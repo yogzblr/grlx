@@ -2,6 +2,7 @@ package facts
 
 import (
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +121,63 @@ func TestRegisterFarmerListener_InvalidJSON(t *testing.T) {
 	nc.Flush()
 	time.Sleep(100 * time.Millisecond)
 	// No assertion needed — just verifying no panic.
+}
+
+// TestRegisterFarmerListener_FanOutNotQueueGrouped is a regression test for
+// the workstream D decision to keep this subscription as plain fan-out
+// (Subscribe) rather than QueueSubscribe: props.SetProp writes into an
+// in-process, in-memory cache, so with multiple farmer replicas every
+// replica needs its own copy of every sprout's facts. If this were ever
+// switched to a queue group, a second "replica" subscribed to the same
+// subject and queue would stop receiving facts events that the first one
+// already handled.
+func TestRegisterFarmerListener_FanOutNotQueueGrouped(t *testing.T) {
+	nc, cleanup := startTestNATS(t)
+	defer cleanup()
+
+	RegisterFarmerListener(nc)
+	nc.Flush()
+
+	// Simulate a second farmer replica subscribed to the same subject
+	// under a queue group. If RegisterFarmerListener were queue-grouped
+	// too, this second subscriber would compete with it for messages
+	// instead of always receiving its own copy.
+	var secondReplicaHits int64
+	sub, err := nc.QueueSubscribe("grlx.sprouts.*.facts", "grlx-core", func(msg *nats.Msg) {
+		atomic.AddInt64(&secondReplicaHits, 1)
+	})
+	if err != nil {
+		t.Fatalf("simulate second replica subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+	nc.Flush()
+
+	const numEvents = 5
+	for i := range numEvents {
+		sf := SystemFacts{
+			OS:       "linux",
+			Hostname: "fanout-host",
+			SproutID: "sprout-fanout-test",
+			NumCPU:   i,
+		}
+		data, _ := json.Marshal(sf)
+		if err := nc.Publish("grlx.sprouts.sprout-fanout-test.facts", data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nc.Flush()
+	time.Sleep(200 * time.Millisecond)
+
+	// The simulated replica's own queue subscription received every event
+	// independently of RegisterFarmerListener's fan-out subscription.
+	if got := atomic.LoadInt64(&secondReplicaHits); got != numEvents {
+		t.Errorf("expected simulated second replica to independently receive all %d events (fan-out), got %d", numEvents, got)
+	}
+
+	// The primary listener also processed the events and stored the props.
+	if got := props.GetStringProp("sprout-fanout-test", "hostname"); got != "fanout-host" {
+		t.Errorf("expected hostname=fanout-host, got %q", got)
+	}
 }
 
 func TestRegisterFarmerListener_MultipleSprouts(t *testing.T) {
