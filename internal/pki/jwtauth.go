@@ -1,0 +1,308 @@
+package pki
+
+// Decentralized NATS JWT auth bootstrap: Operator -> SYSTEM account ->
+// tenant Account. See docs/design/grlx-nats-jwt-auth-design.md.
+//
+// FLAG FOR SECURITY REVIEW: this file mints and persists the root Operator
+// keypair, which is the trust anchor for every tenant's isolation on the
+// bus. It is written to disk here as an interim measure. Per the design
+// doc's "Key custody" section, the Operator root key (and, later, per-tenant
+// Account signing keys) belong in cold storage / OpenBao (workstream F)
+// rather than a flat file, once that workstream lands. Until then, treat
+// {FarmerPKI}/nats-auth/operator.nk as the single most sensitive file this
+// farmer writes.
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"sync"
+
+	jwt "github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nkeys"
+
+	"github.com/gogrlx/grlx/v2/internal/config"
+	log "github.com/gogrlx/grlx/v2/internal/log"
+)
+
+const natsAuthSubdir = "nats-auth"
+
+// natsAuthMaterial holds the loaded/generated decentralized-JWT trust chain
+// for this farmer: the Operator (root trust anchor, plus a delegated
+// signing key used for day-to-day Account issuance), the SYSTEM account
+// (used only to push claims updates to the bus's resolver) and the single
+// tenant Account that sprouts, the farmer, and grlx CLI admins belong to.
+//
+// Multi-tenancy (workstream E) generalizes tenantPub/tenantJWT into one
+// Account per tenant; this struct intentionally holds just one for now.
+type natsAuthMaterial struct {
+	operatorKP        nkeys.KeyPair
+	operatorSigningKP nkeys.KeyPair
+	operatorPub       string
+	operatorJWT       string
+
+	sysAccountKP  nkeys.KeyPair
+	sysAccountPub string
+	sysAccountJWT string
+
+	sysUserKP   nkeys.KeyPair
+	sysUserPub  string
+	sysUserJWT  string
+	sysUserSeed []byte
+
+	tenantKP        nkeys.KeyPair
+	tenantSigningKP nkeys.KeyPair
+	tenantPub       string
+	tenantJWT       string
+	tenantName      string
+}
+
+// authMu guards concurrent bootstrap/persistence of the auth material below
+// (concurrent Accept/Deny/Reject calls, or a SIGHUP racing one of them).
+var authMu sync.Mutex
+
+func natsAuthDir() string {
+	return filepath.Join(config.FarmerPKI, natsAuthSubdir)
+}
+
+func resolverStoreDir() string {
+	return filepath.Join(natsAuthDir(), "resolver")
+}
+
+func sproutJWTDir() string {
+	return filepath.Join(config.FarmerPKI, "sprouts", "jwt")
+}
+
+func tenantJWTPath() string {
+	return filepath.Join(natsAuthDir(), "tenant.jwt")
+}
+
+func farmerUserJWTPath() string {
+	return filepath.Join(natsAuthDir(), "users", "farmer.jwt")
+}
+
+func cliUserJWTPath(pubkey string) string {
+	return filepath.Join(natsAuthDir(), "users", "cli-"+pubkey+".jwt")
+}
+
+func sproutJWTPath(id string) string {
+	return filepath.Join(sproutJWTDir(), id+".jwt")
+}
+
+// ensureNatsAuth loads the operator/system/tenant trust-chain material from
+// disk, generating and persisting any piece that doesn't exist yet. It is
+// idempotent and safe to call repeatedly (from ConfigureNats, ReloadNKeys,
+// and anywhere else that needs the current keys/claims).
+func ensureNatsAuth() (*natsAuthMaterial, error) {
+	authMu.Lock()
+	defer authMu.Unlock()
+
+	dir := natsAuthDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "users"), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(sproutJWTDir(), 0o700); err != nil {
+		return nil, err
+	}
+
+	mat := &natsAuthMaterial{}
+
+	var err error
+	mat.operatorKP, err = loadOrCreateSeed(filepath.Join(dir, "operator.nk"), nkeys.CreateOperator)
+	if err != nil {
+		return nil, err
+	}
+	mat.operatorPub, err = mat.operatorKP.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+	mat.operatorSigningKP, err = loadOrCreateSeed(filepath.Join(dir, "operator-signing.nk"), nkeys.CreateOperator)
+	if err != nil {
+		return nil, err
+	}
+	operatorSigningPub, err := mat.operatorSigningKP.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+
+	mat.sysAccountKP, err = loadOrCreateSeed(filepath.Join(dir, "sys-account.nk"), nkeys.CreateAccount)
+	if err != nil {
+		return nil, err
+	}
+	mat.sysAccountPub, err = mat.sysAccountKP.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+
+	mat.tenantKP, err = loadOrCreateSeed(filepath.Join(dir, "tenant.nk"), nkeys.CreateAccount)
+	if err != nil {
+		return nil, err
+	}
+	mat.tenantPub, err = mat.tenantKP.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+	mat.tenantSigningKP, err = loadOrCreateSeed(filepath.Join(dir, "tenant-signing.nk"), nkeys.CreateAccount)
+	if err != nil {
+		return nil, err
+	}
+	tenantSigningPub, err := mat.tenantSigningKP.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+	mat.tenantName = config.FarmerOrganization
+	if mat.tenantName == "" {
+		mat.tenantName = "grlx"
+	}
+
+	// Operator claims: self-signed, names the SYSTEM account and delegates
+	// day-to-day Account signing to operatorSigningKP so the root operator
+	// key need not be online at runtime (see the security-review note above).
+	needOperatorJWT := true
+	if b, rerr := os.ReadFile(filepath.Join(dir, "operator.jwt")); rerr == nil {
+		if oc, derr := jwt.DecodeOperatorClaims(string(b)); derr == nil &&
+			oc.Subject == mat.operatorPub &&
+			oc.SystemAccount == mat.sysAccountPub &&
+			oc.SigningKeys.Contains(operatorSigningPub) {
+			mat.operatorJWT = string(b)
+			needOperatorJWT = false
+		}
+	}
+	if needOperatorJWT {
+		oc := jwt.NewOperatorClaims(mat.operatorPub)
+		oc.Name = mat.tenantName + "-operator"
+		oc.SystemAccount = mat.sysAccountPub
+		oc.SigningKeys.Add(operatorSigningPub)
+		signed, encErr := oc.Encode(mat.operatorKP)
+		if encErr != nil {
+			return nil, encErr
+		}
+		if werr := os.WriteFile(filepath.Join(dir, "operator.jwt"), []byte(signed), 0o600); werr != nil {
+			return nil, werr
+		}
+		mat.operatorJWT = signed
+	}
+
+	// SYSTEM account claims: signed by the operator's signing key.
+	needSysJWT := true
+	if b, rerr := os.ReadFile(filepath.Join(dir, "sys-account.jwt")); rerr == nil {
+		if ac, derr := jwt.DecodeAccountClaims(string(b)); derr == nil && ac.Subject == mat.sysAccountPub {
+			mat.sysAccountJWT = string(b)
+			needSysJWT = false
+		}
+	}
+	if needSysJWT {
+		ac := jwt.NewAccountClaims(mat.sysAccountPub)
+		ac.Name = "SYS"
+		signed, encErr := ac.Encode(mat.operatorSigningKP)
+		if encErr != nil {
+			return nil, encErr
+		}
+		if werr := os.WriteFile(filepath.Join(dir, "sys-account.jwt"), []byte(signed), 0o600); werr != nil {
+			return nil, werr
+		}
+		mat.sysAccountJWT = signed
+	}
+
+	// SYSTEM user: the identity ReloadNKeys() connects as to push claims
+	// updates to the bus's resolver (see resolver.go). Signed directly by
+	// the SYS account's own key; a dedicated signing key isn't worth the
+	// extra moving part for a single, low-privilege internal user.
+	mat.sysUserKP, err = loadOrCreateSeed(filepath.Join(dir, "sys-user.nk"), nkeys.CreateUser)
+	if err != nil {
+		return nil, err
+	}
+	mat.sysUserPub, err = mat.sysUserKP.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+	mat.sysUserSeed, err = mat.sysUserKP.Seed()
+	if err != nil {
+		return nil, err
+	}
+	needSysUserJWT := true
+	if b, rerr := os.ReadFile(filepath.Join(dir, "sys-user.jwt")); rerr == nil {
+		if uc, derr := jwt.DecodeUserClaims(string(b)); derr == nil && uc.Subject == mat.sysUserPub {
+			mat.sysUserJWT = string(b)
+			needSysUserJWT = false
+		}
+	}
+	if needSysUserJWT {
+		uc := jwt.NewUserClaims(mat.sysUserPub)
+		uc.Name = "grlx-farmer-sys-push"
+		signed, encErr := uc.Encode(mat.sysAccountKP)
+		if encErr != nil {
+			return nil, encErr
+		}
+		if werr := os.WriteFile(filepath.Join(dir, "sys-user.jwt"), []byte(signed), 0o600); werr != nil {
+			return nil, werr
+		}
+		mat.sysUserJWT = signed
+	}
+
+	// Tenant Account claims: signed by the operator's signing key, with its
+	// own delegated signing key used to mint every sprout/farmer/cli User
+	// JWT. Loaded (not regenerated) when present, since this file also
+	// carries the live revocation list that syncNatsAuth maintains.
+	needTenantJWT := true
+	if b, rerr := os.ReadFile(tenantJWTPath()); rerr == nil {
+		if ac, derr := jwt.DecodeAccountClaims(string(b)); derr == nil &&
+			ac.Subject == mat.tenantPub &&
+			ac.SigningKeys.Contains(tenantSigningPub) {
+			mat.tenantJWT = string(b)
+			needTenantJWT = false
+		}
+	}
+	if needTenantJWT {
+		ac := jwt.NewAccountClaims(mat.tenantPub)
+		ac.Name = mat.tenantName
+		ac.SigningKeys.Add(tenantSigningPub)
+		signed, encErr := ac.Encode(mat.operatorSigningKP)
+		if encErr != nil {
+			return nil, encErr
+		}
+		if werr := os.WriteFile(tenantJWTPath(), []byte(signed), 0o600); werr != nil {
+			return nil, werr
+		}
+		mat.tenantJWT = signed
+	}
+
+	return mat, nil
+}
+
+// loadOrCreateSeed reads an NKey seed from path, or creates a new keypair
+// via create and persists its seed to path (0600) if the file doesn't
+// exist yet.
+func loadOrCreateSeed(path string, create func() (nkeys.KeyPair, error)) (nkeys.KeyPair, error) {
+	if b, err := os.ReadFile(path); err == nil {
+		kp, kerr := nkeys.FromSeed(bytes.TrimSpace(b))
+		if kerr != nil {
+			return nil, kerr
+		}
+		return kp, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	kp, err := create()
+	if err != nil {
+		return nil, err
+	}
+	seed, err := kp.Seed()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		return nil, err
+	}
+	log.Tracef("Generated new NATS auth keypair at %s", path)
+	return kp, nil
+}
+
+// loadTenantClaims decodes the current on-disk tenant Account JWT into a
+// mutable *jwt.AccountClaims for syncNatsAuth to update in place.
+func loadTenantClaims(mat *natsAuthMaterial) (*jwt.AccountClaims, error) {
+	return jwt.DecodeAccountClaims(mat.tenantJWT)
+}

@@ -8,9 +8,9 @@ import (
 
 	log "github.com/gogrlx/grlx/v2/internal/log"
 
-	"github.com/gogrlx/grlx/v2/internal/auth"
 	"github.com/gogrlx/grlx/v2/internal/config"
 
+	jwt "github.com/nats-io/jwt/v2"
 	nats_server "github.com/nats-io/nats-server/v2/server"
 )
 
@@ -21,6 +21,13 @@ var (
 	certPool   *x509.CertPool
 )
 
+// ConfigureNats builds the NATS server options for this farmer's bus node.
+// Auth is decentralized JWT (see docs/design/grlx-nats-jwt-auth-design.md):
+// the Operator is the trust anchor, the SYSTEM account is used only to
+// receive claims-update pushes (see resolver.go), and a "full" resolver
+// (every node holds every Account JWT, appropriate at the near-term tenant
+// count) is seeded with the SYSTEM and tenant Account JWTs so the server
+// can validate connections from the moment it starts.
 func ConfigureNats() nats_server.Options {
 	var NatsConfig nats_server.Options
 	FarmerInterface := config.FarmerInterface
@@ -58,13 +65,37 @@ func ConfigureNats() nats_server.Options {
 	if err != nil {
 		log.Panic(err)
 	}
-	config := tls.Config{
+	tlsConfig := tls.Config{
 		ServerName:   FarmerInterface,
 		RootCAs:      certPool,
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}
-	NatsConfig.TLSConfig = &config
+	NatsConfig.TLSConfig = &tlsConfig
+
+	mat, err := ensureNatsAuth()
+	if err != nil {
+		log.Panicf("nats: failed to bootstrap decentralized JWT auth material: %v", err)
+	}
+	opClaims, err := jwt.DecodeOperatorClaims(mat.operatorJWT)
+	if err != nil {
+		log.Panicf("nats: failed to decode operator JWT: %v", err)
+	}
+	NatsConfig.TrustedOperators = []*jwt.OperatorClaims{opClaims}
+	NatsConfig.SystemAccount = mat.sysAccountPub
+
+	resolver, err := nats_server.NewDirAccResolver(resolverStoreDir(), 0, 0, nats_server.HardDelete)
+	if err != nil {
+		log.Panicf("nats: failed to create the account resolver: %v", err)
+	}
+	if err := resolver.Store(mat.sysAccountPub, mat.sysAccountJWT); err != nil {
+		log.Panicf("nats: failed to seed the SYS account into the resolver: %v", err)
+	}
+	if err := resolver.Store(mat.tenantPub, mat.tenantJWT); err != nil {
+		log.Panicf("nats: failed to seed the tenant account into the resolver: %v", err)
+	}
+	NatsConfig.AccountResolver = resolver
+
 	return NatsConfig
 }
 
@@ -72,77 +103,33 @@ func SetNATSServer(s *nats_server.Server) {
 	NatsServer = s
 }
 
+// ReloadNKeys recomputes the tenant Account's User JWTs and revocation list
+// from the current accept/deny/reject/unaccept sprout state (see
+// syncNatsAuth in jwtusers.go), and, if that changed the Account JWT and a
+// bus is running, pushes the update to the resolver (see resolver.go).
+//
+// This replaces the old behavior of rebuilding an NkeyUser allow-list and
+// calling NatsServer.ReloadOptions() in-process; the name is kept because
+// pki.go's Accept/Deny/Reject/Unaccept/Delete all call it via defer, and
+// cmd/farmer/main.go calls it directly on SIGHUP.
 func ReloadNKeys() error {
-	// AuthorizedKeys
-	authorizedKeys := GetNKeysByType("accepted")
-	farmerKey, err := GetPubNKey(FarmerPubNKey)
+	mat, err := ensureNatsAuth()
 	if err != nil {
-		log.Fatalf("Could not load the Farmer's NKey, aborting")
+		log.Errorf("failed to bootstrap NATS decentralized-auth material: %v", err)
+		return err
 	}
-	log.Tracef("Loaded farmer's public key: %s", farmerKey)
-	grlxKeys, err := auth.GetPubkeysByRole("admin")
+	changed, err := syncNatsAuth(mat)
 	if err != nil {
-		log.Errorf("Could not load the grlx cli's NKey(s), please edit the config")
-	} else {
-		log.Tracef("Loaded grlx cli's public key(s): %v", grlxKeys)
+		log.Errorf("failed to sync the tenant Account JWT: %v", err)
+		return err
 	}
-	nkeyUsers := []*nats_server.NkeyUser{}
-	allowAll := nats_server.SubjectPermission{Allow: []string{"grlx.>", "_INBOX.>"}}
-
-	farmerPermissions := nats_server.Permissions{}
-	farmerPermissions.Publish = &allowAll
-	farmerPermissions.Subscribe = &allowAll
-	farmerUser := nats_server.NkeyUser{}
-	farmerUser.Permissions = &farmerPermissions
-	farmerUser.Nkey = farmerKey
-
-	grlxPermissions := nats_server.Permissions{}
-	grlxPermissions.Publish = &allowAll
-	grlxPermissions.Subscribe = &allowAll
-	for _, key := range grlxKeys {
-		grlxUser := nats_server.NkeyUser{}
-		grlxUser.Permissions = &grlxPermissions
-		grlxUser.Nkey = key
-		nkeyUsers = append(nkeyUsers, &grlxUser)
+	if NatsServer == nil || !changed {
+		return nil
 	}
-
-	nkeyUsers = append(nkeyUsers, &farmerUser)
-	for _, account := range authorizedKeys.Sprouts {
-		log.Tracef("Adding accepted key `%s` to NATS", account.SproutID)
-		// sproutAccount.Name = account.SproutID
-		key, errGet := GetNKey(account.SproutID)
-		if errGet != nil {
-			log.Errorf("failed to get NKey for sprout %s: %v", account.SproutID, errGet)
-			continue
-		}
-		accountSubscribe := nats_server.SubjectPermission{Allow: []string{"grlx.sprouts." + account.SproutID + ".>"}}
-		accountPublish := nats_server.SubjectPermission{Allow: []string{"grlx.sprouts.announce." + account.SproutID, "_INBOX.>", "grlx.cook." + account.SproutID + ".>", "grlx.sprouts." + account.SproutID + ".facts"}}
-		sproutPermissions := nats_server.Permissions{}
-		sproutPermissions.Publish = &accountPublish
-		sproutPermissions.Subscribe = &accountSubscribe
-		sproutUser := nats_server.NkeyUser{}
-		sproutUser.Permissions = &sproutPermissions
-		sproutUser.Nkey = key
-		nkeyUsers = append(nkeyUsers, &sproutUser)
+	if err := pushAccountUpdate(mat); err != nil {
+		log.Errorf("failed to push the updated Account JWT to the bus resolver: %v", err)
+		return err
 	}
-	log.Tracef("Completed adding authorized clients.")
-	optsCopy := ConfigureNats()
-	optsCopy.Nkeys = nkeyUsers
-	config := tls.Config{
-		ServerName:   "localhost",
-		RootCAs:      certPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-	optsCopy.TLSConfig = &config
-
-	// DefaultTestOptions.Accounts = append(DefaultTestOptions.Accounts, &farmerAccount)
-	// DefaultTestOptions.Accounts
-	if NatsServer != nil {
-		err = NatsServer.ReloadOptions(&optsCopy)
-		if err != nil {
-			log.Error(err)
-		}
-	}
-	return err
+	log.Tracef("Pushed updated tenant Account JWT to the bus resolver.")
+	return nil
 }
