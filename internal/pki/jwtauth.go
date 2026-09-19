@@ -5,15 +5,19 @@ package pki
 //
 // FLAG FOR SECURITY REVIEW: this file mints and persists the root Operator
 // keypair, which is the trust anchor for every tenant's isolation on the
-// bus. It is written to disk here as an interim measure. Per the design
-// doc's "Key custody" section, the Operator root key (and, later, per-tenant
-// Account signing keys) belong in cold storage / OpenBao (workstream F)
-// rather than a flat file, once that workstream lands. Until then, treat
-// {FarmerPKI}/nats-auth/operator.nk as the single most sensitive file this
-// farmer writes.
+// bus. By default it's written to disk here as an interim measure; every
+// seed below can instead be supplied externally (see loadExternalSeed) so
+// it's never generated or stored locally at all — the intended production
+// shape being Vault, synced into the farmer's pod as a Kubernetes Secret via
+// External Secrets Operator. Per the design doc's "Key custody" section,
+// wiring that up for real (short-lived credentials, or signing without ever
+// releasing the key) is workstream F. Until a given seed is supplied
+// externally, treat {FarmerPKI}/nats-auth/operator.nk as the single most
+// sensitive file this farmer writes.
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -111,7 +115,7 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 	mat := &natsAuthMaterial{}
 
 	var err error
-	mat.operatorKP, err = loadOrCreateSeed(filepath.Join(dir, "operator.nk"), nkeys.CreateOperator)
+	mat.operatorKP, err = loadOrCreateSeed(filepath.Join(dir, "operator.nk"), "OPERATOR", nkeys.CreateOperator)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +123,7 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 	if err != nil {
 		return nil, err
 	}
-	mat.operatorSigningKP, err = loadOrCreateSeed(filepath.Join(dir, "operator-signing.nk"), nkeys.CreateOperator)
+	mat.operatorSigningKP, err = loadOrCreateSeed(filepath.Join(dir, "operator-signing.nk"), "OPERATOR_SIGNING", nkeys.CreateOperator)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +132,7 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 		return nil, err
 	}
 
-	mat.sysAccountKP, err = loadOrCreateSeed(filepath.Join(dir, "sys-account.nk"), nkeys.CreateAccount)
+	mat.sysAccountKP, err = loadOrCreateSeed(filepath.Join(dir, "sys-account.nk"), "SYS_ACCOUNT", nkeys.CreateAccount)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +141,7 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 		return nil, err
 	}
 
-	mat.tenantKP, err = loadOrCreateSeed(filepath.Join(dir, "tenant.nk"), nkeys.CreateAccount)
+	mat.tenantKP, err = loadOrCreateSeed(filepath.Join(dir, "tenant.nk"), "TENANT", nkeys.CreateAccount)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +149,7 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 	if err != nil {
 		return nil, err
 	}
-	mat.tenantSigningKP, err = loadOrCreateSeed(filepath.Join(dir, "tenant-signing.nk"), nkeys.CreateAccount)
+	mat.tenantSigningKP, err = loadOrCreateSeed(filepath.Join(dir, "tenant-signing.nk"), "TENANT_SIGNING", nkeys.CreateAccount)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +215,7 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 	// updates to the bus's resolver (see resolver.go). Signed directly by
 	// the SYS account's own key; a dedicated signing key isn't worth the
 	// extra moving part for a single, low-privilege internal user.
-	mat.sysUserKP, err = loadOrCreateSeed(filepath.Join(dir, "sys-user.nk"), nkeys.CreateUser)
+	mat.sysUserKP, err = loadOrCreateSeed(filepath.Join(dir, "sys-user.nk"), "SYS_USER", nkeys.CreateUser)
 	if err != nil {
 		return nil, err
 	}
@@ -273,10 +277,48 @@ func ensureNatsAuth() (*natsAuthMaterial, error) {
 	return mat, nil
 }
 
-// loadOrCreateSeed reads an NKey seed from path, or creates a new keypair
-// via create and persists its seed to path (0600) if the file doesn't
-// exist yet.
-func loadOrCreateSeed(path string, create func() (nkeys.KeyPair, error)) (nkeys.KeyPair, error) {
+// externalSeedEnvPrefix namespaces the env vars loadOrCreateSeed checks
+// before touching disk, so a seed can be handed to the farmer process by
+// whatever secrets pipeline it's deployed with (e.g. Vault via External
+// Secrets Operator, materialized as a Kubernetes Secret) instead of being
+// generated and stored locally at all. GRLX_NATS_<NAME>_SEED_FILE takes a
+// path — the shape an ESO-synced Secret normally takes once mounted into
+// the pod as a volume — and GRLX_NATS_<NAME>_SEED takes the raw seed value
+// directly, for a Secret wired in via envFrom/secretKeyRef instead. The
+// _FILE form is preferred: unlike an env var, a mounted Secret volume isn't
+// inherited by child processes or liable to end up in a crash dump.
+const externalSeedEnvPrefix = "GRLX_NATS_"
+
+// loadExternalSeed checks GRLX_NATS_<name>_SEED_FILE and GRLX_NATS_<name>_SEED
+// for an externally-supplied seed, in that order. It returns ok=false (no
+// error) when neither is set, so callers fall back to local generation.
+func loadExternalSeed(name string) (kp nkeys.KeyPair, ok bool, err error) {
+	envBase := externalSeedEnvPrefix + name
+	if path := os.Getenv(envBase + "_SEED_FILE"); path != "" {
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil, true, fmt.Errorf("reading %s from %s: %w", envBase+"_SEED_FILE", path, rerr)
+		}
+		kp, err = nkeys.FromSeed(bytes.TrimSpace(b))
+		return kp, true, err
+	}
+	if seed := os.Getenv(envBase + "_SEED"); seed != "" {
+		kp, err = nkeys.FromSeed(bytes.TrimSpace([]byte(seed)))
+		return kp, true, err
+	}
+	return nil, false, nil
+}
+
+// loadOrCreateSeed resolves the NKey seed identified by name: first from an
+// external secret (see loadExternalSeed), then from path on disk, and only
+// generates a fresh keypair via create — persisting it to path (0600) — if
+// neither is present. A seed sourced externally is never written to path:
+// the whole point is that it doesn't get a second, farmer-local plaintext
+// copy.
+func loadOrCreateSeed(path, name string, create func() (nkeys.KeyPair, error)) (nkeys.KeyPair, error) {
+	if kp, ok, err := loadExternalSeed(name); ok {
+		return kp, err
+	}
 	if b, err := os.ReadFile(path); err == nil {
 		kp, kerr := nkeys.FromSeed(bytes.TrimSpace(b))
 		if kerr != nil {

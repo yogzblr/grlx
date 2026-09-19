@@ -67,6 +67,88 @@ func TestEnsureNatsAuth_BootstrapsAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLoadOrCreateSeed_ExternalSeedFile(t *testing.T) {
+	setupTestPKI(t)
+
+	kp, err := nkeys.CreateOperator()
+	if err != nil {
+		t.Fatalf("failed to create operator NKey: %v", err)
+	}
+	wantPub, _ := kp.PublicKey()
+	seed, _ := kp.Seed()
+
+	seedFile := filepath.Join(t.TempDir(), "operator.seed")
+	if err := os.WriteFile(seedFile, seed, 0o600); err != nil {
+		t.Fatalf("failed to write seed file: %v", err)
+	}
+	t.Setenv("GRLX_NATS_OPERATOR_SEED_FILE", seedFile)
+
+	localPath := filepath.Join(t.TempDir(), "operator.nk")
+	got, err := loadOrCreateSeed(localPath, "OPERATOR", nkeys.CreateOperator)
+	if err != nil {
+		t.Fatalf("loadOrCreateSeed failed: %v", err)
+	}
+	gotPub, _ := got.PublicKey()
+	if gotPub != wantPub {
+		t.Errorf("expected the externally-supplied operator key %q, got %q", wantPub, gotPub)
+	}
+	if _, statErr := os.Stat(localPath); !os.IsNotExist(statErr) {
+		t.Error("expected no local copy to be written when the seed comes from an external file")
+	}
+}
+
+func TestLoadOrCreateSeed_ExternalSeedEnvVar(t *testing.T) {
+	setupTestPKI(t)
+
+	kp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatalf("failed to create account NKey: %v", err)
+	}
+	wantPub, _ := kp.PublicKey()
+	seed, _ := kp.Seed()
+	t.Setenv("GRLX_NATS_TENANT_SEED", string(seed))
+
+	localPath := filepath.Join(t.TempDir(), "tenant.nk")
+	got, err := loadOrCreateSeed(localPath, "TENANT", nkeys.CreateAccount)
+	if err != nil {
+		t.Fatalf("loadOrCreateSeed failed: %v", err)
+	}
+	gotPub, _ := got.PublicKey()
+	if gotPub != wantPub {
+		t.Errorf("expected the externally-supplied tenant key %q, got %q", wantPub, gotPub)
+	}
+	if _, statErr := os.Stat(localPath); !os.IsNotExist(statErr) {
+		t.Error("expected no local copy to be written when the seed comes from an env var")
+	}
+}
+
+func TestLoadOrCreateSeed_SeedFileTakesPrecedenceOverEnvVar(t *testing.T) {
+	setupTestPKI(t)
+
+	fileKP, _ := nkeys.CreateUser()
+	filePub, _ := fileKP.PublicKey()
+	fileSeed, _ := fileKP.Seed()
+	seedFile := filepath.Join(t.TempDir(), "sys-user.seed")
+	if err := os.WriteFile(seedFile, fileSeed, 0o600); err != nil {
+		t.Fatalf("failed to write seed file: %v", err)
+	}
+
+	envKP, _ := nkeys.CreateUser()
+	envSeed, _ := envKP.Seed()
+
+	t.Setenv("GRLX_NATS_SYS_USER_SEED_FILE", seedFile)
+	t.Setenv("GRLX_NATS_SYS_USER_SEED", string(envSeed))
+
+	got, err := loadOrCreateSeed(filepath.Join(t.TempDir(), "sys-user.nk"), "SYS_USER", nkeys.CreateUser)
+	if err != nil {
+		t.Fatalf("loadOrCreateSeed failed: %v", err)
+	}
+	gotPub, _ := got.PublicKey()
+	if gotPub != filePub {
+		t.Errorf("expected _SEED_FILE to take precedence, got a different key")
+	}
+}
+
 func TestEnsureNatsAuth_DefaultTenantName(t *testing.T) {
 	setupTestPKI(t)
 	config.FarmerOrganization = ""
