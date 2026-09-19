@@ -34,6 +34,20 @@ import (
 
 var nc *nats.Conn
 
+// RegisterNatsConn subscribes to job-related subjects.
+//
+// This intentionally uses plain Subscribe (fan-out), not QueueSubscribe,
+// unlike internal/natsapi/router.go's request/response API handlers. Job
+// data is persisted to a local, per-process directory (config.JobLogDir);
+// with multiple farmer replicas and no shared job storage yet (workstream
+// A), a client's job-status query can land on any replica, so every
+// replica needs its own on-disk copy of every job event to be able to
+// answer it. Queue-grouping these subjects would mean only one replica
+// ever wrote a given job's data, leaving the others unable to serve it.
+// Once workstream A introduces shared job storage, revisit this: writing
+// the same event N times to shared storage becomes wasted work (and a
+// possible race) rather than useful replication, and QueueSubscribe would
+// become the correct choice.
 func RegisterNatsConn(conn *nats.Conn) {
 	nc = conn
 	_, err := nc.Subscribe("grlx.cook.*.*", logJobs)

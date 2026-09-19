@@ -98,6 +98,14 @@ var routes = map[string]handler{
 	MethodAuditQuery: handleAuditQuery,
 }
 
+// natsCoreQueueGroup is the NATS queue group shared by all farmer replicas
+// for grlx.api.> request handling. Queue-subscribing (rather than plain
+// Subscribe) ensures that when multiple farmer replicas run behind the same
+// NATS subject, exactly one replica processes each API request instead of
+// every replica processing it and racing to reply / duplicating side
+// effects (e.g. running a cmd twice, deleting a job twice).
+const natsCoreQueueGroup = "grlx-core"
+
 // Subscribe registers all NATS API handlers on the given connection.
 // It subscribes to "grlx.api.>" and dispatches based on subject suffix.
 // Each handler is wrapped with RBAC enforcement middleware that checks
@@ -109,7 +117,7 @@ func Subscribe(nc *nats.Conn) error {
 		subject := Subject(method)
 		handler := authMiddleware(method, h) // wrap with RBAC enforcement
 		action := method                     // capture for audit
-		_, err := nc.Subscribe(subject, func(msg *nats.Msg) {
+		_, err := nc.QueueSubscribe(subject, natsCoreQueueGroup, func(msg *nats.Msg) {
 			result, err := handler(msg.Data)
 
 			// Audit log: record actions based on configured audit level.

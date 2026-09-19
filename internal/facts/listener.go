@@ -12,6 +12,17 @@ import (
 
 // RegisterFarmerListener subscribes to sprout facts publications and stores
 // them as props on the farmer side.
+//
+// This intentionally uses plain Subscribe (fan-out), not QueueSubscribe,
+// unlike internal/natsapi/router.go's request/response API handlers.
+// props.SetProp writes into an in-process, in-memory cache (see
+// internal/props), not shared storage, so each farmer replica needs its
+// own copy of every sprout's facts to answer prop queries that land on
+// that replica. Queue-grouping this subject would mean only one replica
+// ever learned a given fact, leaving the others to serve stale or empty
+// data for sprouts whose facts were routed elsewhere. This should be
+// revisited alongside workstream A if/when the props cache moves to
+// shared storage.
 func RegisterFarmerListener(nc *nats.Conn) {
 	_, err := nc.Subscribe("grlx.sprouts.*.facts", func(msg *nats.Msg) {
 		var sf SystemFacts
