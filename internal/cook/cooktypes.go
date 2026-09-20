@@ -69,6 +69,34 @@ type (
 		Requisites  RequisiteSet
 		Properties  map[string]interface{}
 		IsRequisite bool
+		// Cond gates whether the step runs at all: a shell test evaluated
+		// before Apply/Test, with optional negation. nil means unconditional.
+		Cond *Cond
+		// OnExit steps run once after the step's Apply/Test, regardless of its
+		// outcome (success, failure, or skip via Cond) -- e.g. cleanup that
+		// must always happen.
+		OnExit []Step
+		// Register captures this step's output into a named variable other
+		// steps can reference as {NAME} in their own properties.
+		Register *Register
+		// Secrets maps a variable name to an sdb:// ref; each is resolved via
+		// the sdb package immediately before the step runs and is always
+		// treated as sensitive (redacted from logs/job history).
+		Secrets map[string]string
+	}
+	// Cond is a shell-evaluated precondition for a step. The step is
+	// skipped (StepSkipped) unless the test's exit status, after Negate is
+	// applied, indicates success.
+	Cond struct {
+		Test   string
+		Negate bool
+	}
+	// Register names a variable a step's output should be captured into for
+	// use by later steps. Sensitive values are redacted from the persisted
+	// job log and from verbose/debug log output.
+	Register struct {
+		Name      string
+		Sensitive bool
 	}
 	Targets   []StepID
 	Requisite struct {
