@@ -107,7 +107,7 @@ func (c Cmd) run(ctx context.Context, test bool) (cook.Result, error) {
 	} else {
 		command = exec.CommandContext(ctx, executable, args...)
 	}
-	if err := applyRunAs(command, runas); err != nil {
+	if err := setRunAs(command, runas); err != nil {
 		return result, err
 	}
 	if path != "" {
