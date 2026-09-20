@@ -1,3 +1,11 @@
+// Command farmer is grlx's core process: the API server, job/facts/cook
+// subscribers, and all sprout-facing business logic. It is one of two
+// deployables that make up what used to be a single "farmer" binary (see
+// docs/design/grlx-fork-roadmap.md workstream C) — the other is cmd/farmerbus,
+// the NATS bus process meant to run in the DMZ. Core never embeds a bus of
+// its own: it dials config.FarmerBusURL like any other NATS client, the same
+// way it always has, and is meant to run outbound-only from a non-DMZ
+// network segment.
 package main
 
 import (
@@ -36,7 +44,6 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pxc"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
 
-	nats_server "github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	valkey "github.com/valkey-io/valkey-go"
 )
@@ -47,27 +54,14 @@ func init() {
 }
 
 var (
-	// srvMu guards the s and apiServer package globals, which are read by the
-	// shutdown path in main and written/read by handleSIGHUP concurrently.
+	// srvMu guards the apiServer package global, read by the shutdown path
+	// in main and written/read by handleSIGHUP concurrently.
 	srvMu         sync.Mutex
-	s             *nats_server.Server
 	apiServer     *http.Server
 	heartbeatConn *nats.Conn
 	GitCommit     string
 	Tag           string
 )
-
-func setNATSServer(v *nats_server.Server) {
-	srvMu.Lock()
-	s = v
-	srvMu.Unlock()
-}
-
-func getNATSServer() *nats_server.Server {
-	srvMu.Lock()
-	defer srvMu.Unlock()
-	return s
-}
 
 func setAPIServer(v *http.Server) {
 	srvMu.Lock()
@@ -95,7 +89,7 @@ func getHeartbeatConn() *nats.Conn {
 
 func main() {
 	config.LoadConfig("farmer")
-	fmt.Printf("Starting Farmer with URL %s\n", config.FarmerBusURL)
+	fmt.Printf("Starting Farmer (core) with bus URL %s\n", config.FarmerBusURL)
 	defer log.Flush()
 	initStorage()
 	initRecipeStore()
@@ -112,11 +106,22 @@ func main() {
 	if err := certs.GenNKey(true); err != nil {
 		log.Fatalf("failed to generate farmer NKey: %v", err)
 	}
-	RunNATSServer()
-	initHeartbeatListener()
+	// Sync/push the current sprout accept/deny/reject state to the bus's
+	// resolver over the network (see internal/pki/nats.go's ReloadNKeys and
+	// resolver.go). This process never embeds a NATS server (pki.NatsServer
+	// stays nil here), so the push is the only way this state ever reaches
+	// the bus — the same mechanism a SIGHUP or an Accept/Deny call triggers
+	// later. It's also what mints this farmer's own User JWT (see
+	// pki.FarmerUserJWT, used by ConnectFarmer below) onto disk. A failure
+	// here is logged, not fatal: it just means the bus doesn't have the
+	// latest state yet, which a later SIGHUP or accept/deny call can still
+	// push successfully (e.g. if the bus process hasn't finished starting).
+	if err := pki.ReloadNKeys(); err != nil {
+		log.Errorf("Failed to push NATS auth state to the bus: %v", err)
+	}
 	StartAPIServer()
 	// ctx is cancelled on SIGINT/SIGTERM, driving a graceful shutdown of the
-	// cohort refresher, job reaper, NATS connection, NATS server, and API server.
+	// cohort refresher, job reaper, NATS connection, and API server.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	natsapi.StartCohortRefresher(ctx, config.CohortRefreshInterval)
@@ -151,10 +156,7 @@ func main() {
 	if nc := getHeartbeatConn(); nc != nil {
 		nc.Close()
 	}
-	if srv := getNATSServer(); srv != nil {
-		srv.Shutdown()
-	}
-	log.Info("Farmer stopped")
+	log.Info("Farmer (core) stopped")
 }
 
 // initStorage opens the shared PXC connection PKI, props/facts, and RBAC
@@ -205,7 +207,7 @@ func initRecipeStore() {
 // initHeartbeatClient connects the Valkey client connection-state reads
 // and writes through (see internal/heartbeat). The $SYS event listener
 // itself is registered separately, by initHeartbeatListener, once the bus
-// is up.
+// is reachable.
 func initHeartbeatClient() {
 	addrs := strings.Split(config.ValkeyAddrs, ",")
 	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: addrs})
@@ -219,8 +221,9 @@ func initHeartbeatClient() {
 // initHeartbeatListener subscribes to the bus's own
 // $SYS.ACCOUNT.*.CONNECT/DISCONNECT events (as the SYS account — see
 // pki.ConnectSystemAccount) and maintains Valkey heartbeat keys from them,
-// replacing the old synchronous ping-based probeSprout. Must run after
-// RunNATSServer, since the bus needs to be reachable to connect to.
+// replacing the old synchronous ping-based probeSprout. This dials the bus
+// over the network like any other client, so it works whether the bus is a
+// separate process/host (as it is here) or embedded locally.
 func initHeartbeatListener() {
 	nc, err := pki.ConnectSystemAccount()
 	if err != nil {
@@ -327,9 +330,11 @@ func StartAPIServer() {
 	log.Tracef("API server started on %s\n", FarmerInterface+":"+FarmerAPIPort)
 }
 
-// handleSIGHUP listens for SIGHUP signals and reloads the API server
-// and NATS server configuration. This allows certificate rotation and
-// configuration changes to take effect without a full restart.
+// handleSIGHUP listens for SIGHUP signals and reloads the API server and
+// the NATS auth state this core process pushes to the bus. This allows
+// certificate rotation and configuration changes to take effect without a
+// full restart. Unlike the bus process's own SIGHUP handler
+// (cmd/farmerbus), there's no embedded NATS server here to reload.
 func handleSIGHUP(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
 	sighup := make(chan os.Signal, 1)
@@ -347,22 +352,14 @@ func handleSIGHUP(ctx context.Context, done chan<- struct{}) {
 		if ctx.Err() != nil {
 			return
 		}
-		log.Info("Received SIGHUP, reloading servers...")
+		log.Info("Received SIGHUP, reloading...")
 
-		// Reload NATS server NKeys (picks up new sprout keys, config changes)
+		// Recompute and push NATS auth state (picks up new sprout keys,
+		// config changes) to the bus's resolver.
 		if err := pki.ReloadNKeys(); err != nil {
-			log.Errorf("Failed to reload NKeys: %v", err)
+			log.Errorf("Failed to push NATS auth state to the bus: %v", err)
 		} else {
-			log.Info("NATS NKeys reloaded successfully")
-		}
-
-		// Reload the NATS server configuration
-		if srv := getNATSServer(); srv != nil {
-			if err := srv.Reload(); err != nil {
-				log.Errorf("Failed to reload NATS server: %v", err)
-			} else {
-				log.Info("NATS server reloaded successfully")
-			}
+			log.Info("NATS auth state pushed to the bus successfully")
 		}
 
 		// Gracefully shut down the API server and restart it
@@ -392,46 +389,6 @@ func handleSIGHUP(ctx context.Context, done chan<- struct{}) {
 	}
 }
 
-// RunNATSServer starts a new Go routine based server
-func RunNATSServer() {
-	// Optionally override for individual debugging of tests
-	// err := opts.ProcessConfigFile("config.json")
-	// if err != nil {
-	//		log.Panicf("Error configuring server: %v", err)
-	//	}
-	var err error
-	// The bus isn't listening yet at this point, so a resolver push here is
-	// expected to fail in the common case; this call's real purpose is to
-	// sync local JWT/PKI state so ConfigureNats seeds the resolver with an
-	// up-to-date tenant Account JWT below. Not actionable, so log it quietly
-	// and keep starting the bus regardless.
-	if err := pki.ReloadNKeys(); err != nil {
-		log.Debugf("NKey reload before NATS server start (push to not-yet-running bus expected to fail): %v", err)
-	}
-	opts := pki.ConfigureNats()
-	srv, err := nats_server.NewServer(&opts)
-	if err != nil || srv == nil {
-		log.Panicf("No NATS Server object returned: %v", err)
-	}
-	// Run server in Go routine.
-	go srv.Start()
-	var natsLogger log.Logger
-	srv.SetLogger(natsLogger, true, true)
-	// Wait for accept loop(s) to be started
-	if !srv.ReadyForConnections(10 * time.Second) {
-		log.Panicf("Unable to start NATS Server")
-	}
-	setNATSServer(srv)
-	pki.SetNATSServer(srv)
-	// The bus is up and reachable now, so a push failure here is a real,
-	// actionable problem (same class as the SIGHUP handler's reload below).
-	// Don't panic over it though: a later SIGHUP or Accept/Deny call can
-	// still push successfully, so this must be visible but not fatal.
-	if err := pki.ReloadNKeys(); err != nil {
-		log.Errorf("Failed to reload NKeys after starting NATS server: %v", err)
-	}
-}
-
 func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
 	var connectionAttempts atomic.Int64
@@ -444,12 +401,21 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 		FarmerInterface = "localhost"
 	}
 	var err error
-	opt, err := nats.NkeyOptionFromSeed(config.NKeyFarmerPrivFile)
-
+	// Authenticate as the tenant Account User the farmer identity was
+	// granted (see internal/pki/jwtauth-design.md): the User JWT minted by
+	// ReloadNKeys above, plus this farmer's own NKey seed. A bare NKey
+	// connect (the pre-JWT-auth shape) can't satisfy a server configured
+	// with TrustedOperators/an account resolver — it has no account to
+	// belong to without a JWT.
+	farmerJWT, err := pki.FarmerUserJWT()
 	if err != nil {
-		// NKey seed is critical for NATS authentication
+		log.Panicf("farmer User JWT not found (ReloadNKeys must mint it before connecting to the bus): %v", err)
+	}
+	farmerSeed, err := os.ReadFile(config.NKeyFarmerPrivFile)
+	if err != nil {
 		log.Panic(err)
 	}
+	opt := nats.UserJWTAndSeed(farmerJWT, string(farmerSeed))
 	certPool := x509.NewCertPool()
 	rootPEM, err := os.ReadFile(RootCA)
 	if err != nil || rootPEM == nil {
@@ -514,6 +480,10 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 	cook.RegisterNatsConn(nc)
 	jobs.RegisterNatsConn(nc)
 	facts.RegisterFarmerListener(nc)
+
+	// Now that the bus connection is up, register the heartbeat listener
+	// (its own, separate SYS-account connection).
+	initHeartbeatListener()
 
 	// Set version info and subscribe NATS API handlers.
 	natsapi.SetBuildVersion(config.Version{
