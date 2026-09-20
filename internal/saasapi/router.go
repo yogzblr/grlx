@@ -20,7 +20,7 @@ import (
 // hundred enrollment_keys rows/minute instead of an unbounded flood.
 const (
 	enrollmentKeyIssuanceRate  rate.Limit = 1
-	enrollmentKeyIssuanceBurst            = 5
+	enrollmentKeyIssuanceBurst int        = 5
 )
 
 var enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
