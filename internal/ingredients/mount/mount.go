@@ -105,6 +105,7 @@ func (m Mount) PropertiesForMethod(method string) (map[string]string, error) {
 			ingredients.MethodProps{Key: "pass", Type: "string", IsReq: false, Description: "fstab pass field"},
 			ingredients.MethodProps{Key: "persist", Type: "bool", IsReq: false, Description: "also add/update an /etc/fstab entry (default true)"},
 			ingredients.MethodProps{Key: "makedirs", Type: "bool", IsReq: false, Description: "create the mount point directory if missing (default true)"},
+			ingredients.MethodProps{Key: "force_remount", Type: "bool", IsReq: false, Description: "unmount and remount if the mount point is already mounted with a different device/fstype (default false: refuse instead)"},
 		}.ToMap(), nil
 	case "unmounted":
 		return ingredients.MethodPropsSet{

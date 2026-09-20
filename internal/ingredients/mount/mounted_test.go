@@ -4,6 +4,7 @@ package mount
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
@@ -72,6 +73,67 @@ func TestMountedApplyConflictingExistingMount(t *testing.T) {
 	result, err := m.Apply(context.Background())
 	if err == nil {
 		t.Fatal("expected error for conflicting mount")
+	}
+	if !result.Failed {
+		t.Fatalf("expected Failed=true, got %+v", result)
+	}
+}
+
+func TestMountedApplyForceRemountReplacesConflicting(t *testing.T) {
+	withTempTables(t, "", "/dev/sda1 /data ext4 rw 0 0\n")
+	mountCalls := withMockMount(t, nil)
+	unmountCalls := withMockUnmount(t, nil)
+	withMockMkdirAll(t)
+
+	m := Mount{id: "t", method: "mounted", params: map[string]interface{}{
+		"name": "/data", "device": "/dev/sdb1", "fstype": "ext4", "force_remount": true,
+	}}
+	result, err := m.Apply(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Succeeded || result.Failed || !result.Changed {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(*unmountCalls) != 1 || (*unmountCalls)[0] != "/data" {
+		t.Fatalf("expected one unmount of /data, got %v", *unmountCalls)
+	}
+	if len(*mountCalls) != 1 || (*mountCalls)[0].source != "/dev/sdb1" {
+		t.Fatalf("expected remount from /dev/sdb1, got %v", *mountCalls)
+	}
+}
+
+func TestMountedTestModeForceRemount(t *testing.T) {
+	withTempTables(t, "", "/dev/sda1 /data ext4 rw 0 0\n")
+	mountCalls := withMockMount(t, nil)
+	unmountCalls := withMockUnmount(t, nil)
+
+	m := Mount{id: "t", method: "mounted", params: map[string]interface{}{
+		"name": "/data", "device": "/dev/sdb1", "fstype": "ext4", "force_remount": true,
+	}}
+	result, err := m.Test(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Succeeded || !result.Changed {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(*unmountCalls) != 0 || len(*mountCalls) != 0 {
+		t.Fatalf("test mode must not call mount(2)/unmount(2), got unmount=%v mount=%v", *unmountCalls, *mountCalls)
+	}
+}
+
+func TestMountedApplyForceRemountUnmountFailure(t *testing.T) {
+	withTempTables(t, "", "/dev/sda1 /data ext4 rw 0 0\n")
+	withMockMount(t, nil)
+	withMockUnmount(t, fmt.Errorf("device busy"))
+
+	m := Mount{id: "t", method: "mounted", params: map[string]interface{}{
+		"name": "/data", "device": "/dev/sdb1", "fstype": "ext4", "force_remount": true,
+	}}
+	result, err := m.Apply(context.Background())
+	if err == nil {
+		t.Fatal("expected error when unmount fails during force_remount")
 	}
 	if !result.Failed {
 		t.Fatalf("expected Failed=true, got %+v", result)

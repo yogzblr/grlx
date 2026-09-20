@@ -27,6 +27,7 @@ func (m Mount) mounted(ctx context.Context, test bool) (cook.Result, error) {
 	pass := intParam(m.params, "pass", 0)
 	persist := boolParam(m.params, "persist", true)
 	makedirs := boolParam(m.params, "makedirs", true)
+	forceRemount := boolParam(m.params, "force_remount", false)
 
 	active, err := readActiveMounts()
 	if err != nil {
@@ -34,19 +35,37 @@ func (m Mount) mounted(ctx context.Context, test bool) (cook.Result, error) {
 		return result, fmt.Errorf("failed to read active mounts: %w", err)
 	}
 
+	existing := FindByMountPoint(active, name)
+	conflict := existing != nil && (existing.Device != device || existing.FSType != fstype)
+
+	if conflict && !forceRemount {
+		result.Failed = true
+		return result, fmt.Errorf(
+			"%s is already mounted with device %q (fstype %q); refusing to remount over it (set force_remount to override)",
+			name, existing.Device, existing.FSType)
+	}
+	needsMount := existing == nil || conflict
+
 	var didMount bool
-	if existing := FindByMountPoint(active, name); existing != nil {
-		if existing.Device != device || existing.FSType != fstype {
-			result.Failed = true
-			return result, fmt.Errorf(
-				"%s is already mounted with device %q (fstype %q); refusing to remount over it",
-				name, existing.Device, existing.FSType)
-		}
+	switch {
+	case !needsMount:
 		result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf("%s is already mounted", name)))
-	} else if test {
-		result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf("%s would be mounted from %s", name, device)))
+	case test:
+		if conflict {
+			result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf(
+				"%s would be unmounted from %s (fstype %s) and remounted from %s (fstype %s)",
+				name, existing.Device, existing.FSType, device, fstype)))
+		} else {
+			result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf("%s would be mounted from %s", name, device)))
+		}
 		didMount = true
-	} else {
+	default:
+		if conflict {
+			if err := unmountFunc(name, 0); err != nil {
+				result.Failed = true
+				return result, fmt.Errorf("force_remount: unmount(%s): %w", name, err)
+			}
+		}
 		if makedirs {
 			if err := mkdirAll(name, 0o755); err != nil {
 				result.Failed = true
@@ -72,7 +91,11 @@ func (m Mount) mounted(ctx context.Context, test bool) (cook.Result, error) {
 				return result, fmt.Errorf("mount(%s, %s, %s): %w", device, name, fstype, err)
 			}
 		}
-		result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf("mounted %s from %s", name, device)))
+		if conflict {
+			result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf("remounted %s from %s (was %s)", name, device, existing.Device)))
+		} else {
+			result.Notes = append(result.Notes, cook.SimpleNote(fmt.Sprintf("mounted %s from %s", name, device)))
+		}
 		didMount = true
 	}
 
