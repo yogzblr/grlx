@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -233,6 +234,9 @@ func TestShellDoubleQuotesWithSpaces(t *testing.T) {
 }
 
 func TestShellEmptyQuotedArg(t *testing.T) {
+	if _, err := exec.LookPath("ssh-keygen"); err != nil {
+		t.Skip("ssh-keygen not found on PATH; skipping")
+	}
 	// This is the ssh-keygen -N "" case from issue #111
 	tmp := filepath.Join(t.TempDir(), "test_key")
 	_, ok, err := runCmd(t, `ssh-keygen -t ed25519 -q -N "" -f `+tmp, nil)
