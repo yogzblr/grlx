@@ -12,16 +12,16 @@ import (
 // executed on an actual Windows toolchain/runner - please verify on real
 // Windows CI before relying on it.
 
-func TestApplyRunAsEmptyIsNoop(t *testing.T) {
+func TestSetRunAsEmptyIsNoop(t *testing.T) {
 	command := exec.Command("cmd", "/C", "echo", "test")
-	if err := applyRunAs(command, ""); err != nil {
+	if err := setRunAs(command, ""); err != nil {
 		t.Fatalf("unexpected error for empty runas: %v", err)
 	}
 }
 
-func TestApplyRunAsRejectsNonEmptyRunAs(t *testing.T) {
+func TestSetRunAsRejectsNonEmptyRunAs(t *testing.T) {
 	command := exec.Command("cmd", "/C", "echo", "test")
-	if err := applyRunAs(command, "someuser"); err == nil {
+	if err := setRunAs(command, "someuser"); err == nil {
 		t.Error("expected non-nil error when runas is set on Windows")
 	}
 }
