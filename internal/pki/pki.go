@@ -132,7 +132,11 @@ func IsValidSproutID(id string) bool {
 }
 
 func AcceptNKey(id string) error {
-	defer ReloadNKeys()
+	defer func() {
+		if err := ReloadNKeys(); err != nil {
+			log.Errorf("failed to reload NATS auth for accepted sprout %s: %v", id, err)
+		}
+	}()
 	if !IsValidSproutID(strings.SplitN(id, "_", 2)[0]) {
 		return ErrSproutIDInvalid
 	}
@@ -152,7 +156,11 @@ func AcceptNKey(id string) error {
 }
 
 func DeleteNKey(id string) error {
-	defer ReloadNKeys()
+	defer func() {
+		if err := ReloadNKeys(); err != nil {
+			log.Errorf("failed to reload NATS auth for deleted sprout %s: %v", id, err)
+		}
+	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
@@ -164,7 +172,11 @@ func DeleteNKey(id string) error {
 }
 
 func DenyNKey(id string) error {
-	defer ReloadNKeys()
+	defer func() {
+		if err := ReloadNKeys(); err != nil {
+			log.Errorf("failed to reload NATS auth for denied sprout %s: %v", id, err)
+		}
+	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
@@ -180,7 +192,11 @@ func DenyNKey(id string) error {
 }
 
 func UnacceptNKey(id string, nkey string) error {
-	defer ReloadNKeys()
+	defer func() {
+		if err := ReloadNKeys(); err != nil {
+			log.Errorf("failed to reload NATS auth for unaccepted sprout %s: %v", id, err)
+		}
+	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
@@ -241,7 +257,11 @@ func ListNKeysByType() KeysByType {
 }
 
 func RejectNKey(id string, nkey string) error {
-	defer ReloadNKeys()
+	defer func() {
+		if err := ReloadNKeys(); err != nil {
+			log.Errorf("failed to reload NATS auth for rejected sprout %s: %v", id, err)
+		}
+	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}

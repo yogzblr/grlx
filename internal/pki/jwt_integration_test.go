@@ -57,6 +57,46 @@ func startTestBus(t *testing.T) func() {
 	return srv.Shutdown
 }
 
+// startTestBusWithoutLocalHandle is startTestBus's counterpart for the
+// post-bus/core-split topology: it starts the same embedded test bus, but
+// deliberately never calls SetNATSServer, so the calling process (like a
+// future split-out core process) has no in-process *nats_server.Server
+// handle to it at all. Any push to the resolver must reach the bus purely
+// over the network connection pushAccountUpdate opens.
+func startTestBusWithoutLocalHandle(t *testing.T) func() {
+	t.Helper()
+	config.FarmerBusPort = "0"
+
+	opts := ConfigureNats()
+	srv, err := nats_server.NewServer(&opts)
+	if err != nil || srv == nil {
+		t.Fatalf("failed to create NATS server: %v", err)
+	}
+	var noopLogger testNoopLogger
+	srv.SetLogger(noopLogger, false, false)
+	go srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("NATS server did not become ready")
+	}
+
+	addr, ok := srv.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("unexpected listener address type: %T", srv.Addr())
+	}
+	config.FarmerBusURL = fmt.Sprintf("%s:%d", config.FarmerInterface, addr.Port)
+
+	// Deliberately do NOT call SetNATSServer(srv): this process must push
+	// updates to the bus's resolver over the network, the same way a
+	// split-out core process (with no local bus handle) would have to.
+	original := NatsServer
+	NatsServer = nil
+	t.Cleanup(func() {
+		NatsServer = original
+		srv.Shutdown()
+	})
+	return srv.Shutdown
+}
+
 type testNoopLogger struct{}
 
 func (testNoopLogger) Noticef(string, ...any) {}
@@ -223,6 +263,63 @@ func TestJWTLifecycle_RejectAlsoRevokes(t *testing.T) {
 	}
 	if _, err := dialAsSprout(t, sproutJWT, sproutSeed); err == nil {
 		t.Fatal("expected connection to fail for a rejected sprout, but it succeeded")
+	}
+}
+
+// TestReloadNKeys_PushesWithoutLocalNatsServerHandle covers the
+// post-bus/core-split topology described in
+// docs/design/grlx-fork-roadmap.md: once farmer's bus and core processes
+// are split, the process where Accept/Deny/API calls happen (and where
+// ReloadNKeys runs) will never hold a local *nats_server.Server handle.
+// ReloadNKeys must still push the updated tenant Account JWT to the bus
+// over the network (pushAccountUpdate/connectSystemAccount), rather than
+// silently no-opping because NatsServer is nil.
+//
+// Against the pre-fix code (which returned early from ReloadNKeys when
+// NatsServer == nil) this test fails: the accepted sprout's Account JWT
+// update never reaches the bus's resolver, so the bus never learns the
+// sprout's key is now valid and the dial below is rejected.
+func TestReloadNKeys_PushesWithoutLocalNatsServerHandle(t *testing.T) {
+	pkiDir := setupTestPKI(t)
+	useRealFarmerKey(t)
+	defer startTestBusWithoutLocalHandle(t)()
+
+	if NatsServer != nil {
+		t.Fatal("test setup invariant violated: NatsServer must be nil to simulate the split topology")
+	}
+
+	sproutKP, err := nkeys.CreateUser()
+	if err != nil {
+		t.Fatalf("failed to create sprout NKey: %v", err)
+	}
+	sproutPub, err := sproutKP.PublicKey()
+	if err != nil {
+		t.Fatalf("failed to get sprout public key: %v", err)
+	}
+	sproutSeed, err := sproutKP.Seed()
+	if err != nil {
+		t.Fatalf("failed to get sprout seed: %v", err)
+	}
+	writeKey(t, pkiDir, "unaccepted", "split-sprout01", sproutPub)
+
+	// Accept: this calls ReloadNKeys via defer with no local NatsServer
+	// handle. It must still push the updated tenant Account JWT to the
+	// bus's resolver over the network for the sprout to be able to connect.
+	if err := AcceptNKey("split-sprout01"); err != nil {
+		t.Fatalf("AcceptNKey failed: %v", err)
+	}
+	sproutJWT, err := GetSproutUserJWT("split-sprout01")
+	if err != nil {
+		t.Fatalf("GetSproutUserJWT failed after accept: %v", err)
+	}
+
+	nc, err := dialAsSprout(t, sproutJWT, sproutSeed)
+	if err != nil {
+		t.Fatalf("expected accepted sprout to connect once the push reaches the bus, got: %v", err)
+	}
+	defer nc.Close()
+	if !nc.IsConnected() {
+		t.Fatal("expected connection to be established")
 	}
 }
 

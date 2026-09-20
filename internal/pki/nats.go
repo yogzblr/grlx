@@ -105,13 +105,22 @@ func SetNATSServer(s *nats_server.Server) {
 
 // ReloadNKeys recomputes the tenant Account's User JWTs and revocation list
 // from the current accept/deny/reject/unaccept sprout state (see
-// syncNatsAuth in jwtusers.go), and, if that changed the Account JWT and a
-// bus is running, pushes the update to the resolver (see resolver.go).
+// syncNatsAuth in jwtusers.go), and, if that changed the Account JWT,
+// pushes the update to the resolver (see resolver.go).
 //
 // This replaces the old behavior of rebuilding an NkeyUser allow-list and
 // calling NatsServer.ReloadOptions() in-process; the name is kept because
 // pki.go's Accept/Deny/Reject/Unaccept/Delete all call it via defer, and
 // cmd/farmer/main.go calls it directly on SIGHUP.
+//
+// The push (pushAccountUpdate -> connectSystemAccount) dials
+// config.FarmerBusURL over the network as the SYS account; it does not
+// depend on this process holding a local NatsServer handle, so the push is
+// always attempted when changed is true, regardless of whether this
+// process itself embeds the bus. That must stay true once farmer's bus and
+// core processes are split into separate binaries (workstream C): the core
+// process, where Accept/Deny/API calls happen, will never have a local
+// NatsServer, but it still needs its pushes to reach the bus.
 func ReloadNKeys() error {
 	mat, err := ensureNatsAuth()
 	if err != nil {
@@ -123,7 +132,7 @@ func ReloadNKeys() error {
 		log.Errorf("failed to sync the tenant Account JWT: %v", err)
 		return err
 	}
-	if NatsServer == nil || !changed {
+	if !changed {
 		return nil
 	}
 	if err := pushAccountUpdate(mat); err != nil {
