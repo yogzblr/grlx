@@ -65,6 +65,22 @@ func recipeToStep(id string, recipe map[string]interface{}) (Step, error) {
 		if err != nil {
 			return Step{}, err
 		}
+		cond, err := extractCond(m)
+		if err != nil {
+			return Step{}, err
+		}
+		register, err := extractRegister(m)
+		if err != nil {
+			return Step{}, err
+		}
+		secrets, err := extractSecrets(m)
+		if err != nil {
+			return Step{}, err
+		}
+		onExit, err := extractOnExit(id, m)
+		if err != nil {
+			return Step{}, err
+		}
 		step = Step{
 			ID:          StepID(id),
 			Ingredient:  Ingredient(rp[0]),
@@ -72,6 +88,10 @@ func recipeToStep(id string, recipe map[string]interface{}) (Step, error) {
 			Requisites:  reqs,
 			Properties:  m,
 			IsRequisite: false,
+			Cond:        cond,
+			OnExit:      onExit,
+			Register:    register,
+			Secrets:     secrets,
 		}
 		return step, nil
 	}
@@ -164,6 +184,131 @@ func extractRequisites(step map[string]interface{}) (RequisiteSet, error) {
 		}
 	}
 	return requisites, nil
+}
+
+// extractCond pulls an optional "cond" (and "cond_negate") key off a step's
+// raw property map. "cond" is a shell test (run via the same shell-detection
+// rules as cmd.run); the step is skipped unless the test's success, after
+// cond_negate is applied, is true.
+func extractCond(step map[string]interface{}) (*Cond, error) {
+	raw, ok := step["cond"]
+	if !ok {
+		return nil, nil
+	}
+	test, ok := raw.(string)
+	if !ok || test == "" {
+		return nil, errors.Join(ErrInvalidCond, errors.New("cond must be a non-empty string"))
+	}
+	negate := false
+	if n, ok := step["cond_negate"]; ok {
+		negate, ok = n.(bool)
+		if !ok {
+			return nil, errors.Join(ErrInvalidCond, errors.New("cond_negate must be a bool"))
+		}
+	}
+	return &Cond{Test: test, Negate: negate}, nil
+}
+
+// extractRegister pulls an optional "register" key off a step's raw property
+// map, either a bare variable name or a map with "name" and "sensitive".
+func extractRegister(step map[string]interface{}) (*Register, error) {
+	raw, ok := step["register"]
+	if !ok {
+		return nil, nil
+	}
+	switch v := raw.(type) {
+	case string:
+		if v == "" {
+			return nil, errors.Join(ErrInvalidRegister, errors.New("register name must not be empty"))
+		}
+		return &Register{Name: v}, nil
+	case map[string]interface{}:
+		name, ok := v["name"].(string)
+		if !ok || name == "" {
+			return nil, errors.Join(ErrInvalidRegister, errors.New("register.name must be a non-empty string"))
+		}
+		sensitive := false
+		if s, ok := v["sensitive"]; ok {
+			sensitive, ok = s.(bool)
+			if !ok {
+				return nil, errors.Join(ErrInvalidRegister, errors.New("register.sensitive must be a bool"))
+			}
+		}
+		return &Register{Name: name, Sensitive: sensitive}, nil
+	default:
+		return nil, errors.Join(ErrInvalidRegister, fmt.Errorf("register must be a string or map, got %T", raw))
+	}
+}
+
+// extractSecrets pulls an optional "secrets" key off a step's raw property
+// map: a map of variable name to sdb:// ref. Every resolved secret is always
+// sensitive, regardless of how it is later used.
+func extractSecrets(step map[string]interface{}) (map[string]string, error) {
+	raw, ok := step["secrets"]
+	if !ok {
+		return nil, nil
+	}
+	sm, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, errors.Join(ErrInvalidSecrets, fmt.Errorf("secrets must be a map of variable name to sdb:// ref, got %T", raw))
+	}
+	out := make(map[string]string, len(sm))
+	for k, v := range sm {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			return nil, errors.Join(ErrInvalidSecrets, fmt.Errorf("secrets.%s must be a non-empty sdb:// ref string", k))
+		}
+		out[k] = s
+	}
+	return out, nil
+}
+
+// extractOnExit pulls an optional "on_exit" key off a step's raw property
+// map: a list of single-key ingredient.method entries, in the same shape as
+// a top-level recipe step, run after the parent step regardless of outcome.
+func extractOnExit(parentID string, step map[string]interface{}) ([]Step, error) {
+	raw, ok := step["on_exit"]
+	if !ok {
+		return nil, nil
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, errors.Join(ErrInvalidOnExit, fmt.Errorf("on_exit must be a list, got %T", raw))
+	}
+	steps := make([]Step, 0, len(list))
+	for i, item := range list {
+		entry, ok := item.(map[string]interface{})
+		if !ok || len(entry) != 1 {
+			return nil, errors.Join(ErrInvalidOnExit, fmt.Errorf("on_exit[%d] must be a single ingredient.method map", i))
+		}
+		for k, v := range entry {
+			rp := strings.Split(k, ".")
+			if len(rp) != 2 {
+				return nil, errors.Join(ErrInvalidOnExit, fmt.Errorf("on_exit[%d] key %q must be in the form ingredient.method", i, k))
+			}
+			mi, ok := v.([]interface{})
+			if !ok {
+				return nil, errors.Join(ErrInvalidOnExit, fmt.Errorf("on_exit[%d] %s must contain a list of properties, got %T", i, k, v))
+			}
+			props := make(map[string]interface{})
+			for _, pi := range mi {
+				pm, ok := pi.(map[string]interface{})
+				if !ok {
+					return nil, errors.Join(ErrInvalidOnExit, fmt.Errorf("on_exit[%d] %s properties must be a list of maps, got %T", i, k, pi))
+				}
+				for pk, pv := range pm {
+					props[pk] = pv
+				}
+			}
+			steps = append(steps, Step{
+				ID:         StepID(fmt.Sprintf("%s-on_exit-%d", parentID, i)),
+				Ingredient: Ingredient(rp[0]),
+				Method:     rp[1],
+				Properties: props,
+			})
+		}
+	}
+	return steps, nil
 }
 
 func joinMaps(a, b map[string]interface{}) (map[string]interface{}, error) {

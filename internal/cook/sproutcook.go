@@ -66,6 +66,11 @@ func CookRecipeEnvelope(envelope RecipeEnvelope) error {
 	// in-flight steps observe the cancellation through their Apply/Test context.
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultCookTimeout)
 	defer cancel()
+	// vars carries variables registered by steps and secrets resolved via
+	// sdb:// across this recipe run, so later steps can reference them as
+	// {NAME}. runtimeCtx is the auto-populated subset available everywhere.
+	vars := newRunVars()
+	runtimeCtx := runtimeContextVars(pki.GetSproutID())
 	for {
 		select {
 		// each time a step completes, check if any other steps can be started
@@ -112,8 +117,11 @@ func CookRecipeEnvelope(envelope RecipeEnvelope) error {
 				// all requisites are met, so start the step in a goroutine
 				go func(ctx context.Context, step Step, cChan chan StepCompletion, testMode bool) {
 					started := time.Now()
-					// use the ingredient package to load and cook the step
-					ingredient, err := NewRecipeCooker(step.ID, step.Ingredient, step.Method, step.Properties)
+
+					// A Cond gates whether the step runs at all. A genuine
+					// failure to evaluate it (not a failing test) fails the
+					// step; a failing/negated-away test just skips it.
+					condPassed, err := evalCond(ctx, step.Cond)
 					if err != nil {
 						cChan <- StepCompletion{
 							ID:               step.ID,
@@ -124,6 +132,44 @@ func CookRecipeEnvelope(envelope RecipeEnvelope) error {
 						}
 						return
 					}
+					if !condPassed {
+						cChan <- StepCompletion{
+							ID:               step.ID,
+							CompletionStatus: StepSkipped,
+							Started:          started,
+							Duration:         time.Since(started),
+						}
+						return
+					}
+
+					// Resolve any sdb:// secrets this step declares before
+					// substituting {NAME} variables into its properties, so
+					// a secret is usable the same way as a registered value.
+					if err := resolveSecrets(ctx, step.Secrets, vars); err != nil {
+						cChan <- StepCompletion{
+							ID:               step.ID,
+							CompletionStatus: StepFailed,
+							Started:          started,
+							Duration:         time.Since(started),
+							Error:            err,
+						}
+						return
+					}
+					props := substituteProperties(step.Properties, vars.lookup(runtimeCtx))
+
+					// use the ingredient package to load and cook the step
+					ingredient, err := NewRecipeCooker(step.ID, step.Ingredient, step.Method, props)
+					if err != nil {
+						cChan <- StepCompletion{
+							ID:               step.ID,
+							CompletionStatus: StepFailed,
+							Started:          started,
+							Duration:         time.Since(started),
+							Error:            err,
+						}
+						runOnExit(ctx, step.OnExit, vars, runtimeCtx, testMode)
+						return
+					}
 					var res Result
 					if testMode {
 						res, err = ingredient.Test(ctx)
@@ -131,8 +177,16 @@ func CookRecipeEnvelope(envelope RecipeEnvelope) error {
 						res, err = ingredient.Apply(ctx)
 					}
 
-					duration := time.Since(started)
 					// in test mode, res.Changed and res.Notes may not be populated
+					if step.Register != nil && !testMode {
+						vars.set(step.Register.Name, captureRegisterValue(res), step.Register.Sensitive)
+					}
+
+					// on_exit runs once the step has been attempted, regardless
+					// of whether it succeeded, failed, or errored.
+					runOnExit(ctx, step.OnExit, vars, runtimeCtx, testMode)
+
+					duration := time.Since(started)
 					var changed bool
 					var notes []string
 					if !testMode {
@@ -145,6 +199,15 @@ func CookRecipeEnvelope(envelope RecipeEnvelope) error {
 					if !res.Succeeded {
 						status = StepFailed
 					}
+
+					// Redact anything marked sensitive -- by this step's own
+					// register, an earlier step's, or a resolved secret --
+					// before this completion is persisted to the job log,
+					// published, or logged at any verbosity.
+					sensitive := vars.sensitiveValues()
+					notes = redactNotes(notes, sensitive)
+					err = redactError(err, sensitive)
+
 					cChan <- StepCompletion{
 						ID:               step.ID,
 						CompletionStatus: status,
