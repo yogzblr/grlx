@@ -16,4 +16,6 @@ import (
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winservermanager"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winsmtpserver"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winsnmp"
+	_ "github.com/gogrlx/grlx/v2/internal/ingredients/registry"
+	_ "github.com/gogrlx/grlx/v2/internal/ingredients/service/windows"
 )
