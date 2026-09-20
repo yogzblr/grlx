@@ -433,6 +433,19 @@ func HandleUserRemoveProxy(method string) http.HandlerFunc {
 	}
 }
 
+// WithSecurityHeaders sets response headers that harden the server against
+// MIME-sniffing-based content injection. In particular, X-Content-Type-Options:
+// nosniff stops browsers from ignoring a handler's declared Content-Type and
+// guessing (e.g. rendering a JSON error response as HTML) — the standard
+// mitigation for reflected-content risks in handlers that echo request data
+// back in a response, regardless of what Content-Type that handler set.
+func WithSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // WithCORS wraps a handler with permissive CORS headers for local development.
 func WithCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
