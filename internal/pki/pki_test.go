@@ -20,29 +20,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+
 	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
-// setupTestPKI creates the farmer PKI directory structure in a temp dir
-// and sets config.FarmerPKI to point to it. Returns the PKI directory path.
-// Note: FarmerPKI must end with "/" because the production code concatenates
-// paths with string addition (e.g. FarmerPKI + "sprouts/...").
-func setupTestPKI(t *testing.T) string {
+// newTestDB opens a fresh in-memory, pure-Go (no CGO) sqlite database,
+// migrates this package's table, and installs it as the package-level db
+// used by every store function.
+func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	tmpDir := t.TempDir()
-	pkiDir := filepath.Join(tmpDir, "pki") + "/"
-	config.FarmerPKI = pkiDir
-
-	for _, state := range []string{"unaccepted", "accepted", "denied", "rejected"} {
-		dir := filepath.Join(pkiDir, "sprouts", state)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("failed to create %s directory: %v", state, err)
-		}
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())
+	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening test db: %v", err)
 	}
+	if err := gdb.AutoMigrate(Models()...); err != nil {
+		t.Fatalf("migrating test db: %v", err)
+	}
+	SetDB(gdb)
+	t.Cleanup(func() { SetDB(nil) })
+	return gdb
+}
 
-	// ReloadNKeys (called by Accept/Deny/Reject/Unaccept/Delete via defer)
-	// needs a farmer NKey pub file and auth config. Create a dummy farmer key
-	// so ReloadNKeys doesn't fatal.
+// setupTestPKI wires up an in-memory PKI store plus the TLS/NKey
+// scaffolding ReloadNKeys (called by Accept/Deny/Reject/Unaccept/Delete via
+// defer) needs so it doesn't fatal during tests.
+func setupTestPKI(t *testing.T) {
+	t.Helper()
+	newTestDB(t)
+
+	tmpDir := t.TempDir()
+	config.FarmerPKI = filepath.Join(tmpDir, "pki") + "/"
+
 	farmerPubFile := filepath.Join(tmpDir, "farmer.pub")
 	if err := os.WriteFile(farmerPubFile, []byte("UFAKE_FARMER_KEY_FOR_TESTING"), 0o600); err != nil {
 		t.Fatalf("failed to write dummy farmer pub key: %v", err)
@@ -53,7 +64,6 @@ func setupTestPKI(t *testing.T) string {
 	NatsServer = nil
 
 	// ReloadNKeys calls ConfigureNats which needs valid TLS files.
-	// Generate a self-signed CA + cert/key pair inline for test isolation.
 	config.FarmerInterface = "127.0.0.1"
 	config.FarmerBusPort = "14222"
 	config.FarmerOrganization = "grlx-test"
@@ -65,8 +75,6 @@ func setupTestPKI(t *testing.T) string {
 	config.CertHosts = []string{"127.0.0.1"}
 
 	generateTestCerts(t, tmpDir)
-
-	return pkiDir
 }
 
 // generateTestCerts creates a self-signed CA and leaf certificate for
@@ -146,13 +154,24 @@ func writePEM(t *testing.T, path, blockType string, data []byte) {
 	}
 }
 
-// writeKey writes an NKey file into the given state directory.
-func writeKey(t *testing.T, pkiDir, state, sproutID, nkey string) {
+// writeKey inserts an NKey row directly into the test store at the given
+// state, bypassing the lifecycle functions under test.
+func writeKey(t *testing.T, state, sproutID, nkey string) {
 	t.Helper()
-	path := filepath.Join(pkiDir, "sprouts", state, sproutID)
-	if err := os.WriteFile(path, []byte(nkey), 0o600); err != nil {
-		t.Fatalf("failed to write key file %s: %v", path, err)
+	if err := upsertNKeyRow(nkeyRow{TenantID: tenantID(), SproutID: sproutID, NKey: nkey, State: state}); err != nil {
+		t.Fatalf("failed to write key row %s/%s: %v", state, sproutID, err)
 	}
+}
+
+// keyState returns the current state of sproutID's row, or "" if it
+// doesn't exist.
+func keyState(t *testing.T, sproutID string) string {
+	t.Helper()
+	row, err := findNKeyRow(sproutID)
+	if err != nil {
+		return ""
+	}
+	return row.State
 }
 
 func TestIsValidSproutID(t *testing.T) {
@@ -192,16 +211,12 @@ func TestSetupPKIFarmer(t *testing.T) {
 
 	SetupPKIFarmer()
 
-	for _, state := range []string{"unaccepted", "accepted", "denied", "rejected"} {
-		dir := filepath.Join(config.FarmerPKI, "sprouts", state)
-		info, err := os.Stat(dir)
-		if err != nil {
-			t.Errorf("expected directory %s to exist: %v", dir, err)
-			continue
-		}
-		if !info.IsDir() {
-			t.Errorf("expected %s to be a directory", dir)
-		}
+	info, err := os.Stat(config.FarmerPKI)
+	if err != nil {
+		t.Fatalf("expected PKI directory %s to exist: %v", config.FarmerPKI, err)
+	}
+	if !info.IsDir() {
+		t.Errorf("expected %s to be a directory", config.FarmerPKI)
 	}
 
 	// Calling again should not fail (idempotent).
@@ -209,28 +224,26 @@ func TestSetupPKIFarmer(t *testing.T) {
 }
 
 func TestUnacceptNKey_NewSprout(t *testing.T) {
-	// Stub NatsServer to nil so ReloadNKeys is a no-op.
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
 	err := UnacceptNKey("webserver01", "NKEY_ABC123")
 	if err != nil {
 		t.Fatalf("UnacceptNKey failed: %v", err)
 	}
 
-	// Verify file was created in unaccepted.
-	path := filepath.Join(pkiDir, "sprouts/unaccepted/webserver01")
-	data, err := os.ReadFile(path)
+	key, err := GetNKey("webserver01")
 	if err != nil {
-		t.Fatalf("expected key file at %s: %v", path, err)
+		t.Fatalf("expected key: %v", err)
 	}
-	if string(data) != "NKEY_ABC123" {
-		t.Errorf("expected key content %q, got %q", "NKEY_ABC123", string(data))
+	if key != "NKEY_ABC123" {
+		t.Errorf("expected key content %q, got %q", "NKEY_ABC123", key)
+	}
+	if got := keyState(t, "webserver01"); got != stateUnaccepted {
+		t.Errorf("expected state %q, got %q", stateUnaccepted, got)
 	}
 }
 
 func TestUnacceptNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := UnacceptNKey("-invalid", "NKEY_ABC123")
@@ -240,39 +253,31 @@ func TestUnacceptNKey_InvalidID(t *testing.T) {
 }
 
 func TestAcceptNKey(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	// Place a key in unaccepted.
-	writeKey(t, pkiDir, "unaccepted", "db01", "NKEY_DB01")
+	writeKey(t, "unaccepted", "db01", "NKEY_DB01")
 
 	err := AcceptNKey("db01")
 	if err != nil {
 		t.Fatalf("AcceptNKey failed: %v", err)
 	}
 
-	// Should exist in accepted.
-	accepted := filepath.Join(pkiDir, "sprouts/accepted/db01")
-	data, err := os.ReadFile(accepted)
+	key, err := GetNKey("db01")
 	if err != nil {
-		t.Fatalf("expected key at %s: %v", accepted, err)
+		t.Fatalf("expected key: %v", err)
 	}
-	if string(data) != "NKEY_DB01" {
-		t.Errorf("key content mismatch: %q", string(data))
+	if key != "NKEY_DB01" {
+		t.Errorf("key content mismatch: %q", key)
 	}
-
-	// Should NOT exist in unaccepted.
-	unaccepted := filepath.Join(pkiDir, "sprouts/unaccepted/db01")
-	if _, err := os.Stat(unaccepted); !os.IsNotExist(err) {
-		t.Errorf("expected key to be removed from unaccepted, but it still exists")
+	if got := keyState(t, "db01"); got != stateAccepted {
+		t.Errorf("expected state %q, got %q", stateAccepted, got)
 	}
 }
 
 func TestAcceptNKey_AlreadyAccepted(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "db01", "NKEY_DB01")
+	writeKey(t, "accepted", "db01", "NKEY_DB01")
 
 	err := AcceptNKey("db01")
 	if !errors.Is(err, ErrAlreadyAccepted) {
@@ -281,7 +286,6 @@ func TestAcceptNKey_AlreadyAccepted(t *testing.T) {
 }
 
 func TestAcceptNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := AcceptNKey("-nope")
@@ -291,7 +295,6 @@ func TestAcceptNKey_InvalidID(t *testing.T) {
 }
 
 func TestAcceptNKey_NotFound(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := AcceptNKey("nonexistent")
@@ -301,32 +304,24 @@ func TestAcceptNKey_NotFound(t *testing.T) {
 }
 
 func TestDenyNKey(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "unaccepted", "app01", "NKEY_APP01")
+	writeKey(t, "unaccepted", "app01", "NKEY_APP01")
 
 	err := DenyNKey("app01")
 	if err != nil {
 		t.Fatalf("DenyNKey failed: %v", err)
 	}
 
-	denied := filepath.Join(pkiDir, "sprouts/denied/app01")
-	if _, err := os.Stat(denied); err != nil {
-		t.Fatalf("expected key at %s: %v", denied, err)
-	}
-
-	unaccepted := filepath.Join(pkiDir, "sprouts/unaccepted/app01")
-	if _, err := os.Stat(unaccepted); !os.IsNotExist(err) {
-		t.Error("expected key removed from unaccepted")
+	if got := keyState(t, "app01"); got != stateDenied {
+		t.Errorf("expected state %q, got %q", stateDenied, got)
 	}
 }
 
 func TestDenyNKey_AlreadyDenied(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "denied", "app01", "NKEY_APP01")
+	writeKey(t, "denied", "app01", "NKEY_APP01")
 
 	err := DenyNKey("app01")
 	if !errors.Is(err, ErrAlreadyDenied) {
@@ -335,51 +330,49 @@ func TestDenyNKey_AlreadyDenied(t *testing.T) {
 }
 
 func TestRejectNKey_ExistingKey(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "unaccepted", "rogue01", "NKEY_ROGUE")
+	writeKey(t, "unaccepted", "rogue01", "NKEY_ROGUE")
 
 	err := RejectNKey("rogue01", "")
 	if err != nil {
 		t.Fatalf("RejectNKey failed: %v", err)
 	}
 
-	rejected := filepath.Join(pkiDir, "sprouts/rejected/rogue01")
-	data, err := os.ReadFile(rejected)
+	key, err := GetNKey("rogue01")
 	if err != nil {
-		t.Fatalf("expected key at %s: %v", rejected, err)
+		t.Fatalf("expected key: %v", err)
 	}
-	if string(data) != "NKEY_ROGUE" {
-		t.Errorf("key content mismatch: %q", string(data))
+	if key != "NKEY_ROGUE" {
+		t.Errorf("key content mismatch: %q", key)
+	}
+	if got := keyState(t, "rogue01"); got != stateRejected {
+		t.Errorf("expected state %q, got %q", stateRejected, got)
 	}
 }
 
 func TestRejectNKey_NewKeyDirect(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	// Reject a sprout that doesn't exist yet — creates directly in rejected.
+	// Reject a sprout that doesn't exist yet — creates directly as rejected.
 	err := RejectNKey("badactor", "NKEY_BAD")
 	if err != nil {
 		t.Fatalf("RejectNKey failed: %v", err)
 	}
 
-	rejected := filepath.Join(pkiDir, "sprouts/rejected/badactor")
-	data, err := os.ReadFile(rejected)
+	key, err := GetNKey("badactor")
 	if err != nil {
-		t.Fatalf("expected key at %s: %v", rejected, err)
+		t.Fatalf("expected key: %v", err)
 	}
-	if string(data) != "NKEY_BAD" {
-		t.Errorf("expected %q, got %q", "NKEY_BAD", string(data))
+	if key != "NKEY_BAD" {
+		t.Errorf("expected %q, got %q", "NKEY_BAD", key)
 	}
 }
 
 func TestRejectNKey_AlreadyRejected(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "rejected", "rogue01", "NKEY_ROGUE")
+	writeKey(t, "rejected", "rogue01", "NKEY_ROGUE")
 
 	err := RejectNKey("rogue01", "")
 	if !errors.Is(err, ErrAlreadyRejected) {
@@ -388,24 +381,21 @@ func TestRejectNKey_AlreadyRejected(t *testing.T) {
 }
 
 func TestDeleteNKey(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "old01", "NKEY_OLD")
+	writeKey(t, "accepted", "old01", "NKEY_OLD")
 
 	err := DeleteNKey("old01")
 	if err != nil {
 		t.Fatalf("DeleteNKey failed: %v", err)
 	}
 
-	path := filepath.Join(pkiDir, "sprouts/accepted/old01")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Error("expected key file to be deleted")
+	if _, err := GetNKey("old01"); !errors.Is(err, ErrSproutIDNotFound) {
+		t.Error("expected key to be deleted")
 	}
 }
 
 func TestDeleteNKey_NotFound(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := DeleteNKey("ghost")
@@ -415,7 +405,6 @@ func TestDeleteNKey_NotFound(t *testing.T) {
 }
 
 func TestDeleteNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := DeleteNKey("-bad")
@@ -425,10 +414,9 @@ func TestDeleteNKey_InvalidID(t *testing.T) {
 }
 
 func TestGetNKey(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "cache01", "NKEY_CACHE01")
+	writeKey(t, "accepted", "cache01", "NKEY_CACHE01")
 
 	key, err := GetNKey("cache01")
 	if err != nil {
@@ -440,7 +428,6 @@ func TestGetNKey(t *testing.T) {
 }
 
 func TestGetNKey_NotFound(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	_, err := GetNKey("missing")
@@ -450,7 +437,6 @@ func TestGetNKey_NotFound(t *testing.T) {
 }
 
 func TestGetNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	_, err := GetNKey("-invalid")
@@ -460,14 +446,13 @@ func TestGetNKey_InvalidID(t *testing.T) {
 }
 
 func TestGetNKey_FromEachState(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
 	states := []string{"unaccepted", "accepted", "denied", "rejected"}
 	for _, state := range states {
 		sproutID := state + "-sprout"
 		expectedKey := "NKEY_" + strings.ToUpper(state)
-		writeKey(t, pkiDir, state, sproutID, expectedKey)
+		writeKey(t, state, sproutID, expectedKey)
 
 		t.Run(state, func(t *testing.T) {
 			key, err := GetNKey(sproutID)
@@ -482,10 +467,9 @@ func TestGetNKey_FromEachState(t *testing.T) {
 }
 
 func TestNKeyExists(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "exist01", "NKEY_EXIST")
+	writeKey(t, "accepted", "exist01", "NKEY_EXIST")
 
 	t.Run("exists and matches", func(t *testing.T) {
 		registered, matches := NKeyExists("exist01", "NKEY_EXIST")
@@ -519,12 +503,11 @@ func TestNKeyExists(t *testing.T) {
 }
 
 func TestGetNKeysByType(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "a1", "KEY_A1")
-	writeKey(t, pkiDir, "accepted", "a2", "KEY_A2")
-	writeKey(t, pkiDir, "denied", "d1", "KEY_D1")
+	writeKey(t, "accepted", "a1", "KEY_A1")
+	writeKey(t, "accepted", "a2", "KEY_A2")
+	writeKey(t, "denied", "d1", "KEY_D1")
 
 	t.Run("accepted", func(t *testing.T) {
 		ks := GetNKeysByType("accepted")
@@ -556,13 +539,12 @@ func TestGetNKeysByType(t *testing.T) {
 }
 
 func TestListNKeysByType(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "a1", "KEY_A1")
-	writeKey(t, pkiDir, "unaccepted", "u1", "KEY_U1")
-	writeKey(t, pkiDir, "denied", "d1", "KEY_D1")
-	writeKey(t, pkiDir, "rejected", "r1", "KEY_R1")
+	writeKey(t, "accepted", "a1", "KEY_A1")
+	writeKey(t, "unaccepted", "u1", "KEY_U1")
+	writeKey(t, "denied", "d1", "KEY_D1")
+	writeKey(t, "rejected", "r1", "KEY_R1")
 
 	all := ListNKeysByType()
 	if len(all.Accepted.Sprouts) != 1 {
@@ -580,10 +562,9 @@ func TestListNKeysByType(t *testing.T) {
 }
 
 func TestAcceptThenDeny(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "unaccepted", "flip01", "NKEY_FLIP")
+	writeKey(t, "unaccepted", "flip01", "NKEY_FLIP")
 
 	// Accept it.
 	if err := AcceptNKey("flip01"); err != nil {
@@ -694,34 +675,24 @@ func TestCreateSproutID(t *testing.T) {
 }
 
 func TestUnacceptNKey_MoveFromAccepted(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "accepted", "revoke01", "NKEY_REVOKE")
+	writeKey(t, "accepted", "revoke01", "NKEY_REVOKE")
 
 	err := UnacceptNKey("revoke01", "")
 	if err != nil {
 		t.Fatalf("UnacceptNKey failed: %v", err)
 	}
 
-	// Should be in unaccepted now.
-	unaccepted := filepath.Join(pkiDir, "sprouts/unaccepted/revoke01")
-	if _, err := os.Stat(unaccepted); err != nil {
-		t.Fatalf("expected key in unaccepted: %v", err)
-	}
-
-	// Should NOT be in accepted.
-	accepted := filepath.Join(pkiDir, "sprouts/accepted/revoke01")
-	if _, err := os.Stat(accepted); !os.IsNotExist(err) {
-		t.Error("expected key removed from accepted")
+	if got := keyState(t, "revoke01"); got != stateUnaccepted {
+		t.Errorf("expected state %q, got %q", stateUnaccepted, got)
 	}
 }
 
 func TestUnacceptNKey_AlreadyUnaccepted(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
-	writeKey(t, pkiDir, "unaccepted", "already01", "NKEY_ALREADY")
+	writeKey(t, "unaccepted", "already01", "NKEY_ALREADY")
 
 	err := UnacceptNKey("already01", "")
 	if !errors.Is(err, ErrAlreadyUnaccepted) {
@@ -1008,7 +979,6 @@ func TestPutNKey_ServerError(t *testing.T) {
 }
 
 func TestDenyNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := DenyNKey("-invalid")
@@ -1018,7 +988,6 @@ func TestDenyNKey_InvalidID(t *testing.T) {
 }
 
 func TestDenyNKey_NotFound(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := DenyNKey("ghost")
@@ -1028,7 +997,6 @@ func TestDenyNKey_NotFound(t *testing.T) {
 }
 
 func TestRejectNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := RejectNKey("-invalid", "")
@@ -1038,7 +1006,6 @@ func TestRejectNKey_InvalidID(t *testing.T) {
 }
 
 func TestRejectNKey_NotFound(t *testing.T) {
-	NatsServer = nil
 	setupTestPKI(t)
 
 	err := RejectNKey("ghost", "")
@@ -1058,11 +1025,10 @@ func TestRootCACached_UnknownBinary(t *testing.T) {
 func TestAcceptNKey_WithSuffix(t *testing.T) {
 	// When an ID contains "_<suffix>", AcceptNKey should strip the suffix
 	// and also call DeleteNKey on the base ID.
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
 	// Create the suffixed key.
-	writeKey(t, pkiDir, "unaccepted", "web01_2", "NKEY_WEB01_2")
+	writeKey(t, "unaccepted", "web01_2", "NKEY_WEB01_2")
 
 	err := AcceptNKey("web01_2")
 	if err != nil {
@@ -1070,55 +1036,26 @@ func TestAcceptNKey_WithSuffix(t *testing.T) {
 	}
 
 	// Should be accepted as "web01" (base name).
-	accepted := filepath.Join(pkiDir, "sprouts/accepted/web01")
-	if _, err := os.Stat(accepted); err != nil {
-		t.Fatalf("expected key at %s: %v", accepted, err)
-	}
-}
-
-func TestSetupPKIFarmer_Idempotent_ExistingDirs(t *testing.T) {
-	tmpDir := t.TempDir()
-	config.FarmerPKI = filepath.Join(tmpDir, "pki") + "/"
-
-	// Create the full structure first.
-	SetupPKIFarmer()
-
-	// Write a marker file to verify dirs aren't recreated (data preserved).
-	marker := filepath.Join(config.FarmerPKI, "sprouts/accepted/marker")
-	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Call again — should not fail and should preserve existing files.
-	SetupPKIFarmer()
-
-	data, err := os.ReadFile(marker)
+	key, err := GetNKey("web01")
 	if err != nil {
-		t.Fatalf("marker file should still exist: %v", err)
+		t.Fatalf("expected key at base id: %v", err)
 	}
-	if string(data) != "keep" {
-		t.Error("marker file content changed")
+	if key != "NKEY_WEB01_2" {
+		t.Errorf("unexpected key content: %q", key)
 	}
 }
 
-func TestNKeyExists_ReadError(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+func TestNKeyExists_Mismatch(t *testing.T) {
+	setupTestPKI(t)
 
-	// Create a key file that's unreadable.
-	keyPath := filepath.Join(pkiDir, "sprouts/accepted/unreadable01")
-	if err := os.WriteFile(keyPath, []byte("SECRET"), 0o000); err != nil {
-		t.Fatal(err)
-	}
-	// Restore permissions in cleanup so TempDir can clean up.
-	t.Cleanup(func() { os.Chmod(keyPath, 0o600) })
+	writeKey(t, "accepted", "unreadable01", "SECRET")
 
-	registered, matches := NKeyExists("unreadable01", "SECRET")
+	registered, matches := NKeyExists("unreadable01", "WRONG")
 	if !registered {
-		t.Error("expected registered=true even when file is unreadable")
+		t.Error("expected registered=true")
 	}
 	if matches {
-		t.Error("expected matches=false when file cannot be read")
+		t.Error("expected matches=false for mismatched key")
 	}
 }
 
@@ -1146,25 +1083,12 @@ func generateSelfSignedCertPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 }
 
-func TestFindNKey_InvalidID(t *testing.T) {
-	NatsServer = nil
+func TestFindNKeyRow_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	_, err := findNKey("-bad")
+	_, err := findNKeyRow("-bad")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
-	}
-}
-
-func TestRejectNKey_PathTraversal(t *testing.T) {
-	NatsServer = nil
-	setupTestPKI(t)
-
-	// A sprout ID with path traversal should be caught by the path
-	// clean check in RejectNKey.
-	err := RejectNKey("../escape", "NKEY_BAD")
-	if err == nil {
-		t.Error("expected error for path traversal attempt")
 	}
 }
 
@@ -1247,12 +1171,11 @@ func TestLoadRootCA_SproutBinary(t *testing.T) {
 }
 
 func TestReloadNKeys_WithAcceptedSprouts(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
 	// Add some accepted sprouts with valid-looking NKeys.
-	writeKey(t, pkiDir, "accepted", "web01", "UABC123")
-	writeKey(t, pkiDir, "accepted", "db01", "UDEF456")
+	writeKey(t, "accepted", "web01", "UABC123")
+	writeKey(t, "accepted", "db01", "UDEF456")
 
 	// ReloadNKeys should not error when NatsServer is nil (skips reload).
 	err := ReloadNKeys()
@@ -1263,8 +1186,7 @@ func TestReloadNKeys_WithAcceptedSprouts(t *testing.T) {
 
 // Verify that the full key lifecycle works: unaccept → accept → reject → unaccept.
 func TestKeyLifecycle_FullCycle(t *testing.T) {
-	NatsServer = nil
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 
 	// 1. Register as unaccepted.
 	err := UnacceptNKey("lifecycle01", "NKEY_LIFE")
@@ -1277,8 +1199,8 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcceptNKey: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(pkiDir, "sprouts/accepted/lifecycle01")); statErr != nil {
-		t.Fatal("expected key in accepted")
+	if got := keyState(t, "lifecycle01"); got != stateAccepted {
+		t.Fatalf("expected state %q, got %q", stateAccepted, got)
 	}
 
 	// 3. Reject.
@@ -1286,8 +1208,8 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RejectNKey: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(pkiDir, "sprouts/rejected/lifecycle01")); statErr != nil {
-		t.Fatal("expected key in rejected")
+	if got := keyState(t, "lifecycle01"); got != stateRejected {
+		t.Fatalf("expected state %q, got %q", stateRejected, got)
 	}
 
 	// 4. Unaccept again.
@@ -1295,8 +1217,8 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnacceptNKey (from rejected): %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(pkiDir, "sprouts/unaccepted/lifecycle01")); statErr != nil {
-		t.Fatal("expected key back in unaccepted")
+	if got := keyState(t, "lifecycle01"); got != stateUnaccepted {
+		t.Fatalf("expected state %q, got %q", stateUnaccepted, got)
 	}
 
 	// 5. Delete.
@@ -1304,13 +1226,40 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteNKey: %v", err)
 	}
-	// Verify gone from all states.
-	for _, state := range []string{"unaccepted", "accepted", "denied", "rejected"} {
-		p := filepath.Join(pkiDir, "sprouts", state, "lifecycle01")
-		if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
-			t.Errorf("expected key removed from %s", state)
-		}
+	if _, err := GetNKey("lifecycle01"); !errors.Is(err, ErrSproutIDNotFound) {
+		t.Error("expected key removed after delete")
 	}
+}
+
+func TestSproutIDForNKey(t *testing.T) {
+	setupTestPKI(t)
+
+	writeKey(t, "accepted", "web01", "UABC123")
+	writeKey(t, "unaccepted", "web02", "UDEF456")
+
+	t.Run("accepted sprout resolves", func(t *testing.T) {
+		id, err := SproutIDForNKey("UABC123")
+		if err != nil {
+			t.Fatalf("SproutIDForNKey failed: %v", err)
+		}
+		if id != "web01" {
+			t.Errorf("expected 'web01', got %q", id)
+		}
+	})
+
+	t.Run("unaccepted sprout does not resolve", func(t *testing.T) {
+		_, err := SproutIDForNKey("UDEF456")
+		if !errors.Is(err, ErrSproutIDNotFound) {
+			t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
+		}
+	})
+
+	t.Run("unknown key does not resolve", func(t *testing.T) {
+		_, err := SproutIDForNKey("UNKNOWN")
+		if !errors.Is(err, ErrSproutIDNotFound) {
+			t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
+		}
+	})
 }
 
 // Suppress unused import warnings.

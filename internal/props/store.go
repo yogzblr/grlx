@@ -1,108 +1,70 @@
+// Package props: PXC-backed storage.
+//
+// Previously props lived in a package-level in-memory map
+// (propCache), write-through to one JSON file per sprout on local disk.
+// Neither survived a second farmer replica: each replica had its own
+// process-local propCache and its own local JSON files, so a SetProp on
+// replica A was invisible to a GetProp answered by replica B — the
+// cross-replica divergence bug named in docs/design/grlx-fork-roadmap.md
+// workstream A. This file (plus props.go/static.go) now reads and writes
+// straight through to the shared `farmer` schema in PXC on every call, with
+// no in-memory cache layered on top, so every replica sees the same state.
+//
+// tenant_id scoping (workstream A.1, FLAG FOR SECURITY REVIEW): every
+// query in this package includes tenant_id in the same WHERE clause as
+// sprout_id/name. Full per-request tenant identity (NATS Accounts,
+// workstream E) doesn't exist yet, so tenantID() resolves to this farmer
+// deployment's own configured tenant (config.FarmerOrganization — the same
+// value that already names its NATS Account, see internal/pki/jwtauth.go)
+// until per-request tenant context lands.
 package props
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
-	"sync"
+	"time"
 
-	log "github.com/gogrlx/grlx/v2/internal/log"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
-// propsDir is the directory where props are persisted as JSON files.
-// Each sprout gets its own file: <propsDir>/<sproutID>.json.
-var (
-	propsDir     string
-	propsDirOnce sync.Once
-)
-
-// InitStore sets the directory for persistent props storage and loads
-// any existing props from disk into the in-memory cache.
-func InitStore(dir string) {
-	propsDirOnce.Do(func() {
-		propsDir = dir
-		if err := os.MkdirAll(propsDir, 0o700); err != nil {
-			log.Errorf("props: failed to create store dir %s: %v", propsDir, err)
-			return
-		}
-		loadAll()
-	})
+// propRow is the `props` table in the farmer schema.
+type propRow struct {
+	TenantID string    `gorm:"column:tenant_id;primaryKey;size:191"`
+	SproutID string    `gorm:"column:sprout_id;primaryKey;size:253"`
+	Name     string    `gorm:"column:name;primaryKey;size:191"`
+	Value    string    `gorm:"column:value;type:text"`
+	Static   bool      `gorm:"column:static;not null;default:false"`
+	Expiry   time.Time `gorm:"column:expiry;not null;index"`
 }
 
-// persistSprout writes all current (non-expired) props for a sprout to disk.
-func persistSprout(sproutID string) {
-	if propsDir == "" {
-		return
-	}
+func (propRow) TableName() string { return "props" }
 
-	current := getProps(sproutID)
-	if len(current) == 0 {
-		// Remove the file if no props remain.
-		path := filepath.Join(propsDir, sproutID+".json")
-		os.Remove(path)
-		return
-	}
+// Models returns the GORM models this package owns, for callers assembling
+// a single AutoMigrate call across the whole farmer schema (see
+// cmd/farmer/main.go and internal/pxc).
+func Models() []any { return []any{&propRow{}} }
 
-	data, err := json.MarshalIndent(current, "", "  ")
-	if err != nil {
-		log.Errorf("props: failed to marshal props for %s: %v", sproutID, err)
-		return
-	}
+// db is the shared farmer-schema GORM handle. Nil until SetDB is called.
+var db *gorm.DB
 
-	path := filepath.Join(propsDir, sproutID+".json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		log.Errorf("props: failed to write props for %s: %v", sproutID, err)
+// SetDB installs the GORM handle this package reads and writes through.
+// Call once at startup, after internal/pxc.OpenDB.
+func SetDB(d *gorm.DB) { db = d }
+
+// tenantID resolves the current tenant scope for every query in this
+// package. See the package doc comment above for why this isn't yet a
+// per-request value.
+func tenantID() string {
+	if config.FarmerOrganization != "" {
+		return config.FarmerOrganization
 	}
+	return "default"
 }
 
-// loadAll reads all sprout JSON files from disk and populates the cache.
-// Props loaded from disk get the default TTL.
-func loadAll() {
-	entries, err := os.ReadDir(propsDir)
-	if err != nil {
-		log.Errorf("props: failed to read store dir: %v", err)
-		return
-	}
-
-	loaded := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if filepath.Ext(name) != ".json" {
-			continue
-		}
-		sproutID := name[:len(name)-5] // strip .json
-
-		data, readErr := os.ReadFile(filepath.Join(propsDir, name))
-		if readErr != nil {
-			log.Errorf("props: failed to read %s: %v", name, readErr)
-			continue
-		}
-
-		var kv map[string]interface{}
-		if unmarshalErr := json.Unmarshal(data, &kv); unmarshalErr != nil {
-			log.Errorf("props: failed to parse %s: %v", name, unmarshalErr)
-			continue
-		}
-
-		for k, v := range kv {
-			// Convert value to string for storage.
-			var strVal string
-			switch tv := v.(type) {
-			case string:
-				strVal = tv
-			default:
-				b, _ := json.Marshal(tv)
-				strVal = string(b)
-			}
-			setPropWithTTL(sproutID, k, strVal, DefaultPropTTL)
-		}
-		loaded++
-	}
-
-	if loaded > 0 {
-		log.Noticef("props: loaded persistent props for %d sprout(s)", loaded)
-	}
+func upsertProp(row propRow) error {
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "sprout_id"}, {Name: "name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value", "static", "expiry"}),
+	}).Create(&row).Error
 }

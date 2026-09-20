@@ -1,6 +1,7 @@
 package cook
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,21 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/props"
 )
+
+// writeRecipe writes content to both local disk (for this file's own
+// direct os.ReadFile calls) and the shared test object store (see
+// testmain_test.go's SetStore) at the same path, since recipe resolution
+// itself (collectAllIncludes, ResolveRecipeFilePath) now reads through
+// the store — see store.go.
+func writeRecipe(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write recipe %s: %v", path, err)
+	}
+	if err := store.Put(context.Background(), path, []byte(content)); err != nil {
+		t.Fatalf("seed recipe store %s: %v", path, err)
+	}
+}
 
 // TestPropsInFileBasedRecipe verifies the full file-based pipeline:
 // write a recipe with props to disk → collectAllIncludes resolves it →
@@ -39,9 +55,7 @@ func TestPropsInFileBasedRecipe(t *testing.T) {
         - require: deploy config
 `
 	recipeFile := filepath.Join(tmpDir, "deploy.grlx")
-	if err := os.WriteFile(recipeFile, []byte(recipeContent), 0o644); err != nil {
-		t.Fatalf("write recipe: %v", err)
-	}
+	writeRecipe(t, recipeFile, recipeContent)
 
 	// Collect includes (which also renders templates).
 	includes, err := collectAllIncludes("file-sprout", tmpDir, "deploy")
@@ -112,7 +126,7 @@ func TestPropsInRecipeWithIncludes(t *testing.T) {
       - user: root
 `
 	baseFile := filepath.Join(tmpDir, "base.grlx")
-	os.WriteFile(baseFile, []byte(baseContent), 0o644)
+	writeRecipe(t, baseFile, baseContent)
 
 	// Main recipe with include and props.
 	mainContent := `include:
@@ -126,7 +140,7 @@ steps:
       - user: {{ props "db_host" }}
 `
 	mainFile := filepath.Join(tmpDir, "main.grlx")
-	os.WriteFile(mainFile, []byte(mainContent), 0o644)
+	writeRecipe(t, mainFile, mainContent)
 
 	includes, err := collectAllIncludes("include-sprout", tmpDir, "main")
 	if err != nil {
@@ -175,7 +189,7 @@ func TestStaticPropsInFileBasedRecipe(t *testing.T) {
       - name: "node-tagger --cluster={{ props "cluster" }} --tier={{ props "tier" }}"
 `
 	recipeFile := filepath.Join(tmpDir, "tagging.grlx")
-	os.WriteFile(recipeFile, []byte(recipeContent), 0o644)
+	writeRecipe(t, recipeFile, recipeContent)
 
 	f, _ := os.ReadFile(recipeFile)
 	rendered, err := renderRecipeTemplate("static-file-sprout", recipeFile, f)
@@ -221,7 +235,7 @@ func TestPropsWithHostnameAndSproutIDInFile(t *testing.T) {
       - text: "Host {{ hostname }} managed by sprout {{ sproutID }}"
 `
 	recipeFile := filepath.Join(tmpDir, "banner.grlx")
-	os.WriteFile(recipeFile, []byte(recipeContent), 0o644)
+	writeRecipe(t, recipeFile, recipeContent)
 
 	f, _ := os.ReadFile(recipeFile)
 	rendered, err := renderRecipeTemplate("banner-sprout-42", recipeFile, f)
@@ -261,7 +275,7 @@ func TestPropsWithConditionalInclude(t *testing.T) {
 {{- end }}
 `
 	recipeFile := filepath.Join(tmpDir, "conditional.grlx")
-	os.WriteFile(recipeFile, []byte(recipeContent), 0o644)
+	writeRecipe(t, recipeFile, recipeContent)
 
 	// Without the prop — only 1 step.
 	f, _ := os.ReadFile(recipeFile)
@@ -305,7 +319,7 @@ func TestPropsWithDefaultFallbackInFile(t *testing.T) {
       - name: "app --port={{ default "8080" (props "custom_port") }} --host={{ default "localhost" (props "custom_host") }}"
 `
 	recipeFile := filepath.Join(tmpDir, "defaults.grlx")
-	os.WriteFile(recipeFile, []byte(recipeContent), 0o644)
+	writeRecipe(t, recipeFile, recipeContent)
 
 	f, _ := os.ReadFile(recipeFile)
 	rendered, err := renderRecipeTemplate("default-sprout", recipeFile, f)
@@ -346,7 +360,7 @@ func TestMultiSproutSameRecipeFile(t *testing.T) {
       - name: "setup --role={{ props "role" }} --port={{ props "port" }}"
 `
 	recipeFile := filepath.Join(tmpDir, "setup.grlx")
-	os.WriteFile(recipeFile, []byte(recipeContent), 0o644)
+	writeRecipe(t, recipeFile, recipeContent)
 
 	f, _ := os.ReadFile(recipeFile)
 

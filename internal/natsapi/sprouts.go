@@ -1,17 +1,16 @@
 package natsapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
-	apitypes "github.com/gogrlx/grlx/v2/internal/api/types"
 	intauth "github.com/gogrlx/grlx/v2/internal/auth"
+	"github.com/gogrlx/grlx/v2/internal/heartbeat"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
 )
-
-const sproutPingTimeout = 3 * time.Second
 
 // SproutInfo represents a sprout with its key state and connectivity status.
 type SproutInfo struct {
@@ -122,25 +121,21 @@ func handleSproutsGet(params json.RawMessage) (any, error) {
 	return info, nil
 }
 
+// probeSprout reports whether sproutID currently has a live NATS
+// connection to farmer. This used to be a synchronous request/reply ping
+// to the sprout itself (up to sproutPingTimeout=3s per call, ~10x over the
+// <300ms budget for a fleet-listing request) — it now reads a Valkey
+// heartbeat key maintained by internal/heartbeat's
+// $SYS.ACCOUNT.*.CONNECT/DISCONNECT listener, a single fast local read
+// instead of a round trip to the sprout. See
+// docs/design/grlx-master-plan.md Phase 1.
 func probeSprout(sproutID string) bool {
 	if natsConn == nil {
 		return false
 	}
-	topic := SproutSubject(sproutID, SproutTestPing)
-	ping := apitypes.PingPong{Ping: true}
-	data, err := json.Marshal(ping)
-	if err != nil {
-		return false
-	}
-	msg, err := natsConn.Request(topic, data, sproutPingTimeout)
-	if err != nil {
-		return false
-	}
-	var pong apitypes.PingPong
-	if err := json.Unmarshal(msg.Data, &pong); err != nil {
-		return false
-	}
-	return pong.Pong
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return heartbeat.IsOnline(ctx, sproutID)
 }
 
 func resolveKeyState(sproutID string) string {

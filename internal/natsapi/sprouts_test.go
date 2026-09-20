@@ -2,8 +2,6 @@ package natsapi
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/gogrlx/grlx/v2/internal/pki"
@@ -267,15 +265,12 @@ func TestProbeSprout_NilConn(t *testing.T) {
 
 // --- Test helpers ---
 
+// writeTestSproutKey registers id at the given lifecycle state via the
+// pki package's own lifecycle functions — see writeNKey in
+// pki_handlers_test.go, which this delegates to.
 func writeTestSproutKey(t *testing.T, pkiDir, state, id, nkey string) {
 	t.Helper()
-	dir := filepath.Join(pkiDir, "sprouts", state)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir %s: %v", dir, err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, id), []byte(nkey), 0o644); err != nil {
-		t.Fatalf("write sprout key %s/%s: %v", state, id, err)
-	}
+	writeNKey(t, pkiDir, state, id, nkey)
 }
 
 func generateTestNKey(t *testing.T) string {

@@ -8,15 +8,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	log "github.com/gogrlx/grlx/v2/internal/log"
 
@@ -37,6 +38,10 @@ func init() {
 	sproutMatcher = regexp.MustCompile(`^[0-9a-z\.][-0-9_a-z\.]*$`)
 }
 
+// SetupPKIFarmer ensures the farmer's PKI directory exists. Sprout NKey
+// lifecycle state itself now lives in PXC (see store.go) — this directory
+// is still needed for the nats-auth trust-chain material (jwtauth.go) and
+// the TLS certificate files (config.CertFile/KeyFile) that live under it.
 func SetupPKIFarmer() {
 	FarmerPKI := config.FarmerPKI
 	_, err := os.Stat(FarmerPKI)
@@ -47,26 +52,6 @@ func SetupPKIFarmer() {
 				log.Fatalf("insufficient permissions to create PKI directory %s: %v", FarmerPKI, err)
 			}
 			log.Fatalf("failed to create PKI directory %s: %v", FarmerPKI, err)
-		}
-	}
-	for _, acceptanceState := range []string{
-		"unaccepted",
-		"denied",
-		"rejected",
-		"accepted",
-	} {
-		stateFolder := filepath.Join(FarmerPKI, "sprouts", acceptanceState)
-		_, err := os.Stat(stateFolder)
-		if err == nil {
-			continue
-		}
-		if os.IsNotExist(err) {
-			err = os.MkdirAll(stateFolder, os.ModePerm)
-			if err != nil {
-				log.Panicf("failed to create sprout state directory: %v", err)
-			}
-		} else {
-			log.Fatal(err)
 		}
 	}
 }
@@ -137,22 +122,29 @@ func AcceptNKey(id string) error {
 			log.Errorf("failed to reload NATS auth for accepted sprout %s: %v", id, err)
 		}
 	}()
-	if !IsValidSproutID(strings.SplitN(id, "_", 2)[0]) {
+	base := strings.SplitN(id, "_", 2)[0]
+	if !IsValidSproutID(base) {
 		return ErrSproutIDInvalid
 	}
-	fname, err := findNKey(id)
+	row, err := findNKeyRow(id)
 	if err != nil {
 		return err
 	}
 	if len(strings.SplitN(id, "_", 2)) > 1 {
-		DeleteNKey(strings.SplitN(id, "_", 2)[0])
+		DeleteNKey(base)
 	}
-	id = strings.SplitN(id, "_", 2)[0]
-	newDest := filepath.Join(config.FarmerPKI, "sprouts", "accepted", id)
-	if fname == newDest {
+	if id == base && row.State == stateAccepted {
 		return ErrAlreadyAccepted
 	}
-	return os.Rename(fname, newDest)
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("tenant_id = ? AND sprout_id = ?", tenantID(), id).Delete(&nkeyRow{}).Error; err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "sprout_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"nkey", "state"}),
+		}).Create(&nkeyRow{TenantID: tenantID(), SproutID: base, NKey: row.NKey, State: stateAccepted}).Error
+	})
 }
 
 func DeleteNKey(id string) error {
@@ -164,11 +156,14 @@ func DeleteNKey(id string) error {
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	fname, err := findNKey(id)
-	if err != nil {
-		return err
+	res := db.Where("tenant_id = ? AND sprout_id = ?", tenantID(), id).Delete(&nkeyRow{})
+	if res.Error != nil {
+		return res.Error
 	}
-	return os.Remove(fname)
+	if res.RowsAffected == 0 {
+		return ErrSproutIDNotFound
+	}
+	return nil
 }
 
 func DenyNKey(id string) error {
@@ -180,15 +175,14 @@ func DenyNKey(id string) error {
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	newDest := filepath.Join(config.FarmerPKI, "sprouts", "denied", id)
-	fname, err := findNKey(id)
+	row, err := findNKeyRow(id)
 	if err != nil {
 		return err
 	}
-	if fname == newDest {
+	if row.State == stateDenied {
 		return ErrAlreadyDenied
 	}
-	return os.Rename(fname, newDest)
+	return setState(id, stateDenied)
 }
 
 func UnacceptNKey(id string, nkey string) error {
@@ -200,24 +194,17 @@ func UnacceptNKey(id string, nkey string) error {
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	newDest := filepath.Join(config.FarmerPKI, "sprouts", "unaccepted", id)
-	fname, err := findNKey(id)
+	row, err := findNKeyRow(id)
 	if nkey != "" && err == ErrSproutIDNotFound {
-		file, errCreate := os.Create(newDest)
-		if errCreate != nil {
-			return errCreate
-		}
-		defer file.Close()
-		_, errWrite := file.WriteString(nkey)
-		return errWrite
+		return upsertNKeyRow(nkeyRow{TenantID: tenantID(), SproutID: id, NKey: nkey, State: stateUnaccepted})
 	}
 	if err != nil {
 		return err
 	}
-	if fname == newDest {
+	if row.State == stateUnaccepted {
 		return ErrAlreadyUnaccepted
 	}
-	return os.Rename(fname, newDest)
+	return setState(id, stateUnaccepted)
 }
 
 func GetNKeysByType(set string) KeySet {
@@ -235,15 +222,11 @@ func GetNKeysByType(set string) KeySet {
 	default:
 		return keySet
 	}
-	setPath := filepath.Join(config.FarmerPKI, "sprouts", set)
-	filepath.WalkDir(setPath, func(path string, _ fs.DirEntry, _ error) error {
-		_, id := filepath.Split(path)
-		if setPath == path {
-			return nil
-		}
-		keySet.Sprouts = append(keySet.Sprouts, KeyManager{SproutID: id})
-		return nil
-	})
+	var rows []nkeyRow
+	db.Where("tenant_id = ? AND state = ?", tenantID(), set).Find(&rows)
+	for _, r := range rows {
+		keySet.Sprouts = append(keySet.Sprouts, KeyManager{SproutID: r.SproutID})
+	}
 	return keySet
 }
 
@@ -265,113 +248,33 @@ func RejectNKey(id string, nkey string) error {
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	newDest := filepath.Join(config.FarmerPKI, "sprouts", "rejected", id)
-	cleanDest := filepath.Clean(newDest)
-	if newDest != cleanDest {
-		return ErrSproutIDInvalid
-	}
-	fname, err := findNKey(id)
+	row, err := findNKeyRow(id)
 	if nkey != "" && err == ErrSproutIDNotFound {
-		file, errCreate := os.Create(newDest)
-		if errCreate != nil {
-			return errCreate
-		}
-		defer file.Close()
-		_, errWrite := file.WriteString(nkey)
-		return errWrite
+		return upsertNKeyRow(nkeyRow{TenantID: tenantID(), SproutID: id, NKey: nkey, State: stateRejected})
 	}
 	if err != nil {
 		return err
 	}
-	if fname == newDest {
+	if row.State == stateRejected {
 		return ErrAlreadyRejected
 	}
-	return os.Rename(fname, newDest)
+	return setState(id, stateRejected)
 }
 
 func GetNKey(id string) (string, error) {
-	FarmerPKI := config.FarmerPKI
-	if !IsValidSproutID(id) {
-		return "", ErrSproutIDInvalid
+	row, err := findNKeyRow(id)
+	if err != nil {
+		return "", err
 	}
-	filename := ""
-	filepath.WalkDir(FarmerPKI+"sprouts", func(path string, _ fs.DirEntry, _ error) error {
-		switch path {
-		case filepath.Join(FarmerPKI, "sprouts", "unaccepted", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "accepted", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "denied", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "rejected", id):
-			filename = path
-			return ErrSproutIDFound
-		default:
-		}
-		return nil
-	})
-	if filename == "" {
-		return "", ErrSproutIDNotFound
-	}
-	file, err := os.ReadFile(filename)
-	return string(file), err
-}
-
-func findNKey(id string) (string, error) {
-	FarmerPKI := config.FarmerPKI
-	if !IsValidSproutID(id) {
-		return "", ErrSproutIDInvalid
-	}
-	filename := ""
-	filepath.WalkDir(FarmerPKI+"sprouts", func(path string, _ fs.DirEntry, _ error) error {
-		switch path {
-		case filepath.Join(FarmerPKI, "sprouts", "unaccepted", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "accepted", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "denied", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "rejected", id):
-			filename = path
-			return ErrSproutIDFound
-		default:
-		}
-		return nil
-	})
-	if filename == "" {
-		return "", ErrSproutIDNotFound
-	}
-	return filename, nil
+	return row.NKey, nil
 }
 
 func NKeyExists(id string, nkey string) (Registered bool, Matches bool) {
-	FarmerPKI := config.FarmerPKI
-	filename := ""
-	filepath.WalkDir(filepath.Join(FarmerPKI, "sprouts"), func(path string, _ fs.DirEntry, _ error) error {
-		switch path {
-		case filepath.Join(FarmerPKI, "sprouts", "unaccepted", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "accepted", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "denied", id):
-			fallthrough
-		case filepath.Join(FarmerPKI, "sprouts", "rejected", id):
-			filename = path
-			return ErrSproutIDFound
-		default:
-		}
-		return nil
-	})
-	if filename == "" {
+	row, err := findNKeyRow(id)
+	if err != nil {
 		return false, false
 	}
-	file, err := os.ReadFile(filename)
-	if err != nil {
-		log.Errorf("error reading NKey file %s: %v", filename, err)
-		return true, false
-	}
-	content := string(file)
-	return true, content == nkey
+	return true, row.NKey == nkey
 }
 
 func FetchRootCA(filename string) error {

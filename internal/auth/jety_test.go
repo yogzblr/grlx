@@ -16,6 +16,7 @@ import (
 // and clears all auth-related keys.
 func setupJetyForTest(t *testing.T) {
 	t.Helper()
+	newTestDB(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(path, []byte("# test config\n"), 0o644); err != nil {

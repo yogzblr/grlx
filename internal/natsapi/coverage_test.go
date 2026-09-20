@@ -1,6 +1,7 @@
 package natsapi
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -583,7 +584,7 @@ func TestHandleRecipesGetUsingIDField(t *testing.T) {
 
 	content := "steps:\n  test:\n    cmd.run:\n      - name: echo hi\n"
 	recipePath := filepath.Join(tmpDir, "simple.grlx")
-	if err := os.WriteFile(recipePath, []byte(content), 0o644); err != nil {
+	if err := recipeStore.Put(context.Background(), recipePath, []byte(content)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -646,20 +647,23 @@ func TestHandleRecipesGetNoRecipeDir(t *testing.T) {
 	}
 }
 
-func TestHandleRecipesListNotADirectory(t *testing.T) {
-	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "not-a-dir")
-	if err := os.WriteFile(filePath, []byte("not a directory"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+// TestHandleRecipesListNoMatchingKeys used to assert an error when
+// config.RecipeDir pointed at a local file instead of a directory.
+// Recipes now list against an object-storage key prefix (see
+// internal/objectstore), which has no directory-vs-file distinction — a
+// prefix matching no keys is just an empty list, not an error.
+func TestHandleRecipesListNoMatchingKeys(t *testing.T) {
 	origRecipeDir := config.RecipeDir
-	config.RecipeDir = filePath
+	config.RecipeDir = "/no/keys/have/this/prefix"
 	defer func() { config.RecipeDir = origRecipeDir }()
 
-	_, err := handleRecipesList(nil)
-	if err == nil {
-		t.Fatal("expected error when recipe dir is a file")
+	result, err := handleRecipesList(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data := result.(map[string][]RecipeInfo)
+	if len(data["recipes"]) != 0 {
+		t.Fatalf("expected 0 recipes, got %d", len(data["recipes"]))
 	}
 }
 

@@ -19,25 +19,35 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"github.com/nats-io/nkeys"
+	"gorm.io/gorm"
 
 	apitypes "github.com/gogrlx/grlx/v2/internal/api/types"
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
-// setupPKIDirs creates a temp PKI tree for testing and sets config.FarmerPKI.
-// It also creates a fake farmer NKey pub file so that pki.ReloadNKeys()
-// (called by defer in AcceptNKey, DenyNKey, etc.) doesn't log.Fatal.
+// setupPKIDirs wires up an in-memory PKI store (see internal/pki/store.go)
+// for testing and sets config.FarmerPKI. It also creates a fake farmer
+// NKey pub file so that pki.ReloadNKeys() (called by defer in AcceptNKey,
+// DenyNKey, etc.) doesn't log.Fatal.
 func setupPKIDirs(t *testing.T) string {
 	t.Helper()
+
+	dsn := "file:" + t.Name() + "-pki?mode=memory&cache=shared"
+	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening pki test db: %v", err)
+	}
+	if err := gdb.AutoMigrate(pki.Models()...); err != nil {
+		t.Fatalf("migrating pki test db: %v", err)
+	}
+	pki.SetDB(gdb)
+	t.Cleanup(func() { pki.SetDB(nil) })
+
 	dir := t.TempDir()
 	config.FarmerPKI = dir + "/"
-	for _, state := range []string{"accepted", "unaccepted", "denied", "rejected"} {
-		if err := os.MkdirAll(filepath.Join(dir, "sprouts", state), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-	}
 
 	// Create a fake farmer NKey pub file so ReloadNKeys doesn't crash.
 	farmerKP, err := nkeys.CreateUser()
@@ -67,12 +77,37 @@ func setupPKIDirs(t *testing.T) string {
 	return dir
 }
 
-// writeSproutKey writes a fake NKey file into the PKI tree.
-func writeSproutKey(t *testing.T, dir, state, id, nkey string) {
+// writeSproutKey registers id at the given lifecycle state via the pki
+// package's own lifecycle functions. dir is unused (kept so existing call
+// sites don't need to change) now that PKI state lives in PXC, not on
+// disk.
+func writeSproutKey(t *testing.T, _, state, id, nkey string) {
 	t.Helper()
-	p := filepath.Join(dir, "sprouts", state, id)
-	if err := os.WriteFile(p, []byte(nkey), 0o644); err != nil {
-		t.Fatalf("write sprout key: %v", err)
+	switch state {
+	case "unaccepted":
+		if err := pki.UnacceptNKey(id, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", id, err)
+		}
+	case "accepted":
+		if err := pki.UnacceptNKey(id, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", id, err)
+		}
+		if err := pki.AcceptNKey(id); err != nil {
+			t.Fatalf("AcceptNKey(%q): %v", id, err)
+		}
+	case "denied":
+		if err := pki.UnacceptNKey(id, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", id, err)
+		}
+		if err := pki.DenyNKey(id); err != nil {
+			t.Fatalf("DenyNKey(%q): %v", id, err)
+		}
+	case "rejected":
+		if err := pki.RejectNKey(id, nkey); err != nil {
+			t.Fatalf("RejectNKey(%q): %v", id, err)
+		}
+	default:
+		t.Fatalf("writeSproutKey: unknown state %q", state)
 	}
 }
 
@@ -139,7 +174,7 @@ func TestPutNKey_InvalidNKey(t *testing.T) {
 }
 
 func TestPutNKey_NewSprout(t *testing.T) {
-	dir := setupPKIDirs(t)
+	setupPKIDirs(t)
 
 	// Generate a real NKey user key pair for testing
 	nkey := generateTestUserNKey(t)
@@ -162,10 +197,22 @@ func TestPutNKey_NewSprout(t *testing.T) {
 		t.Error("expected success=true")
 	}
 
-	// Verify the key was saved in unaccepted
-	keyPath := filepath.Join(dir, "sprouts", "unaccepted", "new-sprout")
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
-		t.Error("expected key to be saved in unaccepted directory")
+	// Verify the key was saved as unaccepted.
+	got, err := pki.GetNKey("new-sprout")
+	if err != nil {
+		t.Fatalf("expected key to be saved: %v", err)
+	}
+	if got != nkey {
+		t.Errorf("expected saved key %q, got %q", nkey, got)
+	}
+	found := false
+	for _, s := range pki.GetNKeysByType("unaccepted").Sprouts {
+		if s.SproutID == "new-sprout" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected key to be saved in unaccepted state")
 	}
 }
 
@@ -195,11 +242,11 @@ func TestPutNKey_AlreadyKnownExact(t *testing.T) {
 }
 
 func TestPutNKey_SameIDDifferentKey(t *testing.T) {
-	dir := setupPKIDirs(t)
+	setupPKIDirs(t)
 
 	existingKey := generateTestUserNKey(t)
 	newKey := generateTestUserNKey(t)
-	writeSproutKey(t, dir, "accepted", "conflict-sprout", existingKey)
+	writeSproutKey(t, "", "accepted", "conflict-sprout", existingKey)
 
 	body, _ := json.Marshal(pki.KeySubmission{
 		SproutID: "conflict-sprout",
@@ -213,9 +260,14 @@ func TestPutNKey_SameIDDifferentKey(t *testing.T) {
 		t.Fatalf("expected 200 (saved as conflict), got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Should have been saved as conflict-sprout_1 in rejected
-	rejPath := filepath.Join(dir, "sprouts", "rejected", "conflict-sprout_1")
-	if _, err := os.Stat(rejPath); os.IsNotExist(err) {
+	// Should have been saved as conflict-sprout_1 in rejected.
+	found := false
+	for _, s := range pki.GetNKeysByType("rejected").Sprouts {
+		if s.SproutID == "conflict-sprout_1" {
+			found = true
+		}
+	}
+	if !found {
 		t.Error("expected conflicting key to be saved as conflict-sprout_1 in rejected")
 	}
 }
