@@ -104,6 +104,25 @@ func TestWithCORS(t *testing.T) {
 	}
 }
 
+func TestWithSecurityHeaders(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := WithSecurityHeaders(inner)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("expected X-Content-Type-Options: nosniff, got %q", got)
+	}
+}
+
 func TestHandleNATSProxyNoConnection(t *testing.T) {
 	handler := HandleNATSProxy("test.method")
 
