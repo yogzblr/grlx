@@ -2,6 +2,7 @@ package cook
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -105,7 +106,7 @@ func collectAllIncludes(sproutID, basepath string, recipeID RecipeName) ([]Recip
 	if err != nil {
 		return []RecipeName{}, err
 	}
-	f, err := os.ReadFile(recipeFilePath)
+	f, err := store.Get(context.Background(), recipeFilePath)
 	if err != nil {
 		return []RecipeName{}, err
 	}
@@ -429,7 +430,7 @@ func collectIncludesRecurse(sproutID, basepath string, starter map[RecipeName]bo
 				if err != nil {
 					return starter, err
 				}
-				f, err := os.ReadFile(recipeFilePath)
+				f, err := store.Get(context.Background(), recipeFilePath)
 				if err != nil {
 					return starter, err
 				}

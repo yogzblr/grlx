@@ -43,6 +43,7 @@ func newTestPolicy() *Policy {
 }
 
 func TestValidatePolicy_Clean(t *testing.T) {
+	newTestDB(t)
 	p := newTestPolicy()
 	warnings := ValidatePolicy(p)
 	if len(warnings) != 0 {
@@ -51,6 +52,7 @@ func TestValidatePolicy_Clean(t *testing.T) {
 }
 
 func TestValidatePolicy_OrphanRoleRef(t *testing.T) {
+	newTestDB(t)
 	p := newTestPolicy()
 	p.Users.Set("APUBKEY_GHOST", "nonexistent-role")
 
@@ -68,6 +70,7 @@ func TestValidatePolicy_OrphanRoleRef(t *testing.T) {
 }
 
 func TestValidatePolicy_OrphanCohortRef(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	store.Register(&Role{
 		Name:  "bad-scope",
@@ -96,6 +99,7 @@ func TestValidatePolicy_OrphanCohortRef(t *testing.T) {
 }
 
 func TestValidatePolicy_EmptyRole(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	store.Register(&Role{Name: "empty", Rules: []Rule{}})
 
@@ -118,6 +122,7 @@ func TestValidatePolicy_EmptyRole(t *testing.T) {
 }
 
 func TestValidatePolicy_UnusedRole(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	store.Register(&Role{
 		Name:  "admin",
@@ -148,6 +153,7 @@ func TestValidatePolicy_UnusedRole(t *testing.T) {
 }
 
 func TestValidatePolicy_NilStores(t *testing.T) {
+	newTestDB(t)
 	p := &Policy{Roles: nil, Users: nil, Cohorts: nil}
 	warnings := ValidatePolicy(p)
 	if len(warnings) != 0 {
@@ -156,6 +162,7 @@ func TestValidatePolicy_NilStores(t *testing.T) {
 }
 
 func TestValidatePolicy_NilCohortRegistry(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	store.Register(&Role{
 		Name:  "scoped",
@@ -178,6 +185,7 @@ func TestValidatePolicy_NilCohortRegistry(t *testing.T) {
 }
 
 func TestExplainAccess_Admin(t *testing.T) {
+	newTestDB(t)
 	p := newTestPolicy()
 	summary := ExplainAccess(p, "APUBKEY_ADMIN")
 
@@ -193,6 +201,7 @@ func TestExplainAccess_Admin(t *testing.T) {
 }
 
 func TestExplainAccess_ScopedUser(t *testing.T) {
+	newTestDB(t)
 	p := newTestPolicy()
 	summary := ExplainAccess(p, "APUBKEY_DEV")
 
@@ -219,6 +228,7 @@ func TestExplainAccess_ScopedUser(t *testing.T) {
 }
 
 func TestExplainAccess_UnknownUser(t *testing.T) {
+	newTestDB(t)
 	p := newTestPolicy()
 	summary := ExplainAccess(p, "APUBKEY_UNKNOWN")
 
@@ -234,6 +244,7 @@ func TestExplainAccess_UnknownUser(t *testing.T) {
 }
 
 func TestExplainAccess_OrphanRole(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	// Role "ghost" is NOT registered
 	users := NewUserRoleMap()
@@ -254,6 +265,7 @@ func TestExplainAccess_OrphanRole(t *testing.T) {
 }
 
 func TestExplainAccess_NilPolicy(t *testing.T) {
+	newTestDB(t)
 	p := &Policy{Roles: nil, Users: nil}
 	summary := ExplainAccess(p, "APUBKEY1")
 
@@ -266,6 +278,7 @@ func TestExplainAccess_NilPolicy(t *testing.T) {
 }
 
 func TestExplainAllUsers(t *testing.T) {
+	newTestDB(t)
 	p := newTestPolicy()
 	summaries := ExplainAllUsers(p)
 
@@ -282,6 +295,7 @@ func TestExplainAllUsers(t *testing.T) {
 }
 
 func TestExplainAllUsers_NilUsers(t *testing.T) {
+	newTestDB(t)
 	p := &Policy{Roles: NewRoleStore(), Users: nil}
 	summaries := ExplainAllUsers(p)
 	if summaries != nil {
@@ -290,6 +304,7 @@ func TestExplainAllUsers_NilUsers(t *testing.T) {
 }
 
 func TestTruncatePubkey(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		input string
 		want  string
@@ -308,6 +323,7 @@ func TestTruncatePubkey(t *testing.T) {
 }
 
 func TestUserRoleMap_AllRoleNames(t *testing.T) {
+	newTestDB(t)
 	m := NewUserRoleMap()
 	m.Set("KEY1", "admin")
 	m.Set("KEY2", "dev")

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,22 +18,27 @@ import (
 	log "github.com/gogrlx/grlx/v2/internal/log"
 
 	"github.com/gogrlx/grlx/v2/internal/api"
+	"github.com/gogrlx/grlx/v2/internal/api/handlers"
 	"github.com/gogrlx/grlx/v2/internal/audit"
 	"github.com/gogrlx/grlx/v2/internal/auth"
 	"github.com/gogrlx/grlx/v2/internal/certs"
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 	"github.com/gogrlx/grlx/v2/internal/facts"
+	"github.com/gogrlx/grlx/v2/internal/heartbeat"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/cmd"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/test"
 	"github.com/gogrlx/grlx/v2/internal/jobs"
 	"github.com/gogrlx/grlx/v2/internal/natsapi"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 	"github.com/gogrlx/grlx/v2/internal/props"
+	"github.com/gogrlx/grlx/v2/internal/pxc"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
 
 	nats_server "github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
+	valkey "github.com/valkey-io/valkey-go"
 )
 
 func init() {
@@ -43,11 +49,12 @@ func init() {
 var (
 	// srvMu guards the s and apiServer package globals, which are read by the
 	// shutdown path in main and written/read by handleSIGHUP concurrently.
-	srvMu     sync.Mutex
-	s         *nats_server.Server
-	apiServer *http.Server
-	GitCommit string
-	Tag       string
+	srvMu         sync.Mutex
+	s             *nats_server.Server
+	apiServer     *http.Server
+	heartbeatConn *nats.Conn
+	GitCommit     string
+	Tag           string
 )
 
 func setNATSServer(v *nats_server.Server) {
@@ -74,11 +81,25 @@ func getAPIServer() *http.Server {
 	return apiServer
 }
 
+func setHeartbeatConn(v *nats.Conn) {
+	srvMu.Lock()
+	heartbeatConn = v
+	srvMu.Unlock()
+}
+
+func getHeartbeatConn() *nats.Conn {
+	srvMu.Lock()
+	defer srvMu.Unlock()
+	return heartbeatConn
+}
+
 func main() {
 	config.LoadConfig("farmer")
 	fmt.Printf("Starting Farmer with URL %s\n", config.FarmerBusURL)
 	defer log.Flush()
-	props.InitStore(config.PropsDir)
+	initStorage()
+	initRecipeStore()
+	initHeartbeatClient()
 	props.LoadStaticProps(config.StaticProps())
 	loadCohortRegistry()
 	createConfigRoot()
@@ -92,6 +113,7 @@ func main() {
 		log.Fatalf("failed to generate farmer NKey: %v", err)
 	}
 	RunNATSServer()
+	initHeartbeatListener()
 	StartAPIServer()
 	// ctx is cancelled on SIGINT/SIGTERM, driving a graceful shutdown of the
 	// cohort refresher, job reaper, NATS connection, NATS server, and API server.
@@ -126,10 +148,92 @@ func main() {
 			log.Errorf("API server shutdown error: %v", err)
 		}
 	}
+	if nc := getHeartbeatConn(); nc != nil {
+		nc.Close()
+	}
 	if srv := getNATSServer(); srv != nil {
 		srv.Shutdown()
 	}
 	log.Info("Farmer stopped")
+}
+
+// initStorage opens the shared PXC connection PKI, props/facts, and RBAC
+// read and write through (see internal/pxc, and each package's own
+// store.go) — read-through, no in-memory cache, so every farmer replica
+// agrees on the same state. This fixes the cross-replica divergence bug
+// props/store.go had under its old per-process in-memory cache (see
+// docs/design/grlx-fork-roadmap.md workstream A).
+//
+// tenant_id scoping (workstream A.1, FLAG FOR SECURITY REVIEW): every
+// query in props/pki/rbac's stores includes tenant_id in the same WHERE
+// clause as the row's own key — see their store.go doc comments for the
+// current seam (config.FarmerOrganization) and why it isn't yet a
+// per-request value.
+func initStorage() {
+	models := append(append(props.Models(), pki.Models()...), rbac.Models()...)
+	db, err := pxc.OpenDB(config.PXCDSN, models...)
+	if err != nil {
+		log.Fatalf("failed to open PXC farmer schema: %v", err)
+	}
+	props.SetDB(db)
+	pki.SetDB(db)
+	rbac.SetDB(db)
+}
+
+// initRecipeStore opens the object-storage backend recipes are read from
+// (see internal/objectstore, internal/cook/store.go) — farmer's old
+// local-disk basepath doesn't survive horizontal scaling, since any core
+// replica needs to be able to serve any recipe. Git remains the source of
+// truth; syncing a merged commit into this bucket is a deploy-time
+// concern, not something farmer does at runtime.
+func initRecipeStore() {
+	store, err := objectstore.Open(objectstore.Config{
+		Endpoint:        config.S3Endpoint,
+		AccessKeyID:     config.S3AccessKeyID,
+		SecretAccessKey: config.S3SecretAccessKey,
+		UseSSL:          config.S3UseSSL,
+		Bucket:          config.S3Bucket,
+	})
+	if err != nil {
+		log.Fatalf("failed to open recipe object store: %v", err)
+	}
+	cook.SetStore(store)
+	natsapi.SetRecipeStore(store)
+	handlers.SetRecipeStore(store)
+}
+
+// initHeartbeatClient connects the Valkey client connection-state reads
+// and writes through (see internal/heartbeat). The $SYS event listener
+// itself is registered separately, by initHeartbeatListener, once the bus
+// is up.
+func initHeartbeatClient() {
+	addrs := strings.Split(config.ValkeyAddrs, ",")
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: addrs})
+	if err != nil {
+		log.Errorf("failed to connect to Valkey at %v: %v", addrs, err)
+		return
+	}
+	heartbeat.SetClient(client)
+}
+
+// initHeartbeatListener subscribes to the bus's own
+// $SYS.ACCOUNT.*.CONNECT/DISCONNECT events (as the SYS account — see
+// pki.ConnectSystemAccount) and maintains Valkey heartbeat keys from them,
+// replacing the old synchronous ping-based probeSprout. Must run after
+// RunNATSServer, since the bus needs to be reachable to connect to.
+func initHeartbeatListener() {
+	nc, err := pki.ConnectSystemAccount()
+	if err != nil {
+		log.Errorf("failed to connect heartbeat listener to the bus as the SYS account: %v", err)
+		return
+	}
+	if err := heartbeat.RegisterListener(nc); err != nil {
+		log.Errorf("failed to register heartbeat listener: %v", err)
+		nc.Close()
+		return
+	}
+	setHeartbeatConn(nc)
+	log.Info("Heartbeat listener registered")
 }
 
 func initAuditLogger() {

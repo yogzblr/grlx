@@ -14,24 +14,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
-// setupNatsAPIPKI mirrors the pki_test.go setup so PKI handlers can
-// manipulate sprout keys during tests without hitting log.Fatalf.
+// setupNatsAPIPKI wires up an in-memory PKI store (see
+// internal/pki/store.go) plus the same TLS/NKey scaffolding pki_test.go's
+// setupTestPKI uses, so PKI handlers can manipulate sprout keys during
+// tests without hitting log.Fatalf. The returned directory is still used
+// by callers for unrelated TLS fixture paths.
 func setupNatsAPIPKI(t *testing.T) string {
 	t.Helper()
+
+	dsn := "file:" + t.Name() + "-pki?mode=memory&cache=shared"
+	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening pki test db: %v", err)
+	}
+	if err := gdb.AutoMigrate(pki.Models()...); err != nil {
+		t.Fatalf("migrating pki test db: %v", err)
+	}
+	pki.SetDB(gdb)
+	t.Cleanup(func() { pki.SetDB(sharedPKIDB) })
+
 	tmpDir := t.TempDir()
 	pkiDir := filepath.Join(tmpDir, "pki") + "/"
 	config.FarmerPKI = pkiDir
-
-	for _, state := range []string{"unaccepted", "accepted", "denied", "rejected"} {
-		dir := filepath.Join(pkiDir, "sprouts", state)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("create %s dir: %v", state, err)
-		}
-	}
 
 	// Dummy farmer pub key so ReloadNKeys doesn't fatal.
 	farmerPubFile := filepath.Join(tmpDir, "farmer.pub")
@@ -130,11 +141,37 @@ func writeTestPEM(t *testing.T, path, blockType string, data []byte) {
 	}
 }
 
-func writeNKey(t *testing.T, pkiDir, state, sproutID, nkey string) {
+// writeNKey registers sproutID at the given lifecycle state via the same
+// pki functions the handlers under test use, rather than writing storage
+// directly. pkiDir is unused (kept so existing call sites don't need to
+// change) now that PKI state lives in PXC, not on disk.
+func writeNKey(t *testing.T, _, state, sproutID, nkey string) {
 	t.Helper()
-	path := filepath.Join(pkiDir, "sprouts", state, sproutID)
-	if err := os.WriteFile(path, []byte(nkey), 0o600); err != nil {
-		t.Fatalf("write key file %s: %v", path, err)
+	switch state {
+	case "unaccepted":
+		if err := pki.UnacceptNKey(sproutID, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
+		}
+	case "accepted":
+		if err := pki.UnacceptNKey(sproutID, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
+		}
+		if err := pki.AcceptNKey(sproutID); err != nil {
+			t.Fatalf("AcceptNKey(%q): %v", sproutID, err)
+		}
+	case "denied":
+		if err := pki.UnacceptNKey(sproutID, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
+		}
+		if err := pki.DenyNKey(sproutID); err != nil {
+			t.Fatalf("DenyNKey(%q): %v", sproutID, err)
+		}
+	case "rejected":
+		if err := pki.RejectNKey(sproutID, nkey); err != nil {
+			t.Fatalf("RejectNKey(%q): %v", sproutID, err)
+		}
+	default:
+		t.Fatalf("writeNKey: unknown state %q", state)
 	}
 }
 

@@ -129,19 +129,43 @@ type RefreshResult struct {
 	LastRefreshed time.Time `json:"lastRefreshed"`
 }
 
-// Registry holds named cohorts and resolves membership queries.
+// Registry resolves membership queries against cohort *definitions* held
+// in PXC (see store.go) — read-through, no local map of definitions. It
+// still holds its own explicitly-refreshed membership cache (below), which
+// is a distinct, bounded, timer-driven performance feature rather than a
+// cache of the definitions themselves; see store.go's doc comment for why
+// the two aren't the same "in-memory cache" the PXC migration targets.
 type Registry struct {
-	mu      sync.RWMutex
-	cohorts map[string]*Cohort
-	cache   map[string]*CachedMembership
+	mu    sync.RWMutex
+	cache map[string]*CachedMembership
 }
 
-// NewRegistry creates an empty cohort registry.
+// NewRegistry creates a cohort registry scoped to the current tenant.
 func NewRegistry() *Registry {
 	return &Registry{
-		cohorts: make(map[string]*Cohort),
-		cache:   make(map[string]*CachedMembership),
+		cache: make(map[string]*CachedMembership),
 	}
+}
+
+// getCohort reads a single cohort definition from PXC.
+func getCohort(name string) (*Cohort, error) {
+	var row cohortRow
+	if err := db.Where("tenant_id = ? AND name = ?", tenantID(), name).First(&row).Error; err != nil {
+		return nil, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
+	}
+	return row.toCohort(), nil
+}
+
+// listCohorts reads every cohort definition for the current tenant from
+// PXC.
+func listCohorts() map[string]*Cohort {
+	var rows []cohortRow
+	db.Where("tenant_id = ?", tenantID()).Find(&rows)
+	result := make(map[string]*Cohort, len(rows))
+	for _, row := range rows {
+		result[row.Name] = row.toCohort()
+	}
+	return result
 }
 
 // Register adds a cohort to the registry, replacing any existing cohort
@@ -158,11 +182,14 @@ func (r *Registry) Register(c *Cohort) error {
 			}
 		}
 	}
+	if err := upsertCohortRow(cohortRowFrom(c)); err != nil {
+		return err
+	}
+	// Invalidate the membership cache for this cohort since its definition
+	// changed.
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.cohorts[c.Name] = c
-	// Invalidate cache for this cohort since definition changed.
 	delete(r.cache, c.Name)
+	r.mu.Unlock()
 	return nil
 }
 
@@ -182,25 +209,24 @@ func (r *Registry) ValidateReferences() error {
 // every validation error found (missing operands, circular references,
 // exceeded nesting depth). Returns nil if all references are valid.
 func (r *Registry) ValidateReferencesAll() []error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	cohorts := listCohorts()
 	var errs []error
-	for name, c := range r.cohorts {
+	for name, c := range cohorts {
 		if c.Type != CohortTypeCompound {
 			continue
 		}
 		for _, op := range c.Compound.Operands {
-			if _, ok := r.cohorts[op]; !ok {
+			if _, ok := cohorts[op]; !ok {
 				errs = append(errs, fmt.Errorf("%w: cohort %q references unknown operand %q", ErrCohortNotFound, name, op))
 			}
 		}
 	}
 	// Check depth of every compound cohort.
-	for name, c := range r.cohorts {
+	for name, c := range cohorts {
 		if c.Type != CohortTypeCompound {
 			continue
 		}
-		depth, err := r.computeDepth(name, make(map[string]bool))
+		depth, err := computeDepth(cohorts, name, make(map[string]bool))
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -218,11 +244,11 @@ func (r *Registry) ValidateReferencesAll() []error {
 // computeDepth returns the maximum nesting depth for a cohort.
 // Static and dynamic cohorts have depth 0. Compound cohorts have
 // 1 + max(operand depths).
-func (r *Registry) computeDepth(name string, visited map[string]bool) (int, error) {
+func computeDepth(cohorts map[string]*Cohort, name string, visited map[string]bool) (int, error) {
 	if visited[name] {
 		return 0, fmt.Errorf("%w: %q", ErrCircularReference, name)
 	}
-	c, ok := r.cohorts[name]
+	c, ok := cohorts[name]
 	if !ok {
 		return 0, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
 	}
@@ -232,7 +258,7 @@ func (r *Registry) computeDepth(name string, visited map[string]bool) (int, erro
 	visited[name] = true
 	maxChild := 0
 	for _, op := range c.Compound.Operands {
-		d, err := r.computeDepth(op, visited)
+		d, err := computeDepth(cohorts, op, visited)
 		if err != nil {
 			return 0, err
 		}
@@ -246,21 +272,14 @@ func (r *Registry) computeDepth(name string, visited map[string]bool) (int, erro
 
 // Get returns a cohort by name.
 func (r *Registry) Get(name string) (*Cohort, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	c, ok := r.cohorts[name]
-	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
-	}
-	return c, nil
+	return getCohort(name)
 }
 
 // List returns the names of all registered cohorts.
 func (r *Registry) List() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	names := make([]string, 0, len(r.cohorts))
-	for name := range r.cohorts {
+	cohorts := listCohorts()
+	names := make([]string, 0, len(cohorts))
+	for name := range cohorts {
 		names = append(names, name)
 	}
 	return names
@@ -277,14 +296,10 @@ func (r *Registry) GetCachedMembership(name string) (*CachedMembership, bool) {
 // Refresh re-evaluates a named cohort against the current set of sprout IDs
 // and caches the resolved membership with a timestamp. Returns the refresh result.
 func (r *Registry) Refresh(name string, allSproutIDs []string) (*RefreshResult, error) {
-	r.mu.RLock()
-	_, ok := r.cohorts[name]
-	r.mu.RUnlock()
-	if !ok {
+	if _, err := getCohort(name); err != nil {
 		return nil, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
 	}
 
-	// Resolve without holding the lock (Resolve only reads cohorts map).
 	members, err := r.Resolve(name, allSproutIDs)
 	if err != nil {
 		return nil, fmt.Errorf("refreshing cohort %q: %w", name, err)
@@ -338,8 +353,6 @@ func (r *Registry) RefreshAll(allSproutIDs []string) ([]RefreshResult, error) {
 // (needed to evaluate dynamic cohorts). It detects circular references
 // and enforces MaxNestingDepth.
 func (r *Registry) Resolve(name string, allSproutIDs []string) (map[string]bool, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
 	visited := make(map[string]bool)
 	return r.resolve(name, allSproutIDs, visited, 0)
 }
@@ -353,9 +366,9 @@ func (r *Registry) resolve(name string, allSproutIDs []string, visited map[strin
 	}
 	visited[name] = true
 
-	c, ok := r.cohorts[name]
-	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
+	c, err := getCohort(name)
+	if err != nil {
+		return nil, err
 	}
 
 	switch c.Type {

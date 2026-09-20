@@ -1,28 +1,16 @@
 package props
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
-	"sync"
 	"testing"
 )
 
-// resetGlobals resets package-level state so tests are independent.
-func resetGlobals() {
-	propCacheLock.Lock()
-	propCache = make(map[string]map[string]expProp)
-	propCacheLock.Unlock()
-	propsDir = ""
-	propsDirOnce = sync.Once{}
-}
+// TestSetPropPersistsAcrossHandles verifies a prop written through one
+// SetDB-installed handle is visible from a second handle pointed at the
+// same underlying database — the read-through behavior that replaces the
+// old per-process JSON-file cache.
+func TestSetPropPersistsAcrossHandles(t *testing.T) {
+	newTestDB(t)
 
-func TestPersistAndLoad(t *testing.T) {
-	resetGlobals()
-	dir := t.TempDir()
-	InitStore(dir)
-
-	// Set some props.
 	if err := SetProp("sprout-1", "os", "linux"); err != nil {
 		t.Fatal(err)
 	}
@@ -30,49 +18,24 @@ func TestPersistAndLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify the file was written.
-	path := filepath.Join(dir, "sprout-1.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("expected props file to exist: %v", err)
+	if got := GetStringProp("sprout-1", "os"); got != "linux" {
+		t.Errorf("expected 'linux', got %q", got)
 	}
-
-	var kv map[string]interface{}
-	if err := json.Unmarshal(data, &kv); err != nil {
-		t.Fatalf("expected valid JSON: %v", err)
-	}
-
-	if kv["os"] != "linux" || kv["arch"] != "amd64" {
-		t.Errorf("unexpected persisted values: %v", kv)
-	}
-
-	// Reset cache and reload from disk.
-	resetGlobals()
-	InitStore(dir)
-
-	got := GetStringProp("sprout-1", "os")
-	if got != "linux" {
-		t.Errorf("expected 'linux' after reload, got %q", got)
-	}
-	got = GetStringProp("sprout-1", "arch")
-	if got != "amd64" {
-		t.Errorf("expected 'amd64' after reload, got %q", got)
+	if got := GetStringProp("sprout-1", "arch"); got != "amd64" {
+		t.Errorf("expected 'amd64', got %q", got)
 	}
 }
 
-func TestDeleteRemovesFile(t *testing.T) {
-	resetGlobals()
-	dir := t.TempDir()
-	InitStore(dir)
+func TestDeleteRemovesRow(t *testing.T) {
+	newTestDB(t)
 
 	SetProp("sprout-2", "role", "web")
-	path := filepath.Join(dir, "sprout-2.json")
-	if _, err := os.Stat(path); err != nil {
-		t.Fatal("expected file to exist after SetProp")
+	if got := GetStringProp("sprout-2", "role"); got != "web" {
+		t.Fatalf("expected 'web' after SetProp, got %q", got)
 	}
 
 	DeleteProp("sprout-2", "role")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Error("expected file to be removed after deleting last prop")
+	if got := GetStringProp("sprout-2", "role"); got != "" {
+		t.Error("expected empty string after delete")
 	}
 }

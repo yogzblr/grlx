@@ -6,14 +6,8 @@ import (
 	"time"
 )
 
-func resetCache() {
-	propCacheLock.Lock()
-	propCache = make(map[string]map[string]expProp)
-	propCacheLock.Unlock()
-}
-
 func TestSetProp(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	err := setProp("sprout-1", "key1", "value1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -25,7 +19,7 @@ func TestSetProp(t *testing.T) {
 }
 
 func TestSetPropOverwrite(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "key1", "old")
 	setProp("sprout-1", "key1", "new")
 	got := getStringProp("sprout-1", "key1")
@@ -35,7 +29,7 @@ func TestSetPropOverwrite(t *testing.T) {
 }
 
 func TestSetPropEmptySproutID(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	err := setProp("", "key1", "value1")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
@@ -43,7 +37,7 @@ func TestSetPropEmptySproutID(t *testing.T) {
 }
 
 func TestSetPropEmptyName(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	err := setProp("sprout-1", "", "value1")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
@@ -51,7 +45,7 @@ func TestSetPropEmptyName(t *testing.T) {
 }
 
 func TestDeleteProp(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "key1", "value1")
 	err := deleteProp("sprout-1", "key1")
 	if err != nil {
@@ -64,7 +58,7 @@ func TestDeleteProp(t *testing.T) {
 }
 
 func TestDeletePropNonExistent(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	err := deleteProp("sprout-1", "key1")
 	if err != nil {
 		t.Errorf("expected nil error for deleting non-existent prop, got %v", err)
@@ -72,7 +66,7 @@ func TestDeletePropNonExistent(t *testing.T) {
 }
 
 func TestDeletePropEmptySproutID(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	err := deleteProp("", "key1")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
@@ -80,7 +74,7 @@ func TestDeletePropEmptySproutID(t *testing.T) {
 }
 
 func TestDeletePropEmptyName(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	err := deleteProp("sprout-1", "")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
@@ -88,7 +82,7 @@ func TestDeletePropEmptyName(t *testing.T) {
 }
 
 func TestGetStringPropMissingSprout(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	got := getStringProp("no-such-sprout", "key1")
 	if got != "" {
 		t.Errorf("expected empty string, got %q", got)
@@ -96,7 +90,7 @@ func TestGetStringPropMissingSprout(t *testing.T) {
 }
 
 func TestGetStringPropMissingKey(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "key1", "value1")
 	got := getStringProp("sprout-1", "no-such-key")
 	if got != "" {
@@ -105,24 +99,17 @@ func TestGetStringPropMissingKey(t *testing.T) {
 }
 
 func TestGetStringPropExpired(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setPropWithTTL("sprout-1", "key1", "value1", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 	got := getStringProp("sprout-1", "key1")
 	if got != "" {
 		t.Errorf("expected empty string for expired prop, got %q", got)
 	}
-	// Verify it was cleaned up from cache
-	propCacheLock.RLock()
-	_, exists := propCache["sprout-1"]["key1"]
-	propCacheLock.RUnlock()
-	if exists {
-		t.Error("expected expired prop to be removed from cache")
-	}
 }
 
 func TestGetPropsEmpty(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	got := getProps("no-such-sprout")
 	if got != nil {
 		t.Errorf("expected nil, got %v", got)
@@ -130,7 +117,7 @@ func TestGetPropsEmpty(t *testing.T) {
 }
 
 func TestGetPropsMultiple(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "key1", "value1")
 	setProp("sprout-1", "key2", "value2")
 	setProp("sprout-2", "key3", "value3")
@@ -148,7 +135,7 @@ func TestGetPropsMultiple(t *testing.T) {
 }
 
 func TestGetPropsExpiryCleanup(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setPropWithTTL("sprout-1", "keep", "yes", 1*time.Hour)
 	setPropWithTTL("sprout-1", "expire", "no", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
@@ -163,7 +150,7 @@ func TestGetPropsExpiryCleanup(t *testing.T) {
 }
 
 func TestGetStringPropFuncClosure(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "mykey", "myval")
 	fn := GetStringPropFunc("sprout-1")
 	got := fn("mykey")
@@ -173,7 +160,7 @@ func TestGetStringPropFuncClosure(t *testing.T) {
 }
 
 func TestSetPropFuncClosure(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	fn := SetPropFunc("sprout-1")
 	err := fn("key1", "val1")
 	if err != nil {
@@ -186,7 +173,7 @@ func TestSetPropFuncClosure(t *testing.T) {
 }
 
 func TestDeletePropFuncClosure(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "key1", "value1")
 	fn := GetDeletePropFunc("sprout-1")
 	err := fn("key1")
@@ -200,7 +187,7 @@ func TestDeletePropFuncClosure(t *testing.T) {
 }
 
 func TestGetPropsFuncClosure(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-1", "a", "1")
 	fn := GetPropsFunc("sprout-1")
 	got := fn()
@@ -218,7 +205,7 @@ func TestHostnameFunc(t *testing.T) {
 }
 
 func TestConcurrentAccess(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(3)
@@ -239,7 +226,7 @@ func TestConcurrentAccess(t *testing.T) {
 }
 
 func TestIsolationBetweenSprouts(t *testing.T) {
-	resetCache()
+	newTestDB(t)
 	setProp("sprout-a", "shared-key", "alpha")
 	setProp("sprout-b", "shared-key", "beta")
 

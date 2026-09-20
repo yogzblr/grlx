@@ -272,8 +272,18 @@ func TestSubscribeWithAuditLogging(t *testing.T) {
 }
 
 // --- probeSprout integration test ---
+//
+// probeSprout used to be a synchronous NATS request/reply ping to the
+// sprout itself; it now reads a Valkey heartbeat key maintained by
+// internal/heartbeat's $SYS.ACCOUNT.*.CONNECT/DISCONNECT listener (see
+// docs/design/grlx-master-plan.md Phase 1), so a live NATS connection to a
+// mock sprout no longer drives it either way. internal/heartbeat's own
+// test suite covers the event-to-sprout-ID mapping logic; a genuine
+// online/offline round trip needs a live Valkey backend, which this
+// package's test suite doesn't have (see internal/heartbeat's tests for
+// why a fake isn't feasible without one).
 
-func TestProbeSproutSuccess(t *testing.T) {
+func TestProbeSproutNoHeartbeatClient(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
@@ -281,71 +291,10 @@ func TestProbeSproutSuccess(t *testing.T) {
 	natsConn = nc
 	defer func() { natsConn = old }()
 
-	// Subscribe a mock sprout that responds to ping.
-	_, err := nc.Subscribe("grlx.sprouts.test-sprout.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: true})
-		msg.Respond(resp)
-	})
-	if err != nil {
-		t.Fatalf("subscribe mock sprout: %v", err)
-	}
-	nc.Flush()
-
-	if !probeSprout("test-sprout") {
-		t.Error("expected probeSprout to return true for responding sprout")
-	}
-}
-
-func TestProbeSproutTimeout(t *testing.T) {
-	nc, cleanup := startEmbeddedNATS(t)
-	defer cleanup()
-
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// No subscriber for this sprout — should timeout and return false.
-	if probeSprout("nonexistent-sprout") {
-		t.Error("expected probeSprout to return false for unresponsive sprout")
-	}
-}
-
-func TestProbeSproutBadResponse(t *testing.T) {
-	nc, cleanup := startEmbeddedNATS(t)
-	defer cleanup()
-
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// Subscribe a mock sprout that returns invalid JSON.
-	nc.Subscribe("grlx.sprouts.bad-json-sprout.test.ping", func(msg *nats.Msg) {
-		msg.Respond([]byte(`{invalid json`))
-	})
-	nc.Flush()
-
-	if probeSprout("bad-json-sprout") {
-		t.Error("expected probeSprout to return false for bad JSON response")
-	}
-}
-
-func TestProbeSproutNoPong(t *testing.T) {
-	nc, cleanup := startEmbeddedNATS(t)
-	defer cleanup()
-
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// Responds with valid JSON but Pong=false.
-	nc.Subscribe("grlx.sprouts.no-pong.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: false})
-		msg.Respond(resp)
-	})
-	nc.Flush()
-
-	if probeSprout("no-pong") {
-		t.Error("expected probeSprout to return false when Pong is false")
+	// No Valkey client configured anywhere in this test binary — every
+	// sprout must read as offline regardless of NATS connectivity.
+	if probeSprout("test-sprout") {
+		t.Error("expected probeSprout to return false with no heartbeat client configured")
 	}
 }
 
@@ -784,6 +733,12 @@ func TestSubscribeSessionDoneWithError(t *testing.T) {
 
 // --- handleSproutsList with NATS (probeSprout path) ---
 
+// TestHandleSproutsListWithConnectedSprout used to mock a sprout
+// responding to a ping and assert Connected=true; Connected now reflects
+// a Valkey heartbeat key (see internal/heartbeat) instead of a live NATS
+// round trip, so with no Valkey client configured in this test binary
+// every accepted sprout reads as offline regardless of NATS connectivity
+// — see the comment above TestProbeSproutNoHeartbeatClient.
 func TestHandleSproutsListWithConnectedSprout(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
@@ -798,13 +753,6 @@ func TestHandleSproutsListWithConnectedSprout(t *testing.T) {
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	// Subscribe mock sprout to respond to ping.
-	nc.Subscribe("grlx.sprouts.sprout-connected.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: true})
-		msg.Respond(resp)
-	})
-	nc.Flush()
-
 	result, err := handleSproutsList(nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
@@ -815,8 +763,8 @@ func TestHandleSproutsListWithConnectedSprout(t *testing.T) {
 	for _, s := range m["sprouts"] {
 		if s.ID == "sprout-connected" {
 			found = true
-			if !s.Connected {
-				t.Error("expected Connected=true for responding sprout")
+			if s.Connected {
+				t.Error("expected Connected=false with no heartbeat client configured")
 			}
 			break
 		}
@@ -837,13 +785,6 @@ func TestHandleSproutsGetWithNATS(t *testing.T) {
 	natsConn = nc
 	defer func() { natsConn = old }()
 
-	// Mock sprout responds to ping.
-	nc.Subscribe("grlx.sprouts.sprout-get-int.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: true})
-		msg.Respond(resp)
-	})
-	nc.Flush()
-
 	params, _ := json.Marshal(pki.KeyManager{SproutID: "sprout-get-int"})
 	result, err := handleSproutsGet(params)
 	if err != nil {
@@ -854,8 +795,8 @@ func TestHandleSproutsGetWithNATS(t *testing.T) {
 	if info.ID != "sprout-get-int" {
 		t.Errorf("ID = %q, want %q", info.ID, "sprout-get-int")
 	}
-	if !info.Connected {
-		t.Error("expected Connected=true")
+	if info.Connected {
+		t.Error("expected Connected=false with no heartbeat client configured")
 	}
 	if info.KeyState != "accepted" {
 		t.Errorf("KeyState = %q, want %q", info.KeyState, "accepted")
