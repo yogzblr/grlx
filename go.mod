@@ -11,6 +11,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/log v1.0.0
 	github.com/creack/pty v1.1.24
+	github.com/digitalocean/go-smbios v0.0.0-20180907143718-390a4f403a8e
 	github.com/djherbis/atime v1.1.0
 	github.com/fatih/color v1.19.0
 	github.com/gogrlx/snack v0.4.4

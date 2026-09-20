@@ -54,4 +54,32 @@ func storeFacts(sf SystemFacts) {
 		ipsJSON, _ := json.Marshal(sf.IPAddresses)
 		props.SetProp(sid, "ip_addresses", string(ipsJSON))
 	}
+	storeHardwareFacts(sid, sf.Hardware)
+}
+
+// storeHardwareFacts writes non-empty hardware/BIOS facts into the props
+// store. hw is nil when the sprout couldn't reach its SMBIOS table.
+func storeHardwareFacts(sid string, hw *HardwareFacts) {
+	if hw == nil || hw.IsZero() {
+		return
+	}
+	fields := map[string]string{
+		"bios_vendor":           hw.BIOSVendor,
+		"bios_version":          hw.BIOSVersion,
+		"bios_release_date":     hw.BIOSReleaseDate,
+		"system_manufacturer":   hw.SystemManufacturer,
+		"system_product_name":   hw.SystemProductName,
+		"system_serial_number":  hw.SystemSerialNumber,
+		"system_uuid":           hw.SystemUUID,
+		"chassis_manufacturer":  hw.ChassisManufacturer,
+		"chassis_type":          hw.ChassisType,
+		"chassis_serial_number": hw.ChassisSerialNumber,
+		"chassis_asset_tag":     hw.ChassisAssetTag,
+	}
+	for key, value := range fields {
+		if value == "" {
+			continue
+		}
+		props.SetProp(sid, key, value)
+	}
 }
