@@ -296,7 +296,14 @@ func RunNATSServer() {
 	//		log.Panicf("Error configuring server: %v", err)
 	//	}
 	var err error
-	pki.ReloadNKeys()
+	// The bus isn't listening yet at this point, so a resolver push here is
+	// expected to fail in the common case; this call's real purpose is to
+	// sync local JWT/PKI state so ConfigureNats seeds the resolver with an
+	// up-to-date tenant Account JWT below. Not actionable, so log it quietly
+	// and keep starting the bus regardless.
+	if err := pki.ReloadNKeys(); err != nil {
+		log.Debugf("NKey reload before NATS server start (push to not-yet-running bus expected to fail): %v", err)
+	}
 	opts := pki.ConfigureNats()
 	srv, err := nats_server.NewServer(&opts)
 	if err != nil || srv == nil {
@@ -312,7 +319,13 @@ func RunNATSServer() {
 	}
 	setNATSServer(srv)
 	pki.SetNATSServer(srv)
-	pki.ReloadNKeys()
+	// The bus is up and reachable now, so a push failure here is a real,
+	// actionable problem (same class as the SIGHUP handler's reload below).
+	// Don't panic over it though: a later SIGHUP or Accept/Deny call can
+	// still push successfully, so this must be visible but not fatal.
+	if err := pki.ReloadNKeys(); err != nil {
+		log.Errorf("Failed to reload NKeys after starting NATS server: %v", err)
+	}
 }
 
 func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
