@@ -4,13 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"os/exec"
-	"os/user"
-	"runtime"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/gogrlx/grlx/v2/internal/cook"
@@ -112,21 +107,8 @@ func (c Cmd) run(ctx context.Context, test bool) (cook.Result, error) {
 	} else {
 		command = exec.CommandContext(ctx, executable, args...)
 	}
-	if runas != "" && runtime.GOOS != "windows" {
-		u, lookupErr := user.Lookup(runas)
-		if lookupErr != nil {
-			return result, errors.Join(lookupErr, fmt.Errorf("invalid user %s; user must exist", runas))
-		}
-		uid64, strNameErr := strconv.Atoi(u.Uid)
-		if strNameErr != nil {
-			return result, errors.Join(strNameErr, fmt.Errorf("invalid user %s; user must exist", runas))
-		}
-		if uid64 > math.MaxInt32 {
-			return result, fmt.Errorf("UID %d is invalid", uid64)
-		}
-		uid := uint32(uid64)
-		command.SysProcAttr = &syscall.SysProcAttr{}
-		command.SysProcAttr.Credential = &syscall.Credential{Uid: uid}
+	if err := applyRunAs(command, runas); err != nil {
+		return result, err
 	}
 	if path != "" {
 		command.Path = path
