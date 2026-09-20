@@ -40,6 +40,22 @@ func pushAccountUpdate(mat *natsAuthMaterial) error {
 	return publishClaimsUpdate(nc, mat.tenantJWT)
 }
 
+// ConnectSystemAccount dials the configured bus authenticated as the
+// farmer's SYS account, bootstrapping the same trust material ReloadNKeys
+// uses for claims-update pushes. It's exported for internal/heartbeat,
+// which needs a SYS-account connection to subscribe to
+// $SYS.ACCOUNT.*.CONNECT/DISCONNECT — only the SYS account (or a Account
+// with SDK-level system-event permissions) receives those advisories. The
+// caller owns the returned connection and should keep it open for the
+// life of the listener rather than reconnecting per call.
+func ConnectSystemAccount() (*nats.Conn, error) {
+	mat, err := ensureNatsAuth()
+	if err != nil {
+		return nil, fmt.Errorf("bootstrapping NATS auth material: %w", err)
+	}
+	return connectSystemAccount(mat)
+}
+
 func publishClaimsUpdate(nc *nats.Conn, accountJWT string) error {
 	resp, err := nc.Request(claimsUpdateSubject, []byte(accountJWT), pushTimeout)
 	if err != nil {

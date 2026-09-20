@@ -15,7 +15,6 @@ import (
 // any cert-auth login and serves a fixed KV v2 (or, when kvv1 is set,
 // KV v1) secret.
 type mockVault struct {
-	t          *testing.T
 	loginCalls int
 	kvv1       bool
 	secretData map[string]any

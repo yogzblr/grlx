@@ -11,6 +11,7 @@ import (
 )
 
 func TestRoleStoreRegisterAndGet(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 
 	role := &Role{
@@ -37,6 +38,7 @@ func TestRoleStoreRegisterAndGet(t *testing.T) {
 }
 
 func TestRoleStoreGetNotFound(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	_, err := store.Get("missing")
 	if err == nil {
@@ -45,6 +47,7 @@ func TestRoleStoreGetNotFound(t *testing.T) {
 }
 
 func TestRoleStoreList(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	store.Register(&Role{Name: "a", Rules: []Rule{{Action: ActionView}}})
 	store.Register(&Role{Name: "b", Rules: []Rule{{Action: ActionAdmin}}})
@@ -56,6 +59,7 @@ func TestRoleStoreList(t *testing.T) {
 }
 
 func TestRoleStoreRejectInvalid(t *testing.T) {
+	newTestDB(t)
 	store := NewRoleStore()
 	err := store.Register(&Role{Name: "", Rules: []Rule{{Action: ActionView}}})
 	if err == nil {
@@ -64,6 +68,7 @@ func TestRoleStoreRejectInvalid(t *testing.T) {
 }
 
 func TestUserRoleMap(t *testing.T) {
+	newTestDB(t)
 	m := NewUserRoleMap()
 	m.Set("APUBKEY1", "admin")
 	m.Set("APUBKEY2", "viewer")
@@ -85,6 +90,7 @@ func TestUserRoleMap(t *testing.T) {
 }
 
 func TestBuiltinViewerRole(t *testing.T) {
+	newTestDB(t)
 	viewer := BuiltinViewerRole()
 
 	if viewer.Name != "viewer" {
@@ -120,6 +126,7 @@ func TestBuiltinViewerRole(t *testing.T) {
 }
 
 func TestBuiltinViewerRoleRouteAccess(t *testing.T) {
+	newTestDB(t)
 	viewer := BuiltinViewerRole()
 
 	// Routes that should be accessible
@@ -149,6 +156,7 @@ func TestBuiltinViewerRoleRouteAccess(t *testing.T) {
 }
 
 func TestBuiltinOperatorRole(t *testing.T) {
+	newTestDB(t)
 	op := BuiltinOperatorRole()
 
 	if op.Name != "operator" {
@@ -179,6 +187,7 @@ func TestBuiltinOperatorRole(t *testing.T) {
 }
 
 func TestBuiltinOperatorRoleRouteAccess(t *testing.T) {
+	newTestDB(t)
 	op := BuiltinOperatorRole()
 
 	// Routes that should be accessible
@@ -209,6 +218,7 @@ func TestBuiltinOperatorRoleRouteAccess(t *testing.T) {
 }
 
 func TestLoadRolesFromConfig_BuiltinsPresent(t *testing.T) {
+	newTestDB(t)
 	// LoadRolesFromConfig reads from jety, which we can't easily mock here
 	// without side effects. Instead, test that NewRoleStore + built-in roles
 	// work correctly as a unit.
@@ -291,6 +301,7 @@ func TestLoadRolesFromConfig_BuiltinsPresent(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_NoDuplicates(t *testing.T) {
+	newTestDB(t)
 	// With a clean jety state (no users/pubkeys configured), validation passes.
 	err := ValidateUserUniqueness()
 	if err != nil {
@@ -299,6 +310,7 @@ func TestValidateUserUniqueness_NoDuplicates(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_DetectsDuplicate(t *testing.T) {
+	newTestDB(t)
 	// Build a UserRoleMap with a duplicate to verify the detection logic.
 	// Since ValidateUserUniqueness reads from jety directly, we test the
 	// helper-level duplicate detection in a unit-style way.
@@ -321,6 +333,7 @@ func TestValidateUserUniqueness_DetectsDuplicate(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_NoDupeSameSection(t *testing.T) {
+	newTestDB(t)
 	// Two different pubkeys in the same role is fine.
 	seen := make(map[string][]string)
 	seen["APUBKEY_A"] = append(seen["APUBKEY_A"], "users.admin")
@@ -334,6 +347,7 @@ func TestValidateUserUniqueness_NoDupeSameSection(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_CrossSection(t *testing.T) {
+	newTestDB(t)
 	// Same pubkey in users.admin and pubkeys.admin is a duplicate
 	// (even with the same role name, it indicates redundant config).
 	seen := make(map[string][]string)
@@ -352,6 +366,7 @@ func TestValidateUserUniqueness_CrossSection(t *testing.T) {
 }
 
 func TestParseRoleEntry(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name    string
 		input   any
@@ -432,6 +447,7 @@ func clearJetyRBACKeys(t *testing.T) {
 }
 
 func TestLoadRolesFromConfig_Empty(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -459,6 +475,7 @@ func TestLoadRolesFromConfig_Empty(t *testing.T) {
 }
 
 func TestLoadRolesFromConfig_CustomRoles(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -495,6 +512,7 @@ func TestLoadRolesFromConfig_CustomRoles(t *testing.T) {
 }
 
 func TestLoadRolesFromConfig_InvalidAction(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -511,6 +529,7 @@ func TestLoadRolesFromConfig_InvalidAction(t *testing.T) {
 }
 
 func TestLoadRolesFromConfig_OverrideBuiltin(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -539,6 +558,7 @@ func TestLoadRolesFromConfig_OverrideBuiltin(t *testing.T) {
 }
 
 func TestLoadUsersFromConfig_NewFormat(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -563,6 +583,7 @@ func TestLoadUsersFromConfig_NewFormat(t *testing.T) {
 }
 
 func TestLoadUsersFromConfig_LegacyFormat(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -577,6 +598,7 @@ func TestLoadUsersFromConfig_LegacyFormat(t *testing.T) {
 }
 
 func TestLoadUsersFromConfig_NewOverridesLegacy(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -596,6 +618,7 @@ func TestLoadUsersFromConfig_NewOverridesLegacy(t *testing.T) {
 }
 
 func TestLoadUsersFromConfig_Empty(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -606,6 +629,7 @@ func TestLoadUsersFromConfig_Empty(t *testing.T) {
 }
 
 func TestUserRoleMapDelete(t *testing.T) {
+	newTestDB(t)
 	m := NewUserRoleMap()
 	m.Set("KEY1", "admin")
 	m.Set("KEY2", "viewer")
@@ -632,6 +656,7 @@ func TestUserRoleMapDelete(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_WithJety(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -648,6 +673,7 @@ func TestValidateUserUniqueness_WithJety(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_WithJetyDuplicate(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -664,6 +690,7 @@ func TestValidateUserUniqueness_WithJetyDuplicate(t *testing.T) {
 }
 
 func TestValidateUserUniqueness_CrossSectionJety(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -681,6 +708,7 @@ func TestValidateUserUniqueness_CrossSectionJety(t *testing.T) {
 }
 
 func TestValidateUsernameUniqueness_NoDuplicates(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -698,6 +726,7 @@ func TestValidateUsernameUniqueness_NoDuplicates(t *testing.T) {
 }
 
 func TestValidateUsernameUniqueness_DetectsDuplicate(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -723,6 +752,7 @@ func TestValidateUsernameUniqueness_DetectsDuplicate(t *testing.T) {
 }
 
 func TestValidateUsernameUniqueness_SameRoleDuplicate(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -743,6 +773,7 @@ func TestValidateUsernameUniqueness_SameRoleDuplicate(t *testing.T) {
 }
 
 func TestValidateUsernameUniqueness_EmptyUsernamesIgnored(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -759,6 +790,7 @@ func TestValidateUsernameUniqueness_EmptyUsernamesIgnored(t *testing.T) {
 }
 
 func TestValidateUsernameUniqueness_MixedWithAndWithoutUsernames(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -779,6 +811,7 @@ func TestValidateUsernameUniqueness_MixedWithAndWithoutUsernames(t *testing.T) {
 }
 
 func TestValidateUsernameUniqueness_EmptyConfig(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -789,6 +822,7 @@ func TestValidateUsernameUniqueness_EmptyConfig(t *testing.T) {
 }
 
 func TestLoadCohortsFromConfig_Empty(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -803,6 +837,7 @@ func TestLoadCohortsFromConfig_Empty(t *testing.T) {
 }
 
 func TestLoadCohortsFromConfig_Static(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -831,6 +866,7 @@ func TestLoadCohortsFromConfig_Static(t *testing.T) {
 }
 
 func TestLoadCohortsFromConfig_Dynamic(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -865,6 +901,7 @@ func TestLoadCohortsFromConfig_Dynamic(t *testing.T) {
 }
 
 func TestLoadCohortsFromConfig_Compound(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -907,6 +944,7 @@ func TestLoadCohortsFromConfig_Compound(t *testing.T) {
 }
 
 func TestLoadCohortsFromConfig_InvalidType(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 
@@ -925,6 +963,7 @@ func TestLoadCohortsFromConfig_InvalidType(t *testing.T) {
 // --- parseCohortEntry tests ---
 
 func TestParseCohortEntry_Static(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type":    "static",
 		"members": []any{"s1", "s2"},
@@ -946,6 +985,7 @@ func TestParseCohortEntry_Static(t *testing.T) {
 }
 
 func TestParseCohortEntry_NotAMap(t *testing.T) {
+	newTestDB(t)
 	_, err := parseCohortEntry("bad", "not a map")
 	if err == nil {
 		t.Error("expected error for non-map value")
@@ -953,6 +993,7 @@ func TestParseCohortEntry_NotAMap(t *testing.T) {
 }
 
 func TestParseCohortEntry_DynamicMissingPropName(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type": "dynamic",
 		"match": map[string]any{
@@ -967,6 +1008,7 @@ func TestParseCohortEntry_DynamicMissingPropName(t *testing.T) {
 }
 
 func TestParseCohortEntry_DynamicMatchNil(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type":  "dynamic",
 		"match": nil,
@@ -979,6 +1021,7 @@ func TestParseCohortEntry_DynamicMatchNil(t *testing.T) {
 }
 
 func TestParseCohortEntry_DynamicMatchNotMap(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type":  "dynamic",
 		"match": "not a map",
@@ -991,6 +1034,7 @@ func TestParseCohortEntry_DynamicMatchNotMap(t *testing.T) {
 }
 
 func TestParseCohortEntry_CompoundNil(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type":     "compound",
 		"compound": nil,
@@ -1003,6 +1047,7 @@ func TestParseCohortEntry_CompoundNil(t *testing.T) {
 }
 
 func TestParseCohortEntry_CompoundNotMap(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type":     "compound",
 		"compound": "not a map",
@@ -1015,6 +1060,7 @@ func TestParseCohortEntry_CompoundNotMap(t *testing.T) {
 }
 
 func TestParseCohortEntry_CompoundInvalidOperator(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type": "compound",
 		"compound": map[string]any{
@@ -1030,6 +1076,7 @@ func TestParseCohortEntry_CompoundInvalidOperator(t *testing.T) {
 }
 
 func TestParseCohortEntry_CompoundTooFewOperands(t *testing.T) {
+	newTestDB(t)
 	raw := map[string]any{
 		"type": "compound",
 		"compound": map[string]any{
@@ -1047,6 +1094,7 @@ func TestParseCohortEntry_CompoundTooFewOperands(t *testing.T) {
 // --- parseStringSlice tests ---
 
 func TestParseStringSlice(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name  string
 		input any
@@ -1071,6 +1119,7 @@ func TestParseStringSlice(t *testing.T) {
 // --- parseDynamicMatch tests ---
 
 func TestParseDynamicMatch(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name    string
 		input   any
@@ -1115,6 +1164,7 @@ func TestParseDynamicMatch(t *testing.T) {
 // --- parseCompoundExpr tests ---
 
 func TestParseCompoundExpr(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name    string
 		input   any
@@ -1172,6 +1222,7 @@ func TestParseCompoundExpr(t *testing.T) {
 }
 
 func TestUserRoleMapUsername(t *testing.T) {
+	newTestDB(t)
 	m := NewUserRoleMap()
 
 	m.Set("APUBKEY1", "admin")
@@ -1195,6 +1246,7 @@ func TestUserRoleMapUsername(t *testing.T) {
 }
 
 func TestUserRoleMapDeleteRemovesUsername(t *testing.T) {
+	newTestDB(t)
 	m := NewUserRoleMap()
 	m.Set("APUBKEY1", "admin")
 	m.SetUsername("APUBKEY1", "alice")
@@ -1210,6 +1262,7 @@ func TestUserRoleMapDeleteRemovesUsername(t *testing.T) {
 }
 
 func TestParseUserEntries(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name  string
 		input any
@@ -1287,6 +1340,7 @@ func TestParseUserEntries(t *testing.T) {
 }
 
 func TestLoadUsersWithUsernames(t *testing.T) {
+	newTestDB(t)
 	setupJetyForRBACTest(t)
 	defer clearJetyRBACKeys(t)
 

@@ -43,6 +43,19 @@ func (g *gzipResponseWriter) WriteHeader(code int) {
 	// Don't write header yet — wait for sniff to decide Content-Type.
 }
 
+// CodeQL's go/reflected-xss query flags this Write and flush's Write below
+// (alerts #13/#14) via a data-flow path it traces back to
+// internal/objectstore/objectstoretest's fake S3 test server, which echoes
+// a URL path segment into an error response body. That package is imported
+// only by _test.go files (internal/objectstore/objectstore_test.go,
+// internal/natsapi/testmain_test.go, internal/cook/testmain_test.go) — it
+// is never linked into the grlx serve/farmer binaries, so its handler can
+// never run in the same process as this middleware, let alone share a
+// request with it. There is no real call path connecting the two; this is
+// a spurious cross-function flow CodeQL's global taint analysis stitched
+// together from two unrelated http.ResponseWriter.Write([]byte) sinks with
+// matching type shapes. Dismissed as a false positive — see the PR that
+// added this comment for the full trace.
 func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	if !g.sniffDone {
 		g.sniffBuf = append(g.sniffBuf, b...)
@@ -85,6 +98,8 @@ func (g *gzipResponseWriter) flush() error {
 	}
 
 	// Not compressible — write raw.
+	// See the CodeQL false-positive note on gzipResponseWriter.Write above
+	// (alerts #13/#14) — applies equally to this Write call.
 	if g.statusCode == 0 {
 		g.statusCode = http.StatusOK
 	}

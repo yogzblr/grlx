@@ -2,7 +2,6 @@ package cook
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 )
@@ -27,12 +26,12 @@ func TestResolveRecipeFilePath(t *testing.T) {
 		id:       "file doesn't exist",
 		recipe:   "",
 		filepath: "",
-		err:      os.ErrNotExist,
+		err:      ErrNoRecipe,
 	}, {
 		id:       "apache dot grlx",
 		recipe:   "apache.grlx",
 		filepath: "",
-		err:      os.ErrNotExist,
+		err:      ErrNoRecipe,
 	}, {
 		id:       "apache dot apache dot grlx",
 		recipe:   "apache.apache.grlx",

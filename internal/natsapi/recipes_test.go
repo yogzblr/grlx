@@ -1,6 +1,7 @@
 package natsapi
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -25,10 +26,7 @@ func TestHandleRecipesList(t *testing.T) {
 	}
 	for relPath, content := range recipes {
 		fullPath := filepath.Join(tmpDir, relPath)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		if err := recipeStore.Put(context.Background(), fullPath, []byte(content)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -72,10 +70,7 @@ func TestHandleRecipesGet(t *testing.T) {
 
 	content := "steps:\n  install_nginx:\n    pkg.installed:\n      - name: nginx\n"
 	recipePath := filepath.Join(tmpDir, "webserver", "nginx.grlx")
-	if err := os.MkdirAll(filepath.Dir(recipePath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(recipePath, []byte(content), 0o644); err != nil {
+	if err := recipeStore.Put(context.Background(), recipePath, []byte(content)); err != nil {
 		t.Fatal(err)
 	}
 

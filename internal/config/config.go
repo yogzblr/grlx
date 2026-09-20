@@ -74,6 +74,27 @@ var (
 	SproutID              string
 	SproutPKI             string
 	SproutRootCA          string
+
+	// PXCDSN is the GORM MySQL DSN for the shared Percona XtraDB Cluster's
+	// `farmer` schema (PKI, props/facts, RBAC — see internal/pxc,
+	// internal/props/store.go, internal/pki/store.go,
+	// internal/rbac/store.go), e.g.
+	// "farmer_svc:pass@tcp(pxc-cluster:3306)/farmer?parseTime=true".
+	PXCDSN string
+
+	// ValkeyAddrs is the comma-separated list of Valkey node addresses
+	// (host:port) backing the connection-state heartbeat (see
+	// internal/heartbeat).
+	ValkeyAddrs string
+
+	// S3Endpoint/S3AccessKeyID/S3SecretAccessKey/S3UseSSL/S3Bucket
+	// configure the object-storage backend recipes are read from (see
+	// internal/objectstore, internal/cook/store.go).
+	S3Endpoint        string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3UseSSL          bool
+	S3Bucket          string
 )
 
 // Binary represents the type of grlx binary being configured.
@@ -181,10 +202,46 @@ func LoadConfig(binary string) {
 			jety.SetDefault("rootca", filepath.Join(systemConfigRoot, "pki/farmer/tls-rootca.pem"))
 			jety.SetDefault("rootcapriv", filepath.Join(systemConfigRoot, "pki/farmer/tls-rootca-key.pem"))
 			jety.SetDefault("farmerorganization", "grlx farmer")
+			jety.SetDefault("s3usessl", true)
 			JobLogDir = jety.GetString("joblogdir")
 			JobLogTTL = jety.GetDuration("joblogttl")
 			PropsDir = jety.GetString("propsdir")
 			CertHosts = jety.GetStringSlice("certhosts")
+
+			// PXC/Valkey/S3 connection settings are deployment secrets, not
+			// meaningful YAML defaults — like ADMIN_PUBKEYS/CERT_HOSTS below,
+			// they're read from the environment when the config file doesn't
+			// set them, rather than given a default value.
+			if jety.GetString("pxcdsn") == "" {
+				if v, found := os.LookupEnv("GRLX_PXC_DSN"); found {
+					jety.Set("pxcdsn", v)
+				}
+			}
+			if jety.GetString("valkeyaddrs") == "" {
+				if v, found := os.LookupEnv("GRLX_VALKEY_ADDRS"); found {
+					jety.Set("valkeyaddrs", v)
+				}
+			}
+			if jety.GetString("s3endpoint") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_ENDPOINT"); found {
+					jety.Set("s3endpoint", v)
+				}
+			}
+			if jety.GetString("s3accesskeyid") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_ACCESS_KEY_ID"); found {
+					jety.Set("s3accesskeyid", v)
+				}
+			}
+			if jety.GetString("s3secretaccesskey") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_SECRET_ACCESS_KEY"); found {
+					jety.Set("s3secretaccesskey", v)
+				}
+			}
+			if jety.GetString("s3bucket") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_BUCKET"); found {
+					jety.Set("s3bucket", v)
+				}
+			}
 
 			AdminPubKeys := jety.GetStringMap("pubkeys")
 			if len(AdminPubKeys) == 0 {
@@ -307,6 +364,13 @@ func LoadConfig(binary string) {
 	if RecipeDir == "" {
 		RecipeDir = filepath.Join("/", "srv", "grlx", "recipes", "prod")
 	}
+	PXCDSN = jety.GetString("pxcdsn")
+	ValkeyAddrs = jety.GetString("valkeyaddrs")
+	S3Endpoint = jety.GetString("s3endpoint")
+	S3AccessKeyID = jety.GetString("s3accesskeyid")
+	S3SecretAccessKey = jety.GetString("s3secretaccesskey")
+	S3UseSSL = jety.GetBool("s3usessl")
+	S3Bucket = jety.GetString("s3bucket")
 }
 
 // BasePathValid checks that the configured recipe directory exists.

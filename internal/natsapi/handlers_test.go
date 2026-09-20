@@ -597,12 +597,22 @@ func TestHandlePropsInvalidJSON(t *testing.T) {
 
 // --- Cohorts handler tests ---
 
+// setupCohortRegistry installs a fresh cohort registry for the test.
+// Registry no longer holds its own storage (cohort definitions live in
+// PXC, read-through — see internal/rbac/store.go), so a "fresh" registry
+// alone wouldn't isolate this test's cohorts from others sharing this
+// package's test-wide rbac db (see testmain_test.go); scoping to a
+// per-test tenant via config.FarmerOrganization does.
 func setupCohortRegistry(t *testing.T) func() {
 	t.Helper()
-	old := cohortRegistry
+	oldReg, oldOrg := cohortRegistry, config.FarmerOrganization
+	config.FarmerOrganization = t.Name()
 	reg := rbac.NewRegistry()
 	cohortRegistry = reg
-	return func() { cohortRegistry = old }
+	return func() {
+		cohortRegistry = oldReg
+		config.FarmerOrganization = oldOrg
+	}
 }
 
 func TestHandleCohortsListEmpty(t *testing.T) {

@@ -234,7 +234,7 @@ func TestRelativeRecipeToAbsolute(t *testing.T) {
 		id:              "file doesn't exist",
 		recipe:          "",
 		filepath:        "",
-		err:             os.ErrNotExist,
+		err:             ErrNoRecipe,
 		relatedFilepath: "",
 	}, {
 		id:              "valid missing recipe",

@@ -5,11 +5,7 @@ import (
 )
 
 func TestLoadStaticProps(t *testing.T) {
-	// Reset cache state.
-	propCacheLock.Lock()
-	propCache = make(map[string]map[string]expProp)
-	propCacheLock.Unlock()
-	staticPropKeys = make(map[string]map[string]bool)
+	newTestDB(t)
 
 	cfg := map[string]interface{}{
 		"web-1": map[string]interface{}{
@@ -52,15 +48,13 @@ func TestLoadStaticProps(t *testing.T) {
 }
 
 func TestLoadStaticPropsNil(t *testing.T) {
+	newTestDB(t)
 	// Should not panic.
 	LoadStaticProps(nil)
 }
 
 func TestClearStaticProps(t *testing.T) {
-	propCacheLock.Lock()
-	propCache = make(map[string]map[string]expProp)
-	propCacheLock.Unlock()
-	staticPropKeys = make(map[string]map[string]bool)
+	newTestDB(t)
 
 	cfg := map[string]interface{}{
 		"web-1": map[string]interface{}{
@@ -89,33 +83,8 @@ func TestClearStaticProps(t *testing.T) {
 	}
 }
 
-func TestStaticPropsNotPersisted(t *testing.T) {
-	// Reset.
-	propCacheLock.Lock()
-	propCache = make(map[string]map[string]expProp)
-	propCacheLock.Unlock()
-	staticPropKeys = make(map[string]map[string]bool)
-	// Ensure propsDir is empty so persistSprout is a no-op.
-	propsDir = ""
-
-	cfg := map[string]interface{}{
-		"s1": map[string]interface{}{
-			"key": "val",
-		},
-	}
-	LoadStaticProps(cfg)
-
-	// Verify prop is in cache.
-	if got := GetStringProp("s1", "key"); got != "val" {
-		t.Errorf("expected 'val', got %q", got)
-	}
-}
-
 func TestLoadStaticPropsInvalidEntry(t *testing.T) {
-	propCacheLock.Lock()
-	propCache = make(map[string]map[string]expProp)
-	propCacheLock.Unlock()
-	staticPropKeys = make(map[string]map[string]bool)
+	newTestDB(t)
 
 	// "bad-sprout" has a non-map value — should be skipped without panic.
 	cfg := map[string]interface{}{

@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"gorm.io/gorm"
 
 	apitypes "github.com/gogrlx/grlx/v2/internal/api/types"
 	"github.com/gogrlx/grlx/v2/internal/config"
@@ -19,23 +21,46 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
+// setupPingTestPKI wires up an in-memory PKI store (see
+// internal/pki/store.go) plus the minimal config ReloadNKeys (called via
+// defer by every pki lifecycle function) needs to fail fast rather than
+// fatally: a dummy farmer pub key file so it doesn't log.Fatalf, and no
+// FarmerBusURL/RootCA so its network push to the resolver errors out
+// immediately instead of attempting a real connection.
 func setupPingTestPKI(t *testing.T) string {
 	t.Helper()
+	dsn := "file:" + t.Name() + "-pki?mode=memory&cache=shared"
+	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening pki test db: %v", err)
+	}
+	if err := gdb.AutoMigrate(pki.Models()...); err != nil {
+		t.Fatalf("migrating pki test db: %v", err)
+	}
+	pki.SetDB(gdb)
+	t.Cleanup(func() { pki.SetDB(nil) })
+
 	dir := t.TempDir()
 	config.FarmerPKI = dir + "/"
-	for _, state := range []string{"accepted", "unaccepted", "denied", "rejected"} {
-		if err := os.MkdirAll(filepath.Join(dir, "sprouts", state), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	farmerPubFile := filepath.Join(dir, "farmer.pub")
+	if err := os.WriteFile(farmerPubFile, []byte("UFAKE_FARMER_KEY_FOR_TESTING"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	config.NKeyFarmerPubFile = farmerPubFile
+	pki.NatsServer = nil
 	return dir
 }
 
-func addPingTestSprout(t *testing.T, dir, state, id, nkey string) {
+// addPingTestSprout registers id as an accepted sprout with the given
+// nkey, via the same lifecycle pki.UnacceptNKey/AcceptNKey handlers use in
+// production.
+func addPingTestSprout(t *testing.T, id, nkey string) {
 	t.Helper()
-	path := filepath.Join(dir, "sprouts", state, id)
-	if err := os.WriteFile(path, []byte(nkey), 0o644); err != nil {
-		t.Fatal(err)
+	if err := pki.UnacceptNKey(id, nkey); err != nil {
+		t.Fatalf("UnacceptNKey(%q): %v", id, err)
+	}
+	if err := pki.AcceptNKey(id); err != nil {
+		t.Fatalf("AcceptNKey(%q): %v", id, err)
 	}
 }
 
@@ -152,8 +177,8 @@ func TestHTestPing_EmptyBody(t *testing.T) {
 }
 
 func TestHTestPing_MultipleTargetsOneInvalid(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "valid-sprout", "UKEY1")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "valid-sprout", "UKEY1")
 
 	ta := apitypes.TargetedAction{
 		Target: []pki.KeyManager{
@@ -174,8 +199,8 @@ func TestHTestPing_MultipleTargetsOneInvalid(t *testing.T) {
 }
 
 func TestHTestPing_MultipleTargetsOneUnregistered(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "real-sprout", "UKEY1")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "real-sprout", "UKEY1")
 
 	ta := apitypes.TargetedAction{
 		Target: []pki.KeyManager{
@@ -198,8 +223,8 @@ func TestHTestPing_MultipleTargetsOneUnregistered(t *testing.T) {
 // === Happy path tests (require embedded NATS) ===
 
 func TestHTestPing_SingleSproutSuccess(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "sprout1", "UKEY1")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "sprout1", "UKEY1")
 
 	nc, cleanup := startTestNATSServer(t)
 	defer cleanup()
@@ -242,9 +267,9 @@ func TestHTestPing_SingleSproutSuccess(t *testing.T) {
 }
 
 func TestHTestPing_MultipleSproutsSuccess(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "sprout-a", "UKEYA")
-	addPingTestSprout(t, dir, "accepted", "sprout-b", "UKEYB")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "sprout-a", "UKEYA")
+	addPingTestSprout(t, "sprout-b", "UKEYB")
 
 	nc, cleanup := startTestNATSServer(t)
 	defer cleanup()
@@ -295,8 +320,8 @@ func TestHTestPing_MultipleSproutsSuccess(t *testing.T) {
 }
 
 func TestHTestPing_SproutTimeout(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "slow-sprout", "UKEY1")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "slow-sprout", "UKEY1")
 
 	_, cleanup := startTestNATSServer(t)
 	defer cleanup()
@@ -349,8 +374,8 @@ func TestHTestPing_EmptyTargetList(t *testing.T) {
 }
 
 func TestHTestPing_SproutInvalidResponseJSON(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "bad-json-sprout", "UKEY1")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "bad-json-sprout", "UKEY1")
 
 	nc, cleanup := startTestNATSServer(t)
 	defer cleanup()
@@ -381,8 +406,8 @@ func TestHTestPing_SproutInvalidResponseJSON(t *testing.T) {
 }
 
 func TestHTestPing_NilAction(t *testing.T) {
-	dir := setupPingTestPKI(t)
-	addPingTestSprout(t, dir, "accepted", "sprout-nil", "UKEY1")
+	setupPingTestPKI(t)
+	addPingTestSprout(t, "sprout-nil", "UKEY1")
 
 	nc, cleanup := startTestNATSServer(t)
 	defer cleanup()

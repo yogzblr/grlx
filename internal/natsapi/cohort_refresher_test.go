@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
 )
 
@@ -20,7 +21,9 @@ func TestStartCohortRefresher_DisabledOnZeroInterval(t *testing.T) {
 }
 
 func TestStartCohortRefresher_StopsOnCancel(t *testing.T) {
-	old := cohortRegistry
+	oldReg, oldOrg := cohortRegistry, config.FarmerOrganization
+	config.FarmerOrganization = t.Name()
+	defer func() { config.FarmerOrganization = oldOrg }()
 	cohortRegistry = rbac.NewRegistry()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -32,7 +35,7 @@ func TestStartCohortRefresher_StopsOnCancel(t *testing.T) {
 	// Cancel and wait for the goroutine to fully exit before restoring.
 	cancel()
 	<-done
-	cohortRegistry = old
+	cohortRegistry = oldReg
 }
 
 func TestRefreshAllCohorts_NilRegistry(t *testing.T) {
@@ -45,8 +48,12 @@ func TestRefreshAllCohorts_NilRegistry(t *testing.T) {
 }
 
 func TestRefreshAllCohorts_EmptyRegistry(t *testing.T) {
-	old := cohortRegistry
-	defer func() { cohortRegistry = old }()
+	oldReg, oldOrg := cohortRegistry, config.FarmerOrganization
+	config.FarmerOrganization = t.Name()
+	defer func() {
+		cohortRegistry = oldReg
+		config.FarmerOrganization = oldOrg
+	}()
 	cohortRegistry = rbac.NewRegistry()
 
 	// Should not panic with an empty registry.
@@ -54,8 +61,12 @@ func TestRefreshAllCohorts_EmptyRegistry(t *testing.T) {
 }
 
 func TestRefreshAllCohorts_WithStaticCohort(t *testing.T) {
-	old := cohortRegistry
-	defer func() { cohortRegistry = old }()
+	oldReg, oldOrg := cohortRegistry, config.FarmerOrganization
+	config.FarmerOrganization = t.Name()
+	defer func() {
+		cohortRegistry = oldReg
+		config.FarmerOrganization = oldOrg
+	}()
 
 	reg := rbac.NewRegistry()
 	err := reg.Register(&rbac.Cohort{

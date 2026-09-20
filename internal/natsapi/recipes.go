@@ -1,21 +1,21 @@
 package natsapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
 )
 
 // RecipeInfo represents a recipe file in the listing.
 type RecipeInfo struct {
 	// Name is the dot-notation recipe name (e.g., "webserver.nginx").
 	Name string `json:"name"`
-	// Path is the relative file path from the recipe root.
+	// Path is the object key relative to the recipe root.
 	Path string `json:"path"`
 	// Size is the file size in bytes.
 	Size int64 `json:"size"`
@@ -29,61 +29,56 @@ type RecipeContent struct {
 	Size    int64  `json:"size"`
 }
 
+// recipeStore is the object-storage backend recipes are read from — see
+// docs/design/grlx-master-plan.md Phase 1 and internal/cook/store.go's
+// identical seam. Set once at startup via SetRecipeStore, alongside
+// cook.SetStore, with the same *objectstore.Store instance.
+var recipeStore *objectstore.Store
+
+// SetRecipeStore installs the object-storage backend this package reads
+// recipes from.
+func SetRecipeStore(s *objectstore.Store) { recipeStore = s }
+
 func handleRecipesList(_ json.RawMessage) (any, error) {
+	if recipeStore == nil {
+		return nil, fmt.Errorf("recipe store not configured")
+	}
 	recipeDir := config.RecipeDir
 	if recipeDir == "" {
 		return nil, fmt.Errorf("recipe directory not configured")
 	}
 
-	info, err := os.Stat(recipeDir)
+	ctx := context.Background()
+	ext := "." + config.GrlxExt
+	prefix := strings.TrimSuffix(recipeDir, "/") + "/"
+
+	keys, err := recipeStore.List(ctx, prefix)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string][]RecipeInfo{"recipes": {}}, nil
-		}
-		return nil, fmt.Errorf("cannot access recipe directory: %w", err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("recipe path is not a directory: %s", recipeDir)
+		return nil, fmt.Errorf("error listing recipes: %w", err)
 	}
 
 	var recipes []RecipeInfo
-	ext := "." + config.GrlxExt
-
-	err = filepath.WalkDir(recipeDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil // skip inaccessible entries
+	for _, key := range keys {
+		if !strings.HasSuffix(key, ext) {
+			continue
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(d.Name(), ext) {
-			return nil
-		}
-
-		relPath, relErr := filepath.Rel(recipeDir, path)
-		if relErr != nil {
-			return nil
-		}
+		relPath := strings.TrimPrefix(key, prefix)
 
 		// Convert file path to dot-notation recipe name:
 		// "webserver/nginx.grlx" -> "webserver.nginx"
 		name := strings.TrimSuffix(relPath, ext)
-		name = strings.ReplaceAll(name, string(filepath.Separator), ".")
+		name = strings.ReplaceAll(name, "/", ".")
 
-		fi, statErr := d.Info()
-		if statErr != nil {
-			return nil
+		size := int64(-1)
+		if s, statErr := recipeStore.Size(ctx, key); statErr == nil {
+			size = s
 		}
 
 		recipes = append(recipes, RecipeInfo{
 			Name: name,
 			Path: relPath,
-			Size: fi.Size(),
+			Size: size,
 		})
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error walking recipe directory: %w", err)
 	}
 
 	if recipes == nil {
@@ -108,44 +103,28 @@ func handleRecipesGet(params json.RawMessage) (any, error) {
 	if recipeName == "" {
 		return nil, fmt.Errorf("recipe name is required")
 	}
-
+	if recipeStore == nil {
+		return nil, fmt.Errorf("recipe store not configured")
+	}
 	recipeDir := config.RecipeDir
 	if recipeDir == "" {
 		return nil, fmt.Errorf("recipe directory not configured")
 	}
 
-	// Convert dot-notation to file path and resolve
-	// Use the same resolution logic as the cook system
-	relPath := strings.ReplaceAll(recipeName, ".", string(filepath.Separator)) + "." + config.GrlxExt
-	fullPath := filepath.Join(recipeDir, relPath)
-	fullPath = filepath.Clean(fullPath)
+	// Convert dot-notation to an object key. Object storage has no
+	// directory-traversal concept the way a local filesystem does — a
+	// crafted name containing ".." just names a distinct, harmless key,
+	// never a path outside the bucket — so unlike the old local-disk
+	// version, no separate path-traversal check is needed here.
+	relPath := strings.ReplaceAll(recipeName, ".", "/") + "." + config.GrlxExt
+	key := filepath.Join(recipeDir, relPath)
 
-	// Security: ensure the resolved path is within the recipe directory
-	absRecipeDir, err := filepath.Abs(recipeDir)
+	ctx := context.Background()
+	content, err := recipeStore.Get(ctx, key)
 	if err != nil {
-		return nil, fmt.Errorf("cannot resolve recipe directory: %w", err)
-	}
-	absFullPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		return nil, fmt.Errorf("cannot resolve recipe path: %w", err)
-	}
-	if !strings.HasPrefix(absFullPath, absRecipeDir+string(filepath.Separator)) {
-		return nil, fmt.Errorf("invalid recipe name: path traversal detected")
-	}
-
-	fi, err := os.Stat(fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
+		if objectstore.IsNotExist(err) {
 			return nil, fmt.Errorf("recipe not found: %s", recipeName)
 		}
-		return nil, fmt.Errorf("cannot access recipe: %w", err)
-	}
-	if fi.IsDir() {
-		return nil, fmt.Errorf("recipe path is a directory: %s", recipeName)
-	}
-
-	content, err := os.ReadFile(fullPath)
-	if err != nil {
 		return nil, fmt.Errorf("cannot read recipe: %w", err)
 	}
 
@@ -153,6 +132,6 @@ func handleRecipesGet(params json.RawMessage) (any, error) {
 		Name:    recipeName,
 		Path:    relPath,
 		Content: string(content),
-		Size:    fi.Size(),
+		Size:    int64(len(content)),
 	}, nil
 }

@@ -129,7 +129,7 @@ func dialAsSprout(t *testing.T, sproutJWT string, seed []byte) (*nats.Conn, erro
 }
 
 func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 	useRealFarmerKey(t)
 	defer startTestBus(t)()
 
@@ -145,7 +145,7 @@ func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get sprout seed: %v", err)
 	}
-	writeKey(t, pkiDir, "unaccepted", "sprout01", sproutPub)
+	writeKey(t, "unaccepted", "sprout01", sproutPub)
 
 	// Unaccepted: no User JWT minted yet, so there's nothing valid to
 	// connect with regardless of the bus's state.
@@ -236,14 +236,14 @@ func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {
 }
 
 func TestJWTLifecycle_RejectAlsoRevokes(t *testing.T) {
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 	useRealFarmerKey(t)
 	defer startTestBus(t)()
 
 	sproutKP, _ := nkeys.CreateUser()
 	sproutPub, _ := sproutKP.PublicKey()
 	sproutSeed, _ := sproutKP.Seed()
-	writeKey(t, pkiDir, "unaccepted", "rogue01", sproutPub)
+	writeKey(t, "unaccepted", "rogue01", sproutPub)
 
 	if err := AcceptNKey("rogue01"); err != nil {
 		t.Fatalf("AcceptNKey failed: %v", err)
@@ -280,7 +280,7 @@ func TestJWTLifecycle_RejectAlsoRevokes(t *testing.T) {
 // update never reaches the bus's resolver, so the bus never learns the
 // sprout's key is now valid and the dial below is rejected.
 func TestReloadNKeys_PushesWithoutLocalNatsServerHandle(t *testing.T) {
-	pkiDir := setupTestPKI(t)
+	setupTestPKI(t)
 	useRealFarmerKey(t)
 	defer startTestBusWithoutLocalHandle(t)()
 
@@ -300,7 +300,7 @@ func TestReloadNKeys_PushesWithoutLocalNatsServerHandle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get sprout seed: %v", err)
 	}
-	writeKey(t, pkiDir, "unaccepted", "split-sprout01", sproutPub)
+	writeKey(t, "unaccepted", "split-sprout01", sproutPub)
 
 	// Accept: this calls ReloadNKeys via defer with no local NatsServer
 	// handle. It must still push the updated tenant Account JWT to the
