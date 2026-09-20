@@ -2,11 +2,13 @@ package certs
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -17,6 +19,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,17 +100,18 @@ func obAdminRequest(t *testing.T, addr, token, method, path string, body any) {
 	}
 }
 
-// setupOpenBaoPKI mounts a fresh PKI secrets engine and a permissive test
-// role on a local OpenBao dev server, points the certs package at it via
-// the GRLX_CERTS_OPENBAO_* environment variables, and skips the test if
-// no dev server is reachable.
-func setupOpenBaoPKI(t *testing.T) {
+// resolveTestOpenBaoServer resolves the local OpenBao dev server address
+// and root token to use for integration tests (defaulting to
+// http://127.0.0.1:8200 / "root", overridable via
+// GRLX_CERTS_TEST_OPENBAO_ADDR / GRLX_CERTS_TEST_OPENBAO_TOKEN), and skips
+// the calling test if no dev server is reachable there.
+func resolveTestOpenBaoServer(t *testing.T) (addr, token string) {
 	t.Helper()
-	addr := os.Getenv(testOpenBaoAddrEnv)
+	addr = os.Getenv(testOpenBaoAddrEnv)
 	if addr == "" {
 		addr = "http://127.0.0.1:8200"
 	}
-	token := os.Getenv(testOpenBaoTokenEnv)
+	token = os.Getenv(testOpenBaoTokenEnv)
 	if token == "" {
 		token = "root"
 	}
@@ -118,6 +123,16 @@ func setupOpenBaoPKI(t *testing.T) {
 			"`bao server -dev -dev-root-token-id=%s`): %v", addr, token, err)
 	}
 	resp.Body.Close()
+	return addr, token
+}
+
+// setupOpenBaoPKI mounts a fresh PKI secrets engine and a permissive test
+// role on a local OpenBao dev server, points the certs package at it via
+// the GRLX_CERTS_OPENBAO_* environment variables, and skips the test if
+// no dev server is reachable.
+func setupOpenBaoPKI(t *testing.T) {
+	t.Helper()
+	addr, token := resolveTestOpenBaoServer(t)
 
 	mount := fmt.Sprintf("pki-grlx-test-%d", time.Now().UnixNano())
 	role := "grlx-test"
@@ -162,6 +177,483 @@ func setupOpenBaoTLS(t *testing.T) string {
 	dir := setupTLSConfigDir(t)
 	setupOpenBaoPKI(t)
 	return dir
+}
+
+// --- Kubernetes auth test scaffolding -----------------------------------
+//
+// OpenBao's kubernetes auth method validates a login by (1) optionally
+// checking the JWT's signature locally against configured pem_keys (these
+// tests configure none, which is one of OpenBao's own supported modes --
+// see internal/builtin/credential/kubernetes/path_login.go's
+// parseAndValidateJWT in a local openbao/openbao checkout: "we don't
+// verify the signature if we aren't configured with public keys"), then
+// (2) unconditionally calling the Kubernetes API's TokenReview endpoint
+// to confirm the token is still live. (2) is real cluster infrastructure
+// this repo has no access to, so these tests fake just that one HTTP
+// endpoint (newFakeK8sTokenReviewServer) and point a real local OpenBao
+// dev server's kubernetes_host at it. Every other part of the flow --
+// OpenBao itself, this package's login/token-refresh code, the resulting
+// token actually being used for PKI calls -- is genuine, not mocked.
+
+// newFakeK8sTokenReviewServer starts a local HTTP server implementing
+// just enough of the Kubernetes TokenReview API
+// (POST /apis/authentication.k8s.io/v1/tokenreviews) for OpenBao's
+// kubernetes auth method to complete a login against it. It always
+// reports the token as authenticated for the given identity, regardless
+// of the token's actual signature (verified against a live OpenBao dev
+// server: OpenBao only checks the signature itself when pem_keys is
+// configured -- these tests don't -- so this mirrors a real, supported
+// OpenBao configuration, not a shortcut around one).
+func newFakeK8sTokenReviewServer(t *testing.T, namespace, name, uid string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/apis/authentication.k8s.io/v1/tokenreviews", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"kind":       "TokenReview",
+			"apiVersion": "authentication.k8s.io/v1",
+			"status": map[string]any{
+				"authenticated": true,
+				"user": map[string]any{
+					"username": fmt.Sprintf("system:serviceaccount:%s:%s", namespace, name),
+					"uid":      uid,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// writeFixtureK8sJWT builds a JWT shaped like a Kubernetes projected
+// service account token -- enough for OpenBao's kubernetes auth backend
+// to parse the claims it needs (namespace/serviceaccount name/uid) -- and
+// writes it to a temp file, returning the path. Its signature is garbage;
+// see newFakeK8sTokenReviewServer's doc comment for why that's fine here.
+func writeFixtureK8sJWT(t *testing.T, namespace, name, uid string) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal JWT fixture segment: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	header := enc(map[string]string{"alg": "RS256", "typ": "JWT"})
+	payload := enc(map[string]any{
+		"iss": "kubernetes/serviceaccount",
+		"kubernetes.io": map[string]any{
+			"namespace":      namespace,
+			"serviceaccount": map[string]any{"name": name, "uid": uid},
+		},
+	})
+	sig := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte("x"), 32))
+	jwt := header + "." + payload + "." + sig
+
+	path := filepath.Join(t.TempDir(), "sa-token")
+	if err := os.WriteFile(path, []byte(jwt), 0o600); err != nil {
+		t.Fatalf("write fixture SA JWT: %v", err)
+	}
+	return path
+}
+
+// setupOpenBaoKubernetesAuth enables and configures OpenBao's kubernetes
+// auth method on a real local OpenBao dev server, pointed at a fake local
+// TokenReview server (see newFakeK8sTokenReviewServer), and creates a
+// role bound to a fixture service account. It returns the auth mount and
+// role names and a path to a fixture SA JWT for that service account,
+// ready to plug into GRLX_CERTS_OPENBAO_K8S_*.
+func setupOpenBaoKubernetesAuth(t *testing.T, addr, token string) (mount, role, jwtPath string) {
+	t.Helper()
+	const namespace = "default"
+	const saName = "grlx"
+	const saUID = "11111111-1111-1111-1111-111111111111"
+
+	reviewSrv := newFakeK8sTokenReviewServer(t, namespace, saName, saUID)
+
+	// disable_local_ca_jwt=true (rather than relying on OpenBao reading
+	// /var/run/secrets/kubernetes.io/serviceaccount/{ca.crt,token} off its
+	// own local disk, which doesn't exist in this sandbox either) requires
+	// kubernetes_ca_cert to be set; the fake TokenReview server is plain
+	// HTTP, so this cert is never actually used to verify anything, only
+	// to satisfy that config-time requirement.
+	fakeCACertPEM := generateFixtureCAPEM(t)
+
+	mount = fmt.Sprintf("kubernetes-grlx-test-%d", time.Now().UnixNano())
+	role = "grlx-test"
+
+	// setupOpenBaoPKI mounts PKI backends at "pki-grlx-test-<nanotime>";
+	// grant this login's token access to that whole family of test mounts
+	// (rather than "default", which has no PKI access at all) so the
+	// resulting token can actually complete a certificate issuance, not
+	// just a login.
+	obAdminRequest(t, addr, token, http.MethodPut, "/v1/sys/policies/acl/grlx-test-pki-access", map[string]string{
+		"policy": `
+path "pki-grlx-test-*" {
+  capabilities = ["create", "read", "update", "list"]
+}
+path "sys/leases/renew" {
+  capabilities = ["update"]
+}
+`,
+	})
+
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/sys/auth/"+mount, map[string]string{"type": "kubernetes"})
+	t.Cleanup(func() {
+		req, err := http.NewRequest(http.MethodDelete, addr+"/v1/sys/auth/"+mount, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("X-Vault-Token", token)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	})
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/auth/"+mount+"/config", map[string]any{
+		"kubernetes_host":      reviewSrv.URL,
+		"disable_local_ca_jwt": true,
+		"kubernetes_ca_cert":   string(fakeCACertPEM),
+	})
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/auth/"+mount+"/role/"+role, map[string]any{
+		"bound_service_account_names":      []string{saName},
+		"bound_service_account_namespaces": []string{namespace},
+		"policies":                         []string{"grlx-test-pki-access"},
+		"ttl":                              "1h",
+	})
+
+	jwtPath = writeFixtureK8sJWT(t, namespace, saName, saUID)
+	return mount, role, jwtPath
+}
+
+// TestGenCertKubernetesAuthOpenBao exercises the entire kubernetes-auth
+// path for real: a genuine login against a real OpenBao dev server (only
+// the Kubernetes TokenReview call behind it is faked), the resulting
+// token actually being used to fetch the CA and issue a certificate, all
+// through the public GenCert entry point -- the same one the static-token
+// tests above use, proving both auth methods reach the same PKI logic.
+func TestGenCertKubernetesAuthOpenBao(t *testing.T) {
+	setupOpenBaoTLS(t)
+	addr := os.Getenv(EnvOpenBaoAddr)
+	token := os.Getenv(EnvOpenBaoToken)
+
+	k8sMount, k8sRole, jwtPath := setupOpenBaoKubernetesAuth(t, addr, token)
+
+	// Blank the static token entirely to prove this path doesn't fall
+	// back to it.
+	t.Setenv(EnvOpenBaoToken, "")
+	t.Setenv(EnvOpenBaoAuthMethod, AuthMethodKubernetes)
+	t.Setenv(EnvOpenBaoK8sMount, k8sMount)
+	t.Setenv(EnvOpenBaoK8sRole, k8sRole)
+	t.Setenv(EnvOpenBaoK8sJWTPath, jwtPath)
+
+	if err := GenCert(); err != nil {
+		t.Fatalf("GenCert via kubernetes auth failed: %v", err)
+	}
+	if _, err := os.Stat(config.CertFile); err != nil {
+		t.Fatalf("cert file should exist: %v", err)
+	}
+	if _, err := os.Stat(config.KeyFile); err != nil {
+		t.Fatalf("key file should exist: %v", err)
+	}
+	if _, err := os.Stat(config.RootCA); err != nil {
+		t.Fatalf("CA cert file should exist: %v", err)
+	}
+}
+
+// TestObClientKubernetesAuthInvalidRoleOpenBao verifies, against a real
+// OpenBao dev server, that logging in against a role that doesn't exist
+// fails clearly -- this happens before OpenBao would even attempt a
+// TokenReview call, so no fake Kubernetes API is needed for this one.
+func TestObClientKubernetesAuthInvalidRoleOpenBao(t *testing.T) {
+	addr, token := resolveTestOpenBaoServer(t)
+	mount := fmt.Sprintf("kubernetes-grlx-test-%d", time.Now().UnixNano())
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/sys/auth/"+mount, map[string]string{"type": "kubernetes"})
+	t.Cleanup(func() {
+		req, err := http.NewRequest(http.MethodDelete, addr+"/v1/sys/auth/"+mount, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("X-Vault-Token", token)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	})
+	jwtPath := writeFixtureK8sJWT(t, "default", "grlx", "11111111-1111-1111-1111-111111111111")
+
+	t.Setenv(EnvOpenBaoAddr, addr)
+	t.Setenv(EnvOpenBaoAuthMethod, AuthMethodKubernetes)
+	t.Setenv(EnvOpenBaoK8sMount, mount)
+	t.Setenv(EnvOpenBaoK8sRole, "does-not-exist")
+	t.Setenv(EnvOpenBaoK8sJWTPath, jwtPath)
+	t.Setenv(EnvOpenBaoRole, "pki-role-unused")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	_, err = client.currentToken(context.Background())
+	if !errors.Is(err, ErrK8sAuthFailed) {
+		t.Fatalf("expected ErrK8sAuthFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid role name") {
+		t.Fatalf("expected OpenBao's own 'invalid role name' message, got: %v", err)
+	}
+}
+
+// TestObClientKubernetesAuthUnreachableK8sAPIOpenBao verifies, against a
+// real OpenBao dev server, what happens when OpenBao's own TokenReview
+// call can't reach kubernetes_host at all (nothing listens on
+// 127.0.0.1:1, so the connection is refused immediately).
+func TestObClientKubernetesAuthUnreachableK8sAPIOpenBao(t *testing.T) {
+	addr, token := resolveTestOpenBaoServer(t)
+	mount := fmt.Sprintf("kubernetes-grlx-test-%d", time.Now().UnixNano())
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/sys/auth/"+mount, map[string]string{"type": "kubernetes"})
+	t.Cleanup(func() {
+		req, err := http.NewRequest(http.MethodDelete, addr+"/v1/sys/auth/"+mount, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("X-Vault-Token", token)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	})
+	fakeCACertPEM := generateFixtureCAPEM(t)
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/auth/"+mount+"/config", map[string]any{
+		"kubernetes_host":      "http://127.0.0.1:1",
+		"disable_local_ca_jwt": true,
+		"kubernetes_ca_cert":   string(fakeCACertPEM),
+	})
+	obAdminRequest(t, addr, token, http.MethodPost, "/v1/auth/"+mount+"/role/grlx-test", map[string]any{
+		"bound_service_account_names":      []string{"grlx"},
+		"bound_service_account_namespaces": []string{"default"},
+		"policies":                         []string{"default"},
+		"ttl":                              "1h",
+	})
+	jwtPath := writeFixtureK8sJWT(t, "default", "grlx", "11111111-1111-1111-1111-111111111111")
+
+	t.Setenv(EnvOpenBaoAddr, addr)
+	t.Setenv(EnvOpenBaoAuthMethod, AuthMethodKubernetes)
+	t.Setenv(EnvOpenBaoK8sMount, mount)
+	t.Setenv(EnvOpenBaoK8sRole, "grlx-test")
+	t.Setenv(EnvOpenBaoK8sJWTPath, jwtPath)
+	t.Setenv(EnvOpenBaoRole, "pki-role-unused")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	_, err = client.currentToken(context.Background())
+	if !errors.Is(err, ErrK8sAuthFailed) {
+		t.Fatalf("expected ErrK8sAuthFailed, got %v", err)
+	}
+	// Honesty note (see also the PR description): OpenBao's kubernetes
+	// auth backend collapses every post-JWT-parse login failure --
+	// including this one, where OpenBao's own TokenReview call couldn't
+	// even connect -- into a generic "permission denied" response
+	// (internal/builtin/credential/kubernetes/path_login.go's pathLogin
+	// maps any lookup() error to logical.ErrPermissionDenied). Verified
+	// directly against a live OpenBao dev server: this is OpenBao's own
+	// behavior, not a gap in this client. So an unreachable
+	// kubernetes_host is NOT distinguishable from an invalid/rejected JWT
+	// by OpenBao's response text alone -- both read "permission denied".
+	// Only ErrK8sJWTUnavailable (this process's own SA token file being
+	// unreadable, checked before any request to OpenBao is made) is
+	// reliably distinguishable as a category from "OpenBao rejected it".
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected OpenBao's 'permission denied' response, got: %v", err)
+	}
+}
+
+// --- Kubernetes auth unit tests against a fake OpenBao server -----------
+
+func setupK8sAuthEnv(t *testing.T, addr, jwtPath, role string) {
+	t.Helper()
+	t.Setenv(EnvOpenBaoAddr, addr)
+	t.Setenv(EnvOpenBaoAuthMethod, AuthMethodKubernetes)
+	t.Setenv(EnvOpenBaoK8sRole, role)
+	t.Setenv(EnvOpenBaoK8sJWTPath, jwtPath)
+	t.Setenv(EnvOpenBaoRole, "pki-role-unused")
+}
+
+func TestObClientKubernetesTokenCachedBetweenCalls(t *testing.T) {
+	jwtPath := writeFixtureK8sJWT(t, "default", "grlx", "uid-1")
+	var loginCalls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&loginCalls, 1)
+		w.Write([]byte(`{"auth":{"client_token":"tok-1","lease_duration":3600,"renewable":true}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	setupK8sAuthEnv(t, srv.URL, jwtPath, "test-role")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	ctx := context.Background()
+	tok1, err := client.currentToken(ctx)
+	if err != nil {
+		t.Fatalf("first currentToken: %v", err)
+	}
+	if tok1 != "tok-1" {
+		t.Fatalf("expected tok-1, got %q", tok1)
+	}
+	tok2, err := client.currentToken(ctx)
+	if err != nil {
+		t.Fatalf("second currentToken: %v", err)
+	}
+	if tok2 != "tok-1" {
+		t.Fatalf("expected cached tok-1, got %q", tok2)
+	}
+	if calls := atomic.LoadInt32(&loginCalls); calls != 1 {
+		t.Fatalf("expected exactly 1 login call for 2 currentToken calls, got %d", calls)
+	}
+}
+
+func TestObClientKubernetesTokenReLoginNearExpiry(t *testing.T) {
+	jwtPath := writeFixtureK8sJWT(t, "default", "grlx", "uid-1")
+	var loginCalls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&loginCalls, 1)
+		fmt.Fprintf(w, `{"auth":{"client_token":"tok-%d","lease_duration":3600,"renewable":true}}`, n)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	setupK8sAuthEnv(t, srv.URL, jwtPath, "test-role")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	ctx := context.Background()
+	tok1, err := client.currentToken(ctx)
+	if err != nil {
+		t.Fatalf("first currentToken: %v", err)
+	}
+	if tok1 != "tok-1" {
+		t.Fatalf("expected tok-1, got %q", tok1)
+	}
+
+	// Simulate the cached token having fallen within its safety margin,
+	// without waiting a real hour for a 3600s lease to run down.
+	client.authMu.Lock()
+	client.authExpiry = time.Now().Add(-time.Second)
+	client.authMu.Unlock()
+
+	tok2, err := client.currentToken(ctx)
+	if err != nil {
+		t.Fatalf("second currentToken: %v", err)
+	}
+	if tok2 != "tok-2" {
+		t.Fatalf("expected a fresh token (tok-2) after simulated near-expiry, got %q", tok2)
+	}
+	if calls := atomic.LoadInt32(&loginCalls); calls != 2 {
+		t.Fatalf("expected exactly 2 login calls, got %d", calls)
+	}
+}
+
+func TestObClientKubernetesJWTFileMissing(t *testing.T) {
+	setupK8sAuthEnv(t, "http://127.0.0.1:0", filepath.Join(t.TempDir(), "does-not-exist"), "test-role")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	_, err = client.currentToken(context.Background())
+	if !errors.Is(err, ErrK8sJWTUnavailable) {
+		t.Fatalf("expected ErrK8sJWTUnavailable, got %v", err)
+	}
+}
+
+func TestObClientKubernetesJWTFileEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty-token")
+	if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
+		t.Fatalf("write empty token file: %v", err)
+	}
+	setupK8sAuthEnv(t, "http://127.0.0.1:0", path, "test-role")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	_, err = client.currentToken(context.Background())
+	if !errors.Is(err, ErrK8sJWTUnavailable) {
+		t.Fatalf("expected ErrK8sJWTUnavailable, got %v", err)
+	}
+}
+
+func TestObClientKubernetesLoginNon200(t *testing.T) {
+	jwtPath := writeFixtureK8sJWT(t, "default", "grlx", "uid-1")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"errors":["permission denied"]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	setupK8sAuthEnv(t, srv.URL, jwtPath, "test-role")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	_, err = client.currentToken(context.Background())
+	if !errors.Is(err, ErrK8sAuthFailed) {
+		t.Fatalf("expected ErrK8sAuthFailed, got %v", err)
+	}
+}
+
+func TestObClientKubernetesLoginMissingToken(t *testing.T) {
+	jwtPath := writeFixtureK8sJWT(t, "default", "grlx", "uid-1")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"auth":null}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	setupK8sAuthEnv(t, srv.URL, jwtPath, "test-role")
+
+	client, err := newClientFromEnv()
+	if err != nil {
+		t.Fatalf("newClientFromEnv: %v", err)
+	}
+	_, err = client.currentToken(context.Background())
+	if !errors.Is(err, ErrK8sAuthFailed) {
+		t.Fatalf("expected ErrK8sAuthFailed, got %v", err)
+	}
+}
+
+func TestNewClientFromEnvMissingK8sRole(t *testing.T) {
+	t.Setenv(EnvOpenBaoAddr, "http://127.0.0.1:8200")
+	t.Setenv(EnvOpenBaoAuthMethod, AuthMethodKubernetes)
+	t.Setenv(EnvOpenBaoK8sRole, "")
+	t.Setenv(EnvOpenBaoRole, "pki-role-unused")
+
+	_, err := newClientFromEnv()
+	if !errors.Is(err, ErrNotConfigured) {
+		t.Fatalf("expected ErrNotConfigured, got %v", err)
+	}
+}
+
+func TestNewClientFromEnvUnknownAuthMethod(t *testing.T) {
+	t.Setenv(EnvOpenBaoAddr, "http://127.0.0.1:8200")
+	t.Setenv(EnvOpenBaoAuthMethod, "bogus")
+	t.Setenv(EnvOpenBaoRole, "pki-role-unused")
+
+	_, err := newClientFromEnv()
+	if !errors.Is(err, ErrNotConfigured) {
+		t.Fatalf("expected ErrNotConfigured, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("expected error to name the bad AUTH_METHOD value, got: %v", err)
+	}
 }
 
 func TestGenCACertOpenBao(t *testing.T) {
