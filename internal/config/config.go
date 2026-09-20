@@ -51,8 +51,14 @@ var (
 	// happens over the NATS bus.
 	FarmerAPIPort string
 
-	FarmerBusURL          string
-	FarmerBusPort         string
+	FarmerBusURL  string
+	FarmerBusPort string
+	// FarmerWSPort is the port for nats-server's websocket listener —
+	// what Envoy's jwt_authn-gated route proxies sprout wss:// connections
+	// to, per docs/design/grlx-envoy-enrollment-design.md. Distinct from
+	// FarmerBusPort (the plain TCP NATS listener grlx CLI/farmer-to-farmer
+	// connections still use).
+	FarmerWSPort          string
 	FarmerInterface       string
 	FarmerOrganization    string
 	FarmerPKI             string
@@ -74,6 +80,16 @@ var (
 	SproutID              string
 	SproutPKI             string
 	SproutRootCA          string
+
+	// SproutBusURLs are the externally-reachable wss:// addresses (fronted
+	// by Envoy's jwt_authn-gated route — see
+	// docs/design/grlx-envoy-enrollment-design.md) an enrolling sprout is
+	// told to connect to, returned as nats_urls in the enrollment response
+	// (cloudxp-machine-manager-api-design.md §3.2). Comma-separated in
+	// config/env; empty by default, in which case the enrollment handler
+	// falls back to deriving a single-node URL from
+	// FarmerInterface/FarmerWSPort for local/dev use.
+	SproutBusURLs []string
 
 	// PXCDSN is the GORM MySQL DSN for the shared Percona XtraDB Cluster's
 	// `farmer` schema (PKI, props/facts, RBAC — see internal/pxc,
@@ -171,6 +187,7 @@ func LoadConfig(binary string) {
 		jety.SetDefault("farmerinterface", "localhost")
 		jety.SetDefault("farmerapiport", "5405")
 		jety.SetDefault("farmerbusport", "5406")
+		jety.SetDefault("farmerwsport", "5407")
 		switch binary {
 		case "grlx":
 			dirname, err := os.UserHomeDir()
@@ -240,6 +257,17 @@ func LoadConfig(binary string) {
 			if jety.GetString("s3bucket") == "" {
 				if v, found := os.LookupEnv("GRLX_S3_BUCKET"); found {
 					jety.Set("s3bucket", v)
+				}
+			}
+			if len(jety.GetStringSlice("sproutbusurls")) == 0 {
+				if v, found := os.LookupEnv("GRLX_SPROUT_BUS_URLS"); found {
+					urls := []string{}
+					for _, u := range strings.Split(v, ",") {
+						if u != "" {
+							urls = append(urls, u)
+						}
+					}
+					jety.Set("sproutbusurls", urls)
 				}
 			}
 
@@ -345,6 +373,7 @@ func LoadConfig(binary string) {
 	FarmerAPIPort = jety.GetString("farmerapiport")
 	FarmerBusURL = jety.GetString("farmerinterface") + ":" + jety.GetString("farmerbusport")
 	FarmerBusPort = jety.GetString("farmerbusport")
+	FarmerWSPort = jety.GetString("farmerwsport")
 	FarmerInterface = jety.GetString("farmerinterface")
 	FarmerPKI = jety.GetString("farmerpki")
 	FarmerURL = "https://" + jety.GetString("farmerinterface") + ":" + jety.GetString("farmerapiport")
@@ -371,6 +400,7 @@ func LoadConfig(binary string) {
 	S3SecretAccessKey = jety.GetString("s3secretaccesskey")
 	S3UseSSL = jety.GetBool("s3usessl")
 	S3Bucket = jety.GetString("s3bucket")
+	SproutBusURLs = jety.GetStringSlice("sproutbusurls")
 }
 
 // BasePathValid checks that the configured recipe directory exists.
