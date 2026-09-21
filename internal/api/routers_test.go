@@ -89,6 +89,28 @@ func TestNewRouterFilesEndpointRequiresAuth(t *testing.T) {
 	}
 }
 
+func TestNewRouterRecipesEndpointsRequireAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	origRecipeDir := config.RecipeDir
+	config.RecipeDir = tmpDir
+	t.Cleanup(func() { config.RecipeDir = origRecipeDir })
+
+	mux := NewRouter("")
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for _, path := range []string{"/v1/recipes", "/v1/recipes/webserver.nginx"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("GET %s without auth returned %d, want 401", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestNewRouterMethodNotAllowed(t *testing.T) {
 	tmpDir := t.TempDir()
 	origRecipeDir := config.RecipeDir

@@ -16,13 +16,17 @@
 #                           manager-api-design.md §3.2). Proxies straight
 #                           to farmer's existing HTTPS API
 #                           (internal/api/handlers/enroll.go).
-#   2. /v1/recipes/*      — jwt_authn-gated, proxied through to a
-#                           recipe-serving upstream. Points at farmer's
-#                           existing GET /files/ endpoint today; workstream
-#                           I ("Recipe storage migration") is a separate,
-#                           not-yet-built dedicated non-DMZ recipe service
-#                           this route should be repointed at once it
-#                           exists — see the recipe_service cluster below.
+#   2. /v1/recipes/*      — jwt_authn-gated, proxied unmodified (no
+#                           prefix_rewrite — the path matches farmer's own
+#                           route exactly) to farmer's dedicated recipe
+#                           HTTP endpoint (internal/api/handlers/
+#                           recipes.go's ListRecipes/GetRecipe, registered
+#                           in internal/api/routers.go), which reads
+#                           through object storage rather than local disk
+#                           — workstream I ("Recipe storage migration"),
+#                           replacing the old NATS-based
+#                           internal/natsapi/recipes.go. See the
+#                           recipe_service cluster below.
 #   3. everything else    — the sprout's wss:// NATS connection, jwt_authn-
 #                           gated, proxied to nats-server's websocket
 #                           listener (internal/pki/nats.go's
@@ -110,13 +114,12 @@ static_resources:
                                 runtime_key: enroll_rate_limit_enforced
                                 default_value: { numerator: 100, denominator: HUNDRED }
 
-                        # Route 2: authenticated recipe download. See the
-                        # recipe_service cluster's comment below for why
-                        # this currently points at farmer's own /files/.
+                        # Route 2: authenticated recipe download. Passed
+                        # through unmodified to farmer's own /v1/recipes
+                        # endpoint — see the recipe_service cluster below.
                         - match: { prefix: "/v1/recipes" }
                           route:
                             cluster: recipe_service
-                            prefix_rewrite: "/files/"
                             timeout: 60s
                           typed_per_filter_config:
                             envoy.filters.http.jwt_authn:
@@ -223,11 +226,12 @@ static_resources:
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
 
-    # Interim: points at farmer's own GET /files/ (internal/api/handlers/
-    # recipes.go). Repoint this at workstream I's dedicated non-DMZ
-    # recipe service (docs/design/grlx-fork-roadmap.md workstream I) once
-    # it exists — that's the "small, self-contained service" the roadmap
-    # describes, not something this task brief builds.
+    # Points at farmer's dedicated recipe HTTP endpoint (GET /v1/recipes,
+    # GET /v1/recipes/{name...} — internal/api/handlers/recipes.go,
+    # internal/api/routers.go), the "small, self-contained service"
+    # docs/design/grlx-fork-roadmap.md workstream I describes, built
+    # directly into farmer's existing HTTPS API rather than as a separate
+    # deployable.
     - name: recipe_service
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN

@@ -129,7 +129,6 @@ func TestViewerRoleNATSAccess(t *testing.T) {
 		"props.getall", "props.get",
 		"cohorts.list", "cohorts.get", "cohorts.resolve", "cohorts.refresh",
 		"auth.whoami", "auth.explain",
-		"recipes.list", "recipes.get",
 	}
 	for _, method := range allowedMethods {
 		action := NATSMethodAction(method)
@@ -166,7 +165,6 @@ func TestOperatorRoleNATSAccess(t *testing.T) {
 		"cohorts.list", "cohorts.get", "cohorts.resolve", "cohorts.refresh",
 		"cook", "cmd.run", "shell.start", "test.ping",
 		"auth.whoami", "auth.explain",
-		"recipes.list", "recipes.get",
 	}
 	for _, method := range allowedMethods {
 		action := NATSMethodAction(method)

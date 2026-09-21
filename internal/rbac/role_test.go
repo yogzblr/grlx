@@ -64,6 +64,8 @@ func TestRouteAction(t *testing.T) {
 		{"AcceptID", ActionPKI},
 		{"WhoAmI", ActionUserRead},
 		{"ListUsers", ActionAdmin},
+		{"ListRecipes", ActionView},
+		{"GetRecipe", ActionView},
 		{"UnknownRoute", ActionAdmin},
 	}
 	for _, tt := range tests {

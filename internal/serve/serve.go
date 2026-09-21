@@ -78,9 +78,11 @@ func NewMux() *http.ServeMux {
 	// OpenAPI spec
 	mux.HandleFunc("GET /api/v1/openapi.yaml", HandleOpenAPI)
 
-	// Recipes
-	mux.HandleFunc("GET /api/v1/recipes", HandleNATSProxy("recipes.list"))
-	mux.HandleFunc("GET /api/v1/recipes/{id...}", HandleRecipeGetProxy("recipes.get"))
+	// Recipes: farmer's dedicated HTTP endpoint (GET /v1/recipes,
+	// GET /v1/recipes/{name...}), not the NATS proxy pattern the rest of
+	// this file uses — see docs/design/grlx-fork-roadmap.md workstream I.
+	mux.HandleFunc("GET /api/v1/recipes", HandleRecipesList)
+	mux.HandleFunc("GET /api/v1/recipes/{id...}", HandleRecipeGet)
 
 	// Audit
 	mux.HandleFunc("GET /api/v1/audit/dates", HandleNATSProxy("audit.dates"))
@@ -389,26 +391,34 @@ func HandleCohortGetProxy(method string) http.HandlerFunc {
 	}
 }
 
-// HandleRecipeGetProxy returns a handler that forwards a recipe get request
-// to a NATS subject. It uses a wildcard path parameter because recipe names
-// contain dots (e.g., "webserver.nginx").
-func HandleRecipeGetProxy(method string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("id")
-		if name == "" {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "missing recipe name"})
-			return
-		}
-		params := map[string]string{"name": name}
-		result, err := client.NatsRequest(method, params)
-		if err != nil {
-			WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(result)
+// HandleRecipesList calls the farmer's dedicated recipe HTTP endpoint
+// (GET /v1/recipes) instead of going over NATS — see
+// docs/design/grlx-fork-roadmap.md workstream I.
+func HandleRecipesList(w http.ResponseWriter, _ *http.Request) {
+	recipes, err := client.ListRecipes()
+	if err != nil {
+		WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
 	}
+	WriteJSON(w, http.StatusOK, map[string][]client.RecipeInfo{"recipes": recipes})
+}
+
+// HandleRecipeGet calls the farmer's dedicated recipe HTTP endpoint
+// (GET /v1/recipes/{name...}) instead of going over NATS. It uses a
+// wildcard path parameter because recipe names contain dots (e.g.,
+// "webserver.nginx").
+func HandleRecipeGet(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("id")
+	if name == "" {
+		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "missing recipe name"})
+		return
+	}
+	recipe, err := client.GetRecipe(name)
+	if err != nil {
+		WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	WriteJSON(w, http.StatusOK, recipe)
 }
 
 // HandleUserRemoveProxy returns a handler that forwards a user removal request

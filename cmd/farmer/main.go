@@ -202,7 +202,6 @@ func initRecipeStore() {
 		log.Fatalf("failed to open recipe object store: %v", err)
 	}
 	cook.SetStore(store)
-	natsapi.SetRecipeStore(store)
 	handlers.SetRecipeStore(store)
 }
 

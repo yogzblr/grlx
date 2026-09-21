@@ -87,10 +87,6 @@ const (
 	// Shell
 	MethodShellStart = "shell.start"
 
-	// Recipes
-	MethodRecipesList = "recipes.list"
-	MethodRecipesGet  = "recipes.get"
-
 	// Audit
 	MethodAuditDates = "audit.dates"
 	MethodAuditQuery = "audit.query"
@@ -250,14 +246,6 @@ type CohortsValidateResponse = CohortValidateResponse
 // ShellStartResponse contains session subjects for the CLI to use.
 type ShellStartResponse = shell.StartResponse
 
-// RecipesListResponse wraps the recipe list.
-type RecipesListResponse struct {
-	Recipes []RecipeInfo `json:"recipes"`
-}
-
-// RecipesGetResponse is the full content of a recipe.
-type RecipesGetResponse = RecipeContent
-
 // AuditDatesResponse is a list of dates with audit entries.
 type AuditDatesResponse = []string
 
@@ -289,7 +277,6 @@ func AllMethods() []string {
 		MethodCohortsList, MethodCohortsGet, MethodCohortsResolve, MethodCohortsRefresh, MethodCohortsValidate,
 		MethodAuthLogin, MethodAuthWhoAmI, MethodAuthListUsers, MethodAuthAddUser, MethodAuthRemoveUser, MethodAuthExplain,
 		MethodShellStart,
-		MethodRecipesList, MethodRecipesGet,
 		MethodAuditDates, MethodAuditQuery,
 	}
 }

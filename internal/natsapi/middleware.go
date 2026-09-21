@@ -53,10 +53,6 @@ var natsActionMap = map[string]rbac.Action{
 	MethodAuthRemoveUser: rbac.ActionAdmin,
 	MethodAuthExplain:    rbac.ActionUserRead,
 
-	// Recipes (read-only)
-	MethodRecipesList: rbac.ActionView,
-	MethodRecipesGet:  rbac.ActionView,
-
 	// Audit
 	MethodAuditDates: rbac.ActionAdmin,
 	MethodAuditQuery: rbac.ActionAdmin,

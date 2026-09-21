@@ -600,13 +600,11 @@ func TestHandleNATSProxyWithIDMissingParam(t *testing.T) {
 	}
 }
 
-func TestHandleRecipeGetProxyMissingName(t *testing.T) {
-	handler := HandleRecipeGetProxy("recipes.get")
-
+func TestHandleRecipeGetMissingName(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/recipes/", nil)
 	rec := httptest.NewRecorder()
 
-	handler(rec, req)
+	HandleRecipeGet(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", rec.Code)
