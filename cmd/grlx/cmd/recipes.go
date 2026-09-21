@@ -12,20 +12,11 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/log"
 )
 
-// RecipeInfo mirrors the natsapi.RecipeInfo type for CLI unmarshaling.
-type RecipeInfo struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Size int64  `json:"size"`
-}
+// RecipeInfo mirrors client.RecipeInfo for CLI display.
+type RecipeInfo = client.RecipeInfo
 
-// RecipeContent mirrors the natsapi.RecipeContent type for CLI unmarshaling.
-type RecipeContent struct {
-	Name    string `json:"name"`
-	Path    string `json:"path"`
-	Content string `json:"content"`
-	Size    int64  `json:"size"`
-}
+// RecipeContent mirrors client.RecipeContent for CLI display.
+type RecipeContent = client.RecipeContent
 
 var cmdRecipes = &cobra.Command{
 	Use:   "recipes",
@@ -36,26 +27,24 @@ var cmdRecipesList = &cobra.Command{
 	Use:   "list",
 	Short: "List available recipes on the farmer",
 	Run: func(cmd *cobra.Command, args []string) {
-		result, err := client.NatsRequest("recipes.list", nil)
+		recipes, err := client.ListRecipes()
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		switch outputMode {
 		case "json":
-			fmt.Println(string(result))
-		default:
-			var resp struct {
-				Recipes []RecipeInfo `json:"recipes"`
-			}
-			if err := json.Unmarshal(result, &resp); err != nil {
+			b, err := json.Marshal(map[string][]RecipeInfo{"recipes": recipes})
+			if err != nil {
 				log.Fatal(err)
 			}
-			if len(resp.Recipes) == 0 {
+			fmt.Println(string(b))
+		default:
+			if len(recipes) == 0 {
 				fmt.Println("No recipes found.")
 				return
 			}
-			printRecipesTable(resp.Recipes)
+			printRecipesTable(recipes)
 		}
 	},
 }
@@ -67,21 +56,19 @@ var cmdRecipesShow = &cobra.Command{
 Recipe names use dot notation (e.g., "webserver.nginx").`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		params := map[string]string{"name": args[0]}
-		result, err := client.NatsRequest("recipes.get", params)
+		recipe, err := client.GetRecipe(args[0])
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		switch outputMode {
 		case "json":
-			fmt.Println(string(result))
-		default:
-			var recipe RecipeContent
-			if err := json.Unmarshal(result, &recipe); err != nil {
+			b, err := json.Marshal(recipe)
+			if err != nil {
 				log.Fatal(err)
 			}
-
+			fmt.Println(string(b))
+		default:
 			header := color.New(color.FgCyan, color.Bold)
 			header.Printf("Recipe: %s\n", recipe.Name)
 			fmt.Printf("Path:   %s\n", recipe.Path)

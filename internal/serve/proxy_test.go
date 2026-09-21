@@ -2,17 +2,23 @@ package serve
 
 import (
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
+	"github.com/taigrr/jety"
 
 	"github.com/gogrlx/grlx/v2/internal/api/client"
+	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
 // natsResponse mirrors the client's internal envelope.
@@ -78,6 +84,56 @@ func mockMethodError(t *testing.T, nc *nats.Conn, method, errMsg string) {
 	}
 	t.Cleanup(func() { sub.Unsubscribe() })
 	nc.Flush()
+}
+
+// startTestRecipeFarmer stands in for the farmer's dedicated recipe HTTP
+// endpoint (internal/api/handlers/recipes.go), which HandleRecipesList/
+// HandleRecipeGet call over real HTTPS via internal/api/client —
+// unlike the rest of this file's NATS-proxied routes. It trusts the test
+// server's certificate as config.GrlxRootCA and provisions a signing key
+// for the auth token internal/api/client attaches, mirroring
+// internal/api/client/recipes_test.go's setupRecipeTestServer.
+func startTestRecipeFarmer(t *testing.T, handler http.HandlerFunc) {
+	t.Helper()
+	ts := httptest.NewTLSServer(handler)
+	t.Cleanup(ts.Close)
+
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw})
+	caFile := filepath.Join(t.TempDir(), "rootca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, port, ok := strings.Cut(strings.TrimPrefix(ts.URL, "https://"), ":")
+	if !ok {
+		t.Fatalf("unexpected test server URL: %s", ts.URL)
+	}
+
+	origRootCA, origIface, origPort := config.GrlxRootCA, config.FarmerInterface, config.FarmerAPIPort
+	config.GrlxRootCA = caFile
+	config.FarmerInterface = host
+	config.FarmerAPIPort = port
+	t.Cleanup(func() {
+		config.GrlxRootCA = origRootCA
+		config.FarmerInterface = origIface
+		config.FarmerAPIPort = origPort
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("# test config\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jety.SetConfigType("toml")
+	jety.SetConfigFile(configPath)
+	kp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := kp.Seed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jety.Set("privkey", string(seed))
+	t.Cleanup(func() { jety.Set("privkey", "") })
 }
 
 func TestHandleNATSProxy_Success(t *testing.T) {
@@ -425,12 +481,11 @@ func TestHandleCohortGetProxy_NATSError(t *testing.T) {
 	}
 }
 
-func TestHandleRecipeGetProxy_Success(t *testing.T) {
-	cleanup := startTestNATS(t)
-	defer cleanup()
-
-	mockMethod(t, client.NatsConn, "recipes.get", map[string]string{
-		"name": "base/webserver", "content": "pkg.installed: nginx",
+func TestHandleRecipeGet_Success(t *testing.T) {
+	startTestRecipeFarmer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{
+			"name": "base.webserver", "content": "pkg.installed: nginx",
+		})
 	})
 
 	mux := NewMux()
@@ -443,11 +498,10 @@ func TestHandleRecipeGetProxy_Success(t *testing.T) {
 	}
 }
 
-func TestHandleRecipeGetProxy_NATSError(t *testing.T) {
-	cleanup := startTestNATS(t)
-	defer cleanup()
-
-	mockMethodError(t, client.NatsConn, "recipes.get", "recipe not found")
+func TestHandleRecipeGet_FarmerError(t *testing.T) {
+	startTestRecipeFarmer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
 
 	mux := NewMux()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/recipes/missing", nil)

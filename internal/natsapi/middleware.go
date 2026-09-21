@@ -38,12 +38,13 @@ var natsActionMap = map[string]rbac.Action{
 	MethodJobsDelete:  rbac.ActionJobAdmin,
 
 	// Global: PKI
-	MethodPKIList:     rbac.ActionPKI,
-	MethodPKIAccept:   rbac.ActionPKI,
-	MethodPKIReject:   rbac.ActionPKI,
-	MethodPKIDeny:     rbac.ActionPKI,
-	MethodPKIUnaccept: rbac.ActionPKI,
-	MethodPKIDelete:   rbac.ActionPKI,
+	MethodPKIList:         rbac.ActionPKI,
+	MethodPKIAccept:       rbac.ActionPKI,
+	MethodPKIReject:       rbac.ActionPKI,
+	MethodPKIDeny:         rbac.ActionPKI,
+	MethodPKIUnaccept:     rbac.ActionPKI,
+	MethodPKIDelete:       rbac.ActionPKI,
+	MethodPKIRotateBoxKey: rbac.ActionPKI,
 
 	// Auth
 	MethodAuthLogin:      rbac.ActionUserRead,
@@ -52,10 +53,6 @@ var natsActionMap = map[string]rbac.Action{
 	MethodAuthAddUser:    rbac.ActionAdmin,
 	MethodAuthRemoveUser: rbac.ActionAdmin,
 	MethodAuthExplain:    rbac.ActionUserRead,
-
-	// Recipes (read-only)
-	MethodRecipesList: rbac.ActionView,
-	MethodRecipesGet:  rbac.ActionView,
 
 	// Audit
 	MethodAuditDates: rbac.ActionAdmin,

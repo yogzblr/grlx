@@ -38,12 +38,13 @@ var routes = map[string]handler{
 	MethodVersion: handleVersion,
 
 	// PKI management
-	MethodPKIList:     handlePKIList,
-	MethodPKIAccept:   handlePKIAccept,
-	MethodPKIReject:   handlePKIReject,
-	MethodPKIDeny:     handlePKIDeny,
-	MethodPKIUnaccept: handlePKIUnaccept,
-	MethodPKIDelete:   handlePKIDelete,
+	MethodPKIList:         handlePKIList,
+	MethodPKIAccept:       handlePKIAccept,
+	MethodPKIReject:       handlePKIReject,
+	MethodPKIDeny:         handlePKIDeny,
+	MethodPKIUnaccept:     handlePKIUnaccept,
+	MethodPKIDelete:       handlePKIDelete,
+	MethodPKIRotateBoxKey: handlePKIRotateBoxKey,
 
 	// Sprouts
 	MethodSproutsList: handleSproutsList,
@@ -88,10 +89,6 @@ var routes = map[string]handler{
 
 	// Shell (interactive SSH-like sessions)
 	MethodShellStart: handleShellStart,
-
-	// Recipes
-	MethodRecipesList: handleRecipesList,
-	MethodRecipesGet:  handleRecipesGet,
 
 	// Audit
 	MethodAuditDates: handleAuditList,
@@ -147,6 +144,10 @@ func Subscribe(nc *nats.Conn) error {
 			return fmt.Errorf("natsapi: failed to subscribe to %s: %w", subject, err)
 		}
 		log.Tracef("natsapi: registered handler for %s", subject)
+	}
+
+	if err := registerBoxKeySubmitListener(nc); err != nil {
+		return err
 	}
 
 	return nil
