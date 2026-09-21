@@ -93,6 +93,13 @@ var (
 	// internal/gatewayjwt signs gateway JWTs with.
 	GatewayTransitKeyName string
 
+	// BoxKeyGraceDuration bounds how long a sprout's previous X25519 box
+	// public key stays valid after a sprout-initiated rotation
+	// (internal/pki/boxkeys.go), so payloads already in flight when a
+	// rotation happens still decrypt correctly. See
+	// docs/design/grlx-payload-encryption-design.md's "Key rotation".
+	BoxKeyGraceDuration time.Duration
+
 	// SproutBusURLs are the externally-reachable wss:// addresses (fronted
 	// by Envoy's jwt_authn-gated route — see
 	// docs/design/grlx-envoy-enrollment-design.md) an enrolling sprout is
@@ -233,6 +240,7 @@ func LoadConfig(binary string) {
 			jety.SetDefault("farmerorganization", "grlx farmer")
 			jety.SetDefault("gatewayjwtttl", 24*time.Hour)
 			jety.SetDefault("gatewaytransitkeyname", "grlx-gateway-jwt")
+			jety.SetDefault("boxkeygraceduration", 24*time.Hour)
 			jety.SetDefault("s3usessl", true)
 			JobLogDir = jety.GetString("joblogdir")
 			JobLogTTL = jety.GetDuration("joblogttl")
@@ -400,6 +408,7 @@ func LoadConfig(binary string) {
 	FarmerOrganization = jety.GetString("farmerorganization")
 	GatewayJWTTTL = jety.GetDuration("gatewayjwtttl")
 	GatewayTransitKeyName = jety.GetString("gatewaytransitkeyname")
+	BoxKeyGraceDuration = jety.GetDuration("boxkeygraceduration")
 	RootCA = jety.GetString("rootca")
 	RootCAPriv = jety.GetString("rootcapriv")
 	SproutID = jety.GetString("sproutid")

@@ -27,6 +27,12 @@ type enrollRequest struct {
 	JoinToken string `json:"join_token"`
 	NKeyPub   string `json:"nkey_pub"`
 	Hostname  string `json:"hostname"`
+	// SproutPub is the sprout's locally-generated X25519 box public key
+	// (standard base64, 32 bytes) — see
+	// docs/design/grlx-payload-encryption-design.md's "Bootstrap". Its
+	// private half is generated and held by the sprout alone and is never
+	// part of this request.
+	SproutPub string `json:"sprout_pub"`
 }
 
 // enrollSuccessResponse is design doc §3.2's success shape, plus
@@ -68,13 +74,13 @@ func Enroll(w http.ResponseWriter, r *http.Request) {
 		writeEnrollFailed(w)
 		return
 	}
-	if req.JoinToken == "" || req.NKeyPub == "" || req.Hostname == "" {
+	if req.JoinToken == "" || req.NKeyPub == "" || req.Hostname == "" || req.SproutPub == "" {
 		log.Warnf("enroll: request missing a required field")
 		writeEnrollFailed(w)
 		return
 	}
 
-	result, err := pki.Enroll(r.Context(), req.JoinToken, req.NKeyPub, req.Hostname)
+	result, err := pki.Enroll(r.Context(), req.JoinToken, req.NKeyPub, req.Hostname, req.SproutPub)
 	if err != nil {
 		// pki.Enroll has already logged the specific reason; nothing more
 		// to add here.

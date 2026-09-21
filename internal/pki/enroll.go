@@ -136,9 +136,8 @@ type EnrollResult struct {
 	// short-lived (config.GatewayJWTTTL), unlike the cached-to-disk NATS
 	// JWT above.
 	GatewayJWT string
-	// TenantX25519Pub is the tenant's NaCl box public key — see
-	// tenantbox.go's doc comment for why this is an interim, locally-held
-	// placeholder rather than workstream J/F's OpenBao-custodied material.
+	// TenantX25519Pub is the tenant's NaCl box public key, backed by
+	// OpenBao custody of the private half (see tenantbox.go).
 	TenantX25519Pub string
 }
 
@@ -149,9 +148,18 @@ type EnrollResult struct {
 // §2.2's subject exists for a split SaaS-API/farmer deployment this repo
 // doesn't have yet) — farmer validates the token against saas schema
 // directly and mints the JWT itself, in one call.
-func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollResult, error) {
+func Enroll(ctx context.Context, joinToken, nkeyPub, hostname, sproutPub string) (*EnrollResult, error) {
 	if !nkeys.IsValidPublicUserKey(nkeyPub) {
 		log.Warnf("enroll: rejected malformed nkey_pub")
+		return nil, ErrEnrollmentFailed
+	}
+	// Validated up front, alongside nkeyPub, and before any DB work below:
+	// a malformed sprout_pub is a client-side mistake, not a real
+	// enrollment attempt, and shouldn't cost a possibly single-use join
+	// token's redemption (same reasoning as resolveEnrollSproutID's
+	// ordering further down).
+	if _, err := decodeBoxPub(sproutPub); err != nil {
+		log.Warnf("enroll: rejected malformed sprout_pub: %v", err)
 		return nil, ErrEnrollmentFailed
 	}
 
@@ -162,7 +170,7 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 	// identity back rather than burning a second use of a possibly
 	// single-use token.
 	if sproutID, err := SproutIDForNKey(nkeyPub); err == nil {
-		return replayExistingEnrollment(ctx, sproutID, nkeyPub)
+		return replayExistingEnrollment(ctx, sproutID, nkeyPub, sproutPub)
 	}
 
 	keyID, secret, ok := splitJoinToken(joinToken)
@@ -232,6 +240,13 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 		log.Errorf("enroll: accepting sprout %s: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
+	// Bootstraps the sprout's half of the payload-encryption keypair
+	// (docs/design/grlx-payload-encryption-design.md "Bootstrap"): the
+	// sprout generated this locally and never sends its private half.
+	if err := upsertSproutBoxKeyActive(tenantID(), sproutID, sproutPub); err != nil {
+		log.Errorf("enroll: sprout %s accepted but failed to persist sprout_pub: %v", sproutID, err)
+		return nil, ErrEnrollmentFailed
+	}
 
 	signedJWT, err := GetSproutUserJWT(sproutID)
 	if err != nil {
@@ -257,10 +272,18 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 // accepted nkey_pub gets its existing identity back, no token touched.
 // The gateway JWT is still minted fresh — see EnrollResult.GatewayJWT's
 // doc comment on why it isn't cached like the NATS JWT is.
-func replayExistingEnrollment(ctx context.Context, sproutID, nkeyPub string) (*EnrollResult, error) {
+func replayExistingEnrollment(ctx context.Context, sproutID, nkeyPub, sproutPub string) (*EnrollResult, error) {
 	existingJWT, err := GetSproutUserJWT(sproutID)
 	if err != nil {
 		log.Errorf("enroll: sprout %s has an accepted nkey but no readable JWT: %v", sproutID, err)
+		return nil, ErrEnrollmentFailed
+	}
+	// Re-asserts sprout_pub idempotently on every replay, not just first
+	// enrollment: harmless when it matches what's on record already, and
+	// self-heals a sprout accepted before this workstream shipped (no box
+	// key on record yet) the next time it happens to retry.
+	if err := upsertSproutBoxKeyActive(tenantID(), sproutID, sproutPub); err != nil {
+		log.Errorf("enroll: idempotent replay for %s but failed to persist sprout_pub: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
 	tenantPub, err := GetTenantX25519PublicKey()
