@@ -57,19 +57,37 @@ JWT signing algorithm choice itself.
 Dispatched now that A and H are confirmed merged to `master`. J's brief was
 updated post-H-merge to close a real gap H's enrollment endpoint left open
 (no `sprout_pub` field yet) — verified against `internal/pki/enroll.go` and
-`internal/api/handlers/enroll.go` before dispatching, confirmed accurate.
+`internal/api/handlers/enroll.go` before dispatching, confirmed accurate. All
+three are now merged; J landed first, then E needed a follow-up commit to
+resolve merge fallout against J's box-key tenant scoping.
 
 | Workstream | Description | Cloud session ID | Status | Needs security review |
 |---|---|---|---|---|
-| E | Multi-tenancy: NATS Account-per-tenant (subjects unchanged), re-key `internal/pki/pki.go` by `(tenant_id, sprout_id)`, tenant field on `internal/rbac` cohort/role maps, dynamic `FarmerOrganization` | session_01SwBEMgMkSFan2X3fUC3pkz | dispatched | y — tenant isolation correctness |
-| I | Finish recipe storage migration: confirm A's recipe HTTP endpoint is served behind H's Envoy JWT-gated route, remove `internal/natsapi/recipes.go`'s old NATS-based delivery | session_01QKGaTno21cXoZGp7hrbjbM | dispatched | n |
-| J | Payload encryption + rotation: NaCl `box` (X25519), tenant keypair via OpenBao (replacing `internal/pki/tenantbox.go`'s interim local-disk custody), sprout keypair generated at enrollment. Must first add a `sprout_pub` field to the enrollment request/`Enroll()` (confirmed missing) | session_01AivbiHCYGgL1ywzyTViaK2 | dispatched | y — cryptographic code defending against a compromised DMZ bus |
+| E | Multi-tenancy: NATS Account-per-tenant (subjects unchanged), re-key `internal/pki/pki.go` by `(tenant_id, sprout_id)`, tenant field on `internal/rbac` cohort/role maps, dynamic `FarmerOrganization` | session_01SwBEMgMkSFan2X3fUC3pkz | merged — PR #28 (`c13d290`, `aeec2b8`) | y — tenant isolation correctness |
+| I | Finish recipe storage migration: confirm A's recipe HTTP endpoint is served behind H's Envoy JWT-gated route, remove `internal/natsapi/recipes.go`'s old NATS-based delivery | session_01QKGaTno21cXoZGp7hrbjbM | merged — PR #25 (`e59eb65`) | n |
+| J | Payload encryption + rotation: NaCl `box` (X25519), tenant keypair via OpenBao (replacing `internal/pki/tenantbox.go`'s interim local-disk custody), sprout keypair generated at enrollment. Must first add a `sprout_pub` field to the enrollment request/`Enroll()` (confirmed missing) | session_01AivbiHCYGgL1ywzyTViaK2 | merged — PR #27 (`f5a947d`) | y — cryptographic code defending against a compromised DMZ bus |
 
 ## Ongoing / fully parallel (no gating)
 
 | Item | Description | Cloud session ID | Status | Needs security review |
 |---|---|---|---|---|
 | D (facts listener) | `internal/facts/listener.go`'s `RegisterFarmerListener` still used plain fan-out `Subscribe`, justified by a stale comment from before workstream A removed `props/store.go`'s in-memory cache; queue-grouped it under `grlx-core` to stop every replica double-writing the same PXC row on every fact update | not dispatched by this coordinator — found already merged | merged — PR #24 (`e9aa2ea`) | n |
+| G.2 | Windows user/group provider using `deploymenttheory/go-bindings-win32`'s netmanagement package | session_01ArigyXKLB5a2gV449zBGZB | dispatched | y — user/group creation, and the dependency is young (v0.2.x) |
+| G.4 | Windows DACL/ACL ingredient using `hectane/go-acl` for file ACLs, extended to registry-key ACLs (`SE_REGISTRY_KEY`) | session_01BVU6xoX7h7tzkscFYUTY8U | dispatched | y — propagation/inheritance semantics are a security-relevant bug class |
+| G.6 | Task Scheduler, Windows Update, and Shortcut COM ingredients using `go-ole/go-ole`, starting with Shortcut (IShellLink) to prove the COM lifecycle pattern | session_01GXJ5vf5Fdo9fMxdoFAe5rE | dispatched | y — COM lifecycle bugs (missed Release, wrong apartment threading) |
+| G.7 | v1 subset of LGPO — parse `registry.pol` (`encoding/binary`) and ADMX/ADML (`encoding/xml`); PR proposes which policy subset to cover for a first pass | session_01XYVPKvrCssvaGQTd9MbEs3 | dispatched | n |
+| H.1 | Linux network/route management using `vishvananda/netlink`, with a verify-connectivity-or-roll-back pattern in the ingredient itself | session_01Q9NMvFaiFykjHmvCpqSn36 | dispatched | n |
+| H.2 | nftables firewall ingredient using `google/nftables` | session_015pQ7NBWmSxJFht6DQyrrbs | dispatched | y — a firewall ingredient can lock out or expose a host |
+| H.3 | SELinux ingredient using `opencontainers/selinux` | session_012DtUVSVbEHb11Uz4KzW4Tt | dispatched | y — CERT-In/DPDP-relevant: silently degrading to permissive is compliance-visible |
+
+Before dispatching, validated against `master` that none of the seven were
+already implemented: no ACL/DACL, Task Scheduler/WUA/Shortcut, LGPO,
+netlink/route, nftables, or SELinux ingredient existed, and none of their
+named dependencies (`go-bindings-win32`, `hectane/go-acl`, `go-ole/go-ole`,
+`vishvananda/netlink`, `google/nftables`, `opencontainers/selinux`) were in
+`go.mod`. The existing `winfirewall` ingredient is G.9's already-merged
+`netsh advfirewall` wrapper, not H.2's Linux nftables ingredient — confirmed
+by reading its imports before ruling H.2 not done.
 
 ## Notes
 
@@ -81,6 +99,11 @@ updated post-H-merge to close a real gap H's enrollment endpoint left open
 - The six pre-existing Wave 0 workstreams were confirmed directly against the
   repo (code present, tests present, commits/PRs identified in `git log`)
   rather than re-run, per instruction to skip work already done.
-- All Wave 0 and Wave 1 workstreams are now merged. Wave 2 (E, I, J) is
-  dispatched and in progress; the Envoy/EdDSA verification gap above is
-  still open and needs a human or a docker-capable environment.
+- All of Wave 0, Wave 1, and Wave 2 are now merged. Everything in
+  `docs/claude-code-parallel-build-plan.md` sections 1–3 is done. The
+  Envoy/EdDSA verification gap noted above under Wave 1 is still open and
+  needs a human or a docker-capable environment — it was never gated on
+  Wave 2 and remains the one unresolved item from the plan as dispatched.
+  Section 4's remaining "ongoing / fully parallel" Windows/Linux ingredient
+  workstreams (G.2, G.4, G.6, G.7, H.1, H.2, H.3) have now been dispatched
+  as well, since they have no dependency on anything else in the plan.
