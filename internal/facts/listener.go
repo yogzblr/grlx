@@ -10,21 +10,32 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/props"
 )
 
+// natsCoreQueueGroup is the queue group every farmer replica shares for
+// grlx.sprouts.*.facts — the same well-known group name
+// internal/natsapi/router.go's Subscribe uses for its own request/response
+// handlers (that constant is unexported there, so this package defines its
+// own copy of the same value rather than depending across packages for a
+// string literal).
+const natsCoreQueueGroup = "grlx-core"
+
 // RegisterFarmerListener subscribes to sprout facts publications and stores
 // them as props on the farmer side.
 //
-// This intentionally uses plain Subscribe (fan-out), not QueueSubscribe,
-// unlike internal/natsapi/router.go's request/response API handlers.
-// props.SetProp writes into an in-process, in-memory cache (see
-// internal/props), not shared storage, so each farmer replica needs its
-// own copy of every sprout's facts to answer prop queries that land on
-// that replica. Queue-grouping this subject would mean only one replica
-// ever learned a given fact, leaving the others to serve stale or empty
-// data for sprouts whose facts were routed elsewhere. This should be
-// revisited alongside workstream A if/when the props cache moves to
-// shared storage.
+// This used to intentionally use plain Subscribe (fan-out), not
+// QueueSubscribe, on the reasoning that props.SetProp wrote into an
+// in-process, in-memory cache, so every farmer replica needed its own copy
+// of every sprout's facts. That reasoning stopped being true once
+// workstream A moved props to PXC-backed, read-through storage with no
+// in-memory cache (see internal/props/store.go's own header comment) —
+// every replica now reads and writes the same shared row regardless of
+// which one received a given facts event. Fan-out therefore meant every
+// replica redundantly re-processing (and racing to UPSERT) the same event,
+// exactly the class of write race the PXC migration was meant to remove.
+// QueueSubscribe under the shared "grlx-core" group (matching
+// internal/natsapi/router.go's own request/response handlers) makes
+// exactly one replica handle each event instead.
 func RegisterFarmerListener(nc *nats.Conn) {
-	_, err := nc.Subscribe("grlx.sprouts.*.facts", func(msg *nats.Msg) {
+	_, err := nc.QueueSubscribe("grlx.sprouts.*.facts", natsCoreQueueGroup, func(msg *nats.Msg) {
 		var sf SystemFacts
 		if unmarshalErr := json.Unmarshal(msg.Data, &sf); unmarshalErr != nil {
 			log.Errorf("facts: failed to unmarshal: %v", unmarshalErr)

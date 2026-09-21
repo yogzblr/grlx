@@ -123,27 +123,32 @@ func TestRegisterFarmerListener_InvalidJSON(t *testing.T) {
 	// No assertion needed — just verifying no panic.
 }
 
-// TestRegisterFarmerListener_FanOutNotQueueGrouped is a regression test for
-// the workstream D decision to keep this subscription as plain fan-out
-// (Subscribe) rather than QueueSubscribe: props.SetProp writes into an
-// in-process, in-memory cache, so with multiple farmer replicas every
-// replica needs its own copy of every sprout's facts. If this were ever
-// switched to a queue group, a second "replica" subscribed to the same
-// subject and queue would stop receiving facts events that the first one
-// already handled.
-func TestRegisterFarmerListener_FanOutNotQueueGrouped(t *testing.T) {
+// TestRegisterFarmerListener_UsesQueueGroup verifies that
+// RegisterFarmerListener subscribes as a queue-group member of
+// "grlx-core", not a plain fan-out subscriber. This used to be the other
+// way around (see the function's own doc comment for why that changed):
+// props no longer holds an in-process, in-memory cache — workstream A
+// moved it to PXC-backed, read-through storage — so every farmer replica
+// reads/writes the same shared row regardless of which one received a
+// given event, and fan-out here just means every replica redundantly
+// reprocessing (and racing to UPSERT) the same facts event.
+//
+// It simulates a second farmer replica by adding another queue subscriber
+// on the same subject and queue group directly (mirroring
+// internal/natsapi/router_test.go's TestSubscribe_UsesQueueGroup), then
+// verifies that published events are load-balanced across the two instead
+// of delivered to both.
+func TestRegisterFarmerListener_UsesQueueGroup(t *testing.T) {
 	nc, cleanup := startTestNATS(t)
 	defer cleanup()
 
 	RegisterFarmerListener(nc)
 	nc.Flush()
 
-	// Simulate a second farmer replica subscribed to the same subject
-	// under a queue group. If RegisterFarmerListener were queue-grouped
-	// too, this second subscriber would compete with it for messages
-	// instead of always receiving its own copy.
+	// Simulate a second farmer replica subscribing to the same subject in
+	// the same queue group.
 	var secondReplicaHits int64
-	sub, err := nc.QueueSubscribe("grlx.sprouts.*.facts", "grlx-core", func(msg *nats.Msg) {
+	sub, err := nc.QueueSubscribe("grlx.sprouts.*.facts", natsCoreQueueGroup, func(msg *nats.Msg) {
 		atomic.AddInt64(&secondReplicaHits, 1)
 	})
 	if err != nil {
@@ -152,31 +157,42 @@ func TestRegisterFarmerListener_FanOutNotQueueGrouped(t *testing.T) {
 	defer sub.Unsubscribe()
 	nc.Flush()
 
-	const numEvents = 5
+	const numEvents = 20
 	for i := range numEvents {
 		sf := SystemFacts{
 			OS:       "linux",
-			Hostname: "fanout-host",
-			SproutID: "sprout-fanout-test",
+			Hostname: "queue-group-host",
+			SproutID: "sprout-queue-group-test",
 			NumCPU:   i,
 		}
 		data, _ := json.Marshal(sf)
-		if err := nc.Publish("grlx.sprouts.sprout-fanout-test.facts", data); err != nil {
+		if err := nc.Publish("grlx.sprouts.sprout-queue-group-test.facts", data); err != nil {
 			t.Fatal(err)
 		}
 	}
 	nc.Flush()
 	time.Sleep(200 * time.Millisecond)
 
-	// The simulated replica's own queue subscription received every event
-	// independently of RegisterFarmerListener's fan-out subscription.
-	if got := atomic.LoadInt64(&secondReplicaHits); got != numEvents {
-		t.Errorf("expected simulated second replica to independently receive all %d events (fan-out), got %d", numEvents, got)
+	// Because this is a queue subscription, the second "replica" should
+	// receive a share of the events but never all of them — if
+	// RegisterFarmerListener used plain Subscribe instead, every event
+	// would be delivered to both the real listener AND this second
+	// subscriber (fan-out), so hits would equal numEvents; if it were
+	// queue-grouped under a different group name than the simulated
+	// replica's, hits would be 0.
+	hits := atomic.LoadInt64(&secondReplicaHits)
+	if hits == 0 {
+		t.Error("expected second replica to receive at least some events via queue-group load balancing")
+	}
+	if hits >= numEvents {
+		t.Errorf("expected events to be load-balanced across queue members, but second replica received all %d (fan-out, not queue-grouped)", hits)
 	}
 
-	// The primary listener also processed the events and stored the props.
-	if got := props.GetStringProp("sprout-fanout-test", "hostname"); got != "fanout-host" {
-		t.Errorf("expected hostname=fanout-host, got %q", got)
+	// Between the primary listener and the simulated replica, every event
+	// was still handled by exactly one queue member — the primary
+	// listener processed its share and stored the props.
+	if got := props.GetStringProp("sprout-queue-group-test", "hostname"); got != "queue-group-host" {
+		t.Errorf("expected hostname=queue-group-host, got %q", got)
 	}
 }
 
