@@ -18,6 +18,7 @@ require (
 	github.com/gogrlx/snack v0.4.4
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/hectane/go-acl v1.0.0
 	github.com/lestrrat-go/jwx/v2 v2.1.7
 	github.com/minio/minio-go/v7 v7.3.0
 	github.com/nats-io/jwt/v2 v2.8.2
