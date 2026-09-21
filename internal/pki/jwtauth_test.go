@@ -286,6 +286,46 @@ func TestGetSproutUserJWT(t *testing.T) {
 	}
 }
 
+func TestFarmerUserJWT(t *testing.T) {
+	setupTestPKI(t)
+
+	// setupTestPKI seeds config.NKeyFarmerPubFile with a placeholder string
+	// that isn't a valid NKey, so mintOrReuseUserJWT would reject it as the
+	// farmer User JWT's subject. Overwrite it with a real farmer NKey
+	// keypair's public key, the way certs.GenNKey(true) would in main().
+	fkp, err := nkeys.CreateUser()
+	if err != nil {
+		t.Fatalf("failed to create test farmer NKey: %v", err)
+	}
+	farmerPub, err := fkp.PublicKey()
+	if err != nil {
+		t.Fatalf("failed to get test farmer NKey public key: %v", err)
+	}
+	if err := os.WriteFile(config.NKeyFarmerPubFile, []byte(farmerPub), 0o600); err != nil {
+		t.Fatalf("failed to write test farmer NKey public key: %v", err)
+	}
+
+	if _, err := FarmerUserJWT(); err == nil {
+		t.Error("expected an error before ReloadNKeys has minted the farmer's User JWT")
+	}
+
+	if err := ReloadNKeys(); err != nil {
+		t.Fatalf("ReloadNKeys failed: %v", err)
+	}
+
+	got, err := FarmerUserJWT()
+	if err != nil {
+		t.Fatalf("FarmerUserJWT failed: %v", err)
+	}
+	uc, err := jwt.DecodeUserClaims(got)
+	if err != nil {
+		t.Fatalf("returned JWT does not decode: %v", err)
+	}
+	if uc.Subject != farmerPub {
+		t.Errorf("returned JWT subject = %q, want %q", uc.Subject, farmerPub)
+	}
+}
+
 func mustReadFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)

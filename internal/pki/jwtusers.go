@@ -183,6 +183,23 @@ func syncNatsAuth(mat *natsAuthMaterial) (bool, error) {
 	return changed, nil
 }
 
+// FarmerUserJWT returns the farmer's own signed User JWT, minted by
+// syncNatsAuth (via ReloadNKeys) into farmerUserJWTPath. cmd/farmer/main.go's
+// ConnectFarmer reads this to authenticate the core process's own bus
+// connection alongside its NKey seed (config.NKeyFarmerPrivFile) — the same
+// User-JWT-plus-seed shape ConnectSystemAccount uses for the SYS push
+// connection, replacing the bare-NKey connect that predates this file's JWT
+// auth model and can't satisfy a server configured with TrustedOperators.
+// ReloadNKeys must have run at least once (main() calls it during farmer
+// startup, before ConnectFarmer) so this file exists by the time it's read.
+func FarmerUserJWT() (string, error) {
+	b, err := os.ReadFile(farmerUserJWTPath())
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 // GetSproutUserJWT returns the signed User JWT minted for an accepted
 // sprout, if any. This is groundwork for the enrollment endpoint
 // (docs/design/grlx-envoy-enrollment-design.md, workstream H) that will
