@@ -28,14 +28,48 @@ gate) is also confirmed merged: `20eb7cd` on `master`.
 
 ## Wave 1
 
-Dispatched now that B and A are confirmed merged to `master`. C and H both
-depend on B's JWT model; H additionally builds on the SaaS-API-scaffold's
-`saas.enrollment_keys` table.
+Dispatched once B and A were confirmed merged to `master`; both are now
+merged themselves (C via PR #20, H via PR #21, plus a review follow-up
+PR #22/#23 that split sprout identity into a paired NATS User JWT + gateway
+JWT and updated the design docs).
 
 | Workstream | Description | Cloud session ID | Status | Needs security review |
 |---|---|---|---|---|
-| C | Split `cmd/farmer/main.go` into two deployables — DMZ bus process (`RunNATSServer()`) and non-DMZ core process (`ConnectFarmer()`), wired to workstream B's JWT push mechanism | session_01JLfTEGP4UW6hZpPADc8ftD | dispatched | n |
-| H | Envoy JWT-gated gateway in front of NATS + recipe-download route, plus the enrollment endpoint (token redemption against `saas.enrollment_keys`, issuing JWT + NKey + tenant X25519 pubkey) | session_01CGL1nDaq9RrXK2nAttjwf3 | dispatched | y — literal front door of the trust chain |
+| C | Split `cmd/farmer/main.go` into two deployables — DMZ bus process (`farmerbus`, `RunNATSServer()`) and non-DMZ core process (`farmer`, `ConnectFarmer()`), wired to workstream B's JWT push mechanism | session_01JLfTEGP4UW6hZpPADc8ftD | merged — PR #20 (`629e4bc`) | n |
+| H | Envoy JWT-gated gateway (`deploy/envoy/`) in front of NATS + recipe-download route, plus the enrollment endpoint (`POST /v1/enroll`, token redemption against `saas.enrollment_keys`, issuing JWT + NKey + tenant X25519 pubkey + gateway JWT) | session_01CGL1nDaq9RrXK2nAttjwf3 | merged — PR #21 (`373c844`, `f2a6fe7`, `1b81abc`, `de0958a`) | y — literal front door of the trust chain |
+
+**Open verification gap left by H's merge (not a code task, and not gated on
+anything):** the sandbox H was built in had no network access to run a live
+Envoy instance, so `jwt_authn`'s EdDSA/Ed25519 support was only checked
+against `jwx`'s library-level round-trip, never against real Envoy. Someone
+with normal network access (and a Docker daemon) needs to pin an Envoy image
+version confirmed to support EdDSA in `jwt_authn` and run one real enrollment
+against `deploy/envoy/testing/docker-compose.keycloak.yml` before relying on
+`deploy/envoy/` in any real environment. **I attempted this myself and could
+not** — this coordinator session has network access but no Docker daemon
+(`/var/run/docker.sock` doesn't exist here). This still needs to happen
+somewhere before Wave 1/2's Envoy config is trusted in production, but it
+does not block Wave 2's code being written, since E/I/J don't depend on the
+JWT signing algorithm choice itself.
+
+## Wave 2
+
+Dispatched now that A and H are confirmed merged to `master`. J's brief was
+updated post-H-merge to close a real gap H's enrollment endpoint left open
+(no `sprout_pub` field yet) — verified against `internal/pki/enroll.go` and
+`internal/api/handlers/enroll.go` before dispatching, confirmed accurate.
+
+| Workstream | Description | Cloud session ID | Status | Needs security review |
+|---|---|---|---|---|
+| E | Multi-tenancy: NATS Account-per-tenant (subjects unchanged), re-key `internal/pki/pki.go` by `(tenant_id, sprout_id)`, tenant field on `internal/rbac` cohort/role maps, dynamic `FarmerOrganization` | session_01SwBEMgMkSFan2X3fUC3pkz | dispatched | y — tenant isolation correctness |
+| I | Finish recipe storage migration: confirm A's recipe HTTP endpoint is served behind H's Envoy JWT-gated route, remove `internal/natsapi/recipes.go`'s old NATS-based delivery | session_01QKGaTno21cXoZGp7hrbjbM | dispatched | n |
+| J | Payload encryption + rotation: NaCl `box` (X25519), tenant keypair via OpenBao (replacing `internal/pki/tenantbox.go`'s interim local-disk custody), sprout keypair generated at enrollment. Must first add a `sprout_pub` field to the enrollment request/`Enroll()` (confirmed missing) | session_01AivbiHCYGgL1ywzyTViaK2 | dispatched | y — cryptographic code defending against a compromised DMZ bus |
+
+## Ongoing / fully parallel (no gating)
+
+| Item | Description | Cloud session ID | Status | Needs security review |
+|---|---|---|---|---|
+| D (facts listener) | `internal/facts/listener.go`'s `RegisterFarmerListener` still used plain fan-out `Subscribe`, justified by a stale comment from before workstream A removed `props/store.go`'s in-memory cache; queue-grouped it under `grlx-core` to stop every replica double-writing the same PXC row on every fact update | not dispatched by this coordinator — found already merged | merged — PR #24 (`e9aa2ea`) | n |
 
 ## Notes
 
@@ -47,5 +81,6 @@ depend on B's JWT model; H additionally builds on the SaaS-API-scaffold's
 - The six pre-existing Wave 0 workstreams were confirmed directly against the
   repo (code present, tests present, commits/PRs identified in `git log`)
   rather than re-run, per instruction to skip work already done.
-- Wave 2 workstreams (E, I, J) are **not** dispatched — they depend on A and
-  H being merged first. Dispatch them once H (and ideally C) are merged.
+- All Wave 0 and Wave 1 workstreams are now merged. Wave 2 (E, I, J) is
+  dispatched and in progress; the Envoy/EdDSA verification gap above is
+  still open and needs a human or a docker-capable environment.
