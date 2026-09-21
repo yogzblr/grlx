@@ -92,19 +92,33 @@ func tenantID() string {
 	return "default"
 }
 
+// roleRowFrom uses r.TenantID when set, falling back to the package's
+// current-tenant seam otherwise — see Role's TenantID doc comment
+// (role.go) for why a Role built directly in Go (e.g. the builtin roles
+// below) normally leaves TenantID unset and picks it up here.
 func roleRowFrom(r *Role) roleRow {
+	tid := r.TenantID
+	if tid == "" {
+		tid = tenantID()
+	}
 	rules, _ := json.Marshal(r.Rules)
-	return roleRow{TenantID: tenantID(), Name: r.Name, Rules: string(rules)}
+	return roleRow{TenantID: tid, Name: r.Name, Rules: string(rules)}
 }
 
 func (row roleRow) toRole() *Role {
-	r := &Role{Name: row.Name}
+	r := &Role{Name: row.Name, TenantID: row.TenantID}
 	json.Unmarshal([]byte(row.Rules), &r.Rules)
 	return r
 }
 
+// cohortRowFrom uses c.TenantID when set, falling back to the package's
+// current-tenant seam otherwise — see cohortRowFrom's sibling, roleRowFrom.
 func cohortRowFrom(c *Cohort) cohortRow {
-	row := cohortRow{TenantID: tenantID(), Name: c.Name, Type: string(c.Type)}
+	tid := c.TenantID
+	if tid == "" {
+		tid = tenantID()
+	}
+	row := cohortRow{TenantID: tid, Name: c.Name, Type: string(c.Type)}
 	if c.Members != nil {
 		b, _ := json.Marshal(c.Members)
 		row.Members = string(b)
@@ -121,7 +135,7 @@ func cohortRowFrom(c *Cohort) cohortRow {
 }
 
 func (row cohortRow) toCohort() *Cohort {
-	c := &Cohort{Name: row.Name, Type: CohortType(row.Type)}
+	c := &Cohort{Name: row.Name, Type: CohortType(row.Type), TenantID: row.TenantID}
 	if row.Members != "" {
 		json.Unmarshal([]byte(row.Members), &c.Members)
 	}

@@ -66,12 +66,17 @@ type CompoundExpr struct {
 }
 
 // Cohort is the primary unit of sprout grouping in grlx RBAC.
+//
+// TenantID identifies which tenant this cohort belongs to — see Role's
+// TenantID doc comment (role.go) for the same zero-value-means-"current
+// tenant" convention and its FLAG FOR SECURITY REVIEW caveat.
 type Cohort struct {
 	Name     string        `json:"name" yaml:"name"`
 	Type     CohortType    `json:"type" yaml:"type"`
 	Members  []string      `json:"members,omitempty" yaml:"members,omitempty"`
 	Match    *DynamicMatch `json:"match,omitempty" yaml:"match,omitempty"`
 	Compound *CompoundExpr `json:"compound,omitempty" yaml:"compound,omitempty"`
+	TenantID string        `json:"tenantId,omitempty" yaml:"-"`
 }
 
 // Validate checks that the cohort definition is internally consistent.
@@ -135,32 +140,50 @@ type RefreshResult struct {
 // is a distinct, bounded, timer-driven performance feature rather than a
 // cache of the definitions themselves; see store.go's doc comment for why
 // the two aren't the same "in-memory cache" the PXC migration targets.
+//
+// tenantID is fixed at construction (NewRegistry/NewRegistryForTenant) and
+// used for every query this Registry issues — see store.go's tenantID()
+// doc comment for why a Registry built via the bare NewRegistry() resolves
+// to "the current tenant" rather than a per-request value.
 type Registry struct {
-	mu    sync.RWMutex
-	cache map[string]*CachedMembership
+	mu       sync.RWMutex
+	cache    map[string]*CachedMembership
+	tenantID string
 }
 
-// NewRegistry creates a cohort registry scoped to the current tenant.
+// NewRegistry creates a cohort registry scoped to the current tenant (see
+// tenantID in store.go).
 func NewRegistry() *Registry {
+	return NewRegistryForTenant(tenantID())
+}
+
+// NewRegistryForTenant creates a cohort registry scoped explicitly to
+// tenantID, independent of the package's "current tenant" seam. Workstream
+// E groundwork: nothing in this repo constructs one of these yet (cohort
+// loading is still wired through the current-tenant path — see
+// LoadCohortsFromConfig in config.go), but real per-request/per-tenant
+// dispatch needs a Registry that doesn't implicitly follow whatever
+// config.FarmerOrganization happens to be at call time.
+func NewRegistryForTenant(tenantID string) *Registry {
 	return &Registry{
-		cache: make(map[string]*CachedMembership),
+		cache:    make(map[string]*CachedMembership),
+		tenantID: tenantID,
 	}
 }
 
-// getCohort reads a single cohort definition from PXC.
-func getCohort(name string) (*Cohort, error) {
+// getCohort reads a single cohort definition from PXC, scoped to tenantID.
+func getCohort(tenantID, name string) (*Cohort, error) {
 	var row cohortRow
-	if err := db.Where("tenant_id = ? AND name = ?", tenantID(), name).First(&row).Error; err != nil {
+	if err := db.Where("tenant_id = ? AND name = ?", tenantID, name).First(&row).Error; err != nil {
 		return nil, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
 	}
 	return row.toCohort(), nil
 }
 
-// listCohorts reads every cohort definition for the current tenant from
-// PXC.
-func listCohorts() map[string]*Cohort {
+// listCohorts reads every cohort definition for tenantID from PXC.
+func listCohorts(tenantID string) map[string]*Cohort {
 	var rows []cohortRow
-	db.Where("tenant_id = ?", tenantID()).Find(&rows)
+	db.Where("tenant_id = ?", tenantID).Find(&rows)
 	result := make(map[string]*Cohort, len(rows))
 	for _, row := range rows {
 		result[row.Name] = row.toCohort()
@@ -181,6 +204,9 @@ func (r *Registry) Register(c *Cohort) error {
 				return fmt.Errorf("%w: cohort %q lists itself as an operand", ErrSelfReference, c.Name)
 			}
 		}
+	}
+	if c.TenantID == "" {
+		c.TenantID = r.tenantID
 	}
 	if err := upsertCohortRow(cohortRowFrom(c)); err != nil {
 		return err
@@ -209,7 +235,7 @@ func (r *Registry) ValidateReferences() error {
 // every validation error found (missing operands, circular references,
 // exceeded nesting depth). Returns nil if all references are valid.
 func (r *Registry) ValidateReferencesAll() []error {
-	cohorts := listCohorts()
+	cohorts := listCohorts(r.tenantID)
 	var errs []error
 	for name, c := range cohorts {
 		if c.Type != CohortTypeCompound {
@@ -272,12 +298,12 @@ func computeDepth(cohorts map[string]*Cohort, name string, visited map[string]bo
 
 // Get returns a cohort by name.
 func (r *Registry) Get(name string) (*Cohort, error) {
-	return getCohort(name)
+	return getCohort(r.tenantID, name)
 }
 
 // List returns the names of all registered cohorts.
 func (r *Registry) List() []string {
-	cohorts := listCohorts()
+	cohorts := listCohorts(r.tenantID)
 	names := make([]string, 0, len(cohorts))
 	for name := range cohorts {
 		names = append(names, name)
@@ -296,7 +322,7 @@ func (r *Registry) GetCachedMembership(name string) (*CachedMembership, bool) {
 // Refresh re-evaluates a named cohort against the current set of sprout IDs
 // and caches the resolved membership with a timestamp. Returns the refresh result.
 func (r *Registry) Refresh(name string, allSproutIDs []string) (*RefreshResult, error) {
-	if _, err := getCohort(name); err != nil {
+	if _, err := getCohort(r.tenantID, name); err != nil {
 		return nil, fmt.Errorf("%w: %q", ErrCohortNotFound, name)
 	}
 
@@ -366,7 +392,7 @@ func (r *Registry) resolve(name string, allSproutIDs []string, visited map[strin
 	}
 	visited[name] = true
 
-	c, err := getCohort(name)
+	c, err := getCohort(r.tenantID, name)
 	if err != nil {
 		return nil, err
 	}

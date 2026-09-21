@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 
 	jwt "github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nkeys"
 
 	"github.com/gogrlx/grlx/v2/internal/auth"
 	log "github.com/gogrlx/grlx/v2/internal/log"
@@ -71,10 +72,18 @@ func ensureUserRevoked(ac *jwt.AccountClaims, pubkey string) bool {
 }
 
 // mintOrReuseUserJWT (re)mints a signed User JWT for pubkey under the
-// tenant account and persists it to path, unless a JWT already on disk at
-// path is still current (same subject pubkey). Returns whether a new JWT
-// was written.
-func mintOrReuseUserJWT(path, pubkey, name string, perms jwt.Permissions, mat *natsAuthMaterial) (bool, error) {
+// Account identified by issuerAccountPub/signingKP and persists it to
+// path, unless a JWT already on disk at path is still current (same
+// subject pubkey). Returns whether a new JWT was written.
+//
+// Parameterized by the issuing Account rather than a *natsAuthMaterial so
+// this same function serves both the legacy single "current tenant" Account
+// (syncNatsAuth, below, passing mat.tenantPub/mat.tenantSigningKP) and any
+// number of dynamically-provisioned tenant Accounts (tenant.go's
+// syncTenantSprouts, passing a *tenantAccountMaterial's fields) — workstream
+// E, FLAG FOR SECURITY REVIEW: this is exactly the seam that must never mix
+// up which Account a given sprout's User JWT gets issued under.
+func mintOrReuseUserJWT(path, pubkey, name string, perms jwt.Permissions, issuerAccountPub string, signingKP nkeys.KeyPair) (bool, error) {
 	if b, err := os.ReadFile(path); err == nil {
 		if existing, derr := jwt.DecodeUserClaims(string(b)); derr == nil && existing.Subject == pubkey {
 			return false, nil
@@ -84,9 +93,9 @@ func mintOrReuseUserJWT(path, pubkey, name string, perms jwt.Permissions, mat *n
 	}
 	uc := jwt.NewUserClaims(pubkey)
 	uc.Name = name
-	uc.IssuerAccount = mat.tenantPub
+	uc.IssuerAccount = issuerAccountPub
 	uc.Permissions = perms
-	signed, err := uc.Encode(mat.tenantSigningKP)
+	signed, err := uc.Encode(signingKP)
 	if err != nil {
 		return false, err
 	}
@@ -121,7 +130,7 @@ func syncNatsAuth(mat *natsAuthMaterial) (bool, error) {
 	if ensureUserGranted(ac, farmerKey) {
 		changed = true
 	}
-	if _, mintErr := mintOrReuseUserJWT(farmerUserJWTPath(), farmerKey, "farmer", allowAllPermissions(), mat); mintErr != nil {
+	if _, mintErr := mintOrReuseUserJWT(farmerUserJWTPath(), farmerKey, "farmer", allowAllPermissions(), mat.tenantPub, mat.tenantSigningKP); mintErr != nil {
 		log.Errorf("failed to mint farmer User JWT: %v", mintErr)
 	}
 
@@ -135,7 +144,7 @@ func syncNatsAuth(mat *natsAuthMaterial) (bool, error) {
 		if ensureUserGranted(ac, key) {
 			changed = true
 		}
-		if _, mintErr := mintOrReuseUserJWT(cliUserJWTPath(key), key, "grlx-cli", allowAllPermissions(), mat); mintErr != nil {
+		if _, mintErr := mintOrReuseUserJWT(cliUserJWTPath(key), key, "grlx-cli", allowAllPermissions(), mat.tenantPub, mat.tenantSigningKP); mintErr != nil {
 			log.Errorf("failed to mint grlx cli User JWT for %s: %v", key, mintErr)
 		}
 	}
@@ -150,7 +159,7 @@ func syncNatsAuth(mat *natsAuthMaterial) (bool, error) {
 		if ensureUserGranted(ac, key) {
 			changed = true
 		}
-		if _, mintErr := mintOrReuseUserJWT(sproutJWTPath(s.SproutID), key, s.SproutID, sproutPermissions(s.SproutID), mat); mintErr != nil {
+		if _, mintErr := mintOrReuseUserJWT(sproutJWTPath(s.SproutID), key, s.SproutID, sproutPermissions(s.SproutID), mat.tenantPub, mat.tenantSigningKP); mintErr != nil {
 			log.Errorf("failed to mint User JWT for sprout %s: %v", s.SproutID, mintErr)
 		}
 	}

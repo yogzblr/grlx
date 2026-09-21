@@ -33,4 +33,6 @@ var (
 	ErrInvalidKeyState          = errors.New("code bug: an invalid key state was supplied")
 	ErrConfirmationLengthIsZero = errors.New("code bug: confirmation options must not be 0-length")
 	ErrNKeyClientNotReady       = errors.New("nkey HTTP client is not initialized; call LoadRootCA first")
+	ErrTenantNotFound           = errors.New("no such tenant has been provisioned")
+	ErrTenantIDInvalid          = errors.New("bad user input: invalid tenant ID received")
 )

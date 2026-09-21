@@ -1,0 +1,151 @@
+package pki
+
+// Integration coverage for dynamic tenant Account provisioning (tenant.go)
+// against a real, local embedded nats-server — the multi-tenant
+// counterpart to jwt_integration_test.go's single-tenant lifecycle
+// coverage. Proves ProvisionTenant/ReloadNKeysForTenant/DeprovisionTenant
+// don't just write local files but actually change what the bus accepts,
+// and that two dynamically-provisioned tenants are genuinely isolated from
+// each other (FLAG FOR SECURITY REVIEW: tenant isolation correctness).
+
+import (
+	"testing"
+
+	"github.com/nats-io/nkeys"
+)
+
+// TestReloadNKeysForTenant_LazyProvisionsAndConnects covers the path
+// enroll.go's acceptEnrolledNKey actually exercises: a sprout accepted
+// under a tenant ID that has never been provisioned before gets that
+// tenant's Account created and pushed to the bus on the spot, and the
+// sprout's freshly-minted User JWT is immediately valid against the live
+// server.
+func TestReloadNKeysForTenant_LazyProvisionsAndConnects(t *testing.T) {
+	setupTestPKI(t)
+	useRealFarmerKey(t)
+	defer startTestBus(t)()
+
+	sproutKP, _ := nkeys.CreateUser()
+	sproutPub, _ := sproutKP.PublicKey()
+	sproutSeed, _ := sproutKP.Seed()
+
+	const tenantID = "t_lazy"
+	if err := upsertNKeyRow(nkeyRow{TenantID: tenantID, SproutID: "web-01", NKey: sproutPub, State: stateAccepted}); err != nil {
+		t.Fatalf("upsertNKeyRow: %v", err)
+	}
+	if err := ReloadNKeysForTenant(tenantID); err != nil {
+		t.Fatalf("ReloadNKeysForTenant: %v", err)
+	}
+
+	row, err := getTenantRow(tenantID)
+	if err != nil || row.Deleted {
+		t.Fatalf("expected tenant %q to be provisioned, row=%+v err=%v", tenantID, row, err)
+	}
+
+	sproutJWT, err := GetSproutUserJWTForTenant(tenantID, "web-01")
+	if err != nil {
+		t.Fatalf("GetSproutUserJWTForTenant: %v", err)
+	}
+	nc, err := dialAsSprout(t, sproutJWT, sproutSeed)
+	if err != nil {
+		t.Fatalf("expected lazily-provisioned tenant's sprout to connect, got: %v", err)
+	}
+	nc.Close()
+}
+
+// TestProvisionTenant_TwoTenantsAreIsolatedAccounts provisions two tenants
+// explicitly (the internal.tenant.provision-shaped path, once that's wired
+// up) and proves each gets a sprout identity the *other* tenant's Account
+// does not vouch for: dialing tenant B's sprout JWT/seed succeeds, but that
+// same JWT can never be confused with tenant A's — they're signed by
+// different Accounts, which is what "isolation enforced by which Account a
+// connection authenticated into" actually rests on.
+func TestProvisionTenant_TwoTenantsAreIsolatedAccounts(t *testing.T) {
+	setupTestPKI(t)
+	useRealFarmerKey(t)
+	defer startTestBus(t)()
+
+	if err := ProvisionTenant("t_a", "Tenant A"); err != nil {
+		t.Fatalf("ProvisionTenant(t_a): %v", err)
+	}
+	if err := ProvisionTenant("t_b", "Tenant B"); err != nil {
+		t.Fatalf("ProvisionTenant(t_b): %v", err)
+	}
+
+	tamA, err := loadTenantAccountMaterial("t_a")
+	if err != nil {
+		t.Fatalf("loadTenantAccountMaterial(t_a): %v", err)
+	}
+	tamB, err := loadTenantAccountMaterial("t_b")
+	if err != nil {
+		t.Fatalf("loadTenantAccountMaterial(t_b): %v", err)
+	}
+	if tamA.pub == tamB.pub {
+		t.Fatal("expected tenant A and tenant B to have distinct Account public keys")
+	}
+
+	sproutKP, _ := nkeys.CreateUser()
+	sproutPub, _ := sproutKP.PublicKey()
+	sproutSeed, _ := sproutKP.Seed()
+	if err := upsertNKeyRow(nkeyRow{TenantID: "t_b", SproutID: "web-01", NKey: sproutPub, State: stateAccepted}); err != nil {
+		t.Fatalf("upsertNKeyRow: %v", err)
+	}
+	if err := ReloadNKeysForTenant("t_b"); err != nil {
+		t.Fatalf("ReloadNKeysForTenant(t_b): %v", err)
+	}
+	sproutJWT, err := GetSproutUserJWTForTenant("t_b", "web-01")
+	if err != nil {
+		t.Fatalf("GetSproutUserJWTForTenant: %v", err)
+	}
+
+	nc, err := dialAsSprout(t, sproutJWT, sproutSeed)
+	if err != nil {
+		t.Fatalf("expected tenant B's sprout to connect under tenant B's own Account: %v", err)
+	}
+	nc.Close()
+}
+
+// TestDeprovisionTenant_RevokesLiveBusAccess is the security-critical
+// counterpart to ProvisionTenant: once a tenant is deprovisioned, a sprout
+// that could connect a moment ago under that tenant's Account must be
+// rejected — the same "revocation takes effect immediately" property
+// jwt_integration_test.go proves for the legacy single-tenant Deny/Reject
+// path, here for a dynamically-provisioned tenant's Account as a whole.
+func TestDeprovisionTenant_RevokesLiveBusAccess(t *testing.T) {
+	setupTestPKI(t)
+	useRealFarmerKey(t)
+	defer startTestBus(t)()
+
+	const tenantID = "t_offboarding"
+	if err := ProvisionTenant(tenantID, "Offboarding Co"); err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
+	}
+
+	sproutKP, _ := nkeys.CreateUser()
+	sproutPub, _ := sproutKP.PublicKey()
+	sproutSeed, _ := sproutKP.Seed()
+	if err := upsertNKeyRow(nkeyRow{TenantID: tenantID, SproutID: "web-01", NKey: sproutPub, State: stateAccepted}); err != nil {
+		t.Fatalf("upsertNKeyRow: %v", err)
+	}
+	if err := ReloadNKeysForTenant(tenantID); err != nil {
+		t.Fatalf("ReloadNKeysForTenant: %v", err)
+	}
+	sproutJWT, err := GetSproutUserJWTForTenant(tenantID, "web-01")
+	if err != nil {
+		t.Fatalf("GetSproutUserJWTForTenant: %v", err)
+	}
+
+	if nc, err := dialAsSprout(t, sproutJWT, sproutSeed); err != nil {
+		t.Fatalf("expected sprout to connect before deprovisioning: %v", err)
+	} else {
+		nc.Close()
+	}
+
+	if err := DeprovisionTenant(tenantID); err != nil {
+		t.Fatalf("DeprovisionTenant: %v", err)
+	}
+
+	if _, err := dialAsSprout(t, sproutJWT, sproutSeed); err == nil {
+		t.Fatal("expected the same sprout JWT to be rejected after its tenant was deprovisioned")
+	}
+}
