@@ -210,7 +210,7 @@ func TestMintOrReuseUserJWT(t *testing.T) {
 	upub, _ := ukp.PublicKey()
 	path := filepath.Join(t.TempDir(), "sprout.jwt")
 
-	minted, err := mintOrReuseUserJWT(path, upub, "sprout01", sproutPermissions("sprout01"), mat)
+	minted, err := mintOrReuseUserJWT(path, upub, "sprout01", sproutPermissions("sprout01"), mat.tenantPub, mat.tenantSigningKP)
 	if err != nil {
 		t.Fatalf("mintOrReuseUserJWT failed: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestMintOrReuseUserJWT(t *testing.T) {
 	}
 
 	// Calling again for the same pubkey should reuse the file, not re-mint.
-	minted, err = mintOrReuseUserJWT(path, upub, "sprout01", sproutPermissions("sprout01"), mat)
+	minted, err = mintOrReuseUserJWT(path, upub, "sprout01", sproutPermissions("sprout01"), mat.tenantPub, mat.tenantSigningKP)
 	if err != nil {
 		t.Fatalf("mintOrReuseUserJWT (reuse) failed: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestMintOrReuseUserJWT(t *testing.T) {
 	// A different pubkey at the same path must trigger a re-mint.
 	ukp2, _ := nkeys.CreateUser()
 	upub2, _ := ukp2.PublicKey()
-	minted, err = mintOrReuseUserJWT(path, upub2, "sprout01", sproutPermissions("sprout01"), mat)
+	minted, err = mintOrReuseUserJWT(path, upub2, "sprout01", sproutPermissions("sprout01"), mat.tenantPub, mat.tenantSigningKP)
 	if err != nil {
 		t.Fatalf("mintOrReuseUserJWT (rotate) failed: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestGetSproutUserJWT(t *testing.T) {
 
 	ukp, _ := nkeys.CreateUser()
 	upub, _ := ukp.PublicKey()
-	if _, err := mintOrReuseUserJWT(sproutJWTPath("sprout01"), upub, "sprout01", sproutPermissions("sprout01"), mat); err != nil {
+	if _, err := mintOrReuseUserJWT(sproutJWTPath("sprout01"), upub, "sprout01", sproutPermissions("sprout01"), mat.tenantPub, mat.tenantSigningKP); err != nil {
 		t.Fatalf("mintOrReuseUserJWT failed: %v", err)
 	}
 

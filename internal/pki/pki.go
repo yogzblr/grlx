@@ -208,6 +208,13 @@ func UnacceptNKey(id string, nkey string) error {
 }
 
 func GetNKeysByType(set string) KeySet {
+	return getNKeysByTypeForTenant(tenantID(), set)
+}
+
+// getNKeysByTypeForTenant is GetNKeysByType scoped to an explicit tenant
+// instead of the package's current-tenant seam — used by tenant.go's
+// per-tenant sync path (syncTenantSprouts).
+func getNKeysByTypeForTenant(tenantID, set string) KeySet {
 	keySet := KeySet{}
 	keySet.Sprouts = []KeyManager{}
 	switch set {
@@ -223,7 +230,7 @@ func GetNKeysByType(set string) KeySet {
 		return keySet
 	}
 	var rows []nkeyRow
-	db.Where("tenant_id = ? AND state = ?", tenantID(), set).Find(&rows)
+	db.Where("tenant_id = ? AND state = ?", tenantID, set).Find(&rows)
 	for _, r := range rows {
 		keySet.Sprouts = append(keySet.Sprouts, KeyManager{SproutID: r.SproutID})
 	}

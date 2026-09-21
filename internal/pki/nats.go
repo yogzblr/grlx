@@ -125,6 +125,37 @@ func ConfigureNats() nats_server.Options {
 	if err := resolver.Store(mat.tenantPub, mat.tenantJWT); err != nil {
 		log.Panicf("nats: failed to seed the tenant account into the resolver: %v", err)
 	}
+
+	// Seed every additionally-provisioned tenant's Account too (workstream
+	// E, FLAG FOR SECURITY REVIEW: tenant isolation correctness) — the
+	// legacy single-tenant seam above only ever knows about the one Account
+	// named by config.FarmerOrganization; ProvisionTenant (tenant.go) is
+	// what actually makes multiple, dynamically-created tenant Accounts
+	// exist, and every one of them needs to be in the resolver from the
+	// moment this bus node starts, not just the tenant that happens to be
+	// "current" for this process. This is a filesystem scan
+	// (tenantIDsProvisionedOnDisk), not a pki_tenants/PXC query: this
+	// function runs in both cmd/farmer (has a PXC connection) and
+	// cmd/farmerbus (deliberately does not — see that binary's
+	// RunNATSServer doc comment), and a database dependency here would
+	// panic the bus binary. A failure loading one tenant's material is
+	// logged and skipped rather than panicking the whole server — a bad
+	// on-disk file for one tenant shouldn't take down every other tenant's
+	// bus access.
+	ids, err := tenantIDsProvisionedOnDisk()
+	if err != nil {
+		log.Errorf("nats: failed to list provisioned tenants for resolver seeding: %v", err)
+	}
+	for _, id := range ids {
+		tam, tErr := loadTenantAccountMaterial(id)
+		if tErr != nil {
+			log.Errorf("nats: failed to load Account material for tenant %q, skipping resolver seed: %v", id, tErr)
+			continue
+		}
+		if err := resolver.Store(tam.pub, tam.jwt); err != nil {
+			log.Errorf("nats: failed to seed tenant %q's account into the resolver: %v", id, err)
+		}
+	}
 	NatsConfig.AccountResolver = resolver
 
 	return NatsConfig
@@ -166,7 +197,7 @@ func ReloadNKeys() error {
 	if !changed {
 		return nil
 	}
-	if err := pushAccountUpdate(mat); err != nil {
+	if err := pushAccountUpdate(mat, mat.tenantJWT); err != nil {
 		log.Errorf("failed to push the updated Account JWT to the bus resolver: %v", err)
 		return err
 	}

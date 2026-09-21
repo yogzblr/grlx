@@ -75,9 +75,19 @@ type Rule struct {
 }
 
 // Role is a named collection of permission rules.
+//
+// TenantID identifies which tenant this role belongs to (workstream E,
+// FLAG FOR SECURITY REVIEW: see store.go's tenantID() doc comment — a
+// zero-value TenantID here means "the current tenant", resolved at
+// storage time, not "no tenant"/"global"). Roles constructed directly in
+// Go (as the BuiltinViewerRole/BuiltinOperatorRole below do) leave this
+// unset and get the current tenant filled in when persisted; a Role read
+// back from storage (RoleStore.Get/List) always has it populated from the
+// owning row.
 type Role struct {
-	Name  string `json:"name" yaml:"name"`
-	Rules []Rule `json:"rules" yaml:"rules"`
+	Name     string `json:"name" yaml:"name"`
+	Rules    []Rule `json:"rules" yaml:"rules"`
+	TenantID string `json:"tenantId,omitempty" yaml:"-"`
 }
 
 // routeActions maps route names to the action(s) they require.

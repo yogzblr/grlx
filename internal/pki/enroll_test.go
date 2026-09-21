@@ -136,9 +136,9 @@ func TestEnroll_Success(t *testing.T) {
 		t.Errorf("expected exactly 1 gateway JWT mint call, got %d", minter.calls)
 	}
 
-	sproutID, err := SproutIDForNKey(nkeyPub)
-	if err != nil || sproutID != "web-01" {
-		t.Errorf("expected sprout accepted under web-01, got %q err=%v", sproutID, err)
+	gotTenant, sproutID, err := SproutIDAndTenantForNKey(nkeyPub)
+	if err != nil || sproutID != "web-01" || gotTenant != "t_1" {
+		t.Errorf("expected sprout web-01 accepted under tenant t_1, got tenant=%q sprout=%q err=%v", gotTenant, sproutID, err)
 	}
 }
 
@@ -159,7 +159,7 @@ func TestEnroll_NoGatewaySignerConfigured(t *testing.T) {
 
 func TestEnroll_IdempotentReplayDoesNotConsumeToken(t *testing.T) {
 	store, minter := setupEnrollTest(t)
-	store.rows["ek_1"] = &enrollmentKeyRow{KeyHash: hashSecret("supersecret"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
+	store.rows["ek_1"] = &enrollmentKeyRow{TenantID: "t_1", KeyHash: hashSecret("supersecret"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
 
 	nkeyPub := testEnrollNKey(t)
 	first, err := Enroll(t.Context(), "ek_1.supersecret", nkeyPub, "web-01")
@@ -228,7 +228,7 @@ func TestEnroll_Expired(t *testing.T) {
 
 func TestEnroll_ExhaustedByPriorRedemption(t *testing.T) {
 	store, _ := setupEnrollTest(t)
-	store.rows["ek_1"] = &enrollmentKeyRow{KeyHash: hashSecret("s"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
+	store.rows["ek_1"] = &enrollmentKeyRow{TenantID: "t_1", KeyHash: hashSecret("s"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
 
 	if _, err := Enroll(t.Context(), "ek_1.s", testEnrollNKey(t), "web-01"); err != nil {
 		t.Fatalf("first enroll: %v", err)

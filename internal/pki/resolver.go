@@ -29,15 +29,17 @@ const (
 	pushTimeout         = 10 * time.Second
 )
 
-// pushAccountUpdate publishes mat's current tenant Account JWT to the bus's
-// resolver, over a fresh connection authenticated as the SYS account.
-func pushAccountUpdate(mat *natsAuthMaterial) error {
+// pushAccountUpdate publishes accountJWT (a signed Account JWT — the
+// legacy single-tenant seam's mat.tenantJWT, or any dynamically-provisioned
+// tenant's own Account JWT, see tenant.go) to the bus's resolver, over a
+// fresh connection authenticated as the SYS account.
+func pushAccountUpdate(mat *natsAuthMaterial, accountJWT string) error {
 	nc, err := connectSystemAccount(mat)
 	if err != nil {
 		return fmt.Errorf("connecting as the SYS account: %w", err)
 	}
 	defer nc.Close()
-	return publishClaimsUpdate(nc, mat.tenantJWT)
+	return publishClaimsUpdate(nc, accountJWT)
 }
 
 // ConnectSystemAccount dials the configured bus authenticated as the

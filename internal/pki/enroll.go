@@ -160,9 +160,14 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 	// connection generates its keypair once, locally, before ever calling
 	// out — so a retry presents the same nkey_pub and should get the same
 	// identity back rather than burning a second use of a possibly
-	// single-use token.
-	if sproutID, err := SproutIDForNKey(nkeyPub); err == nil {
-		return replayExistingEnrollment(ctx, sproutID, nkeyPub)
+	// single-use token. This has to search across every tenant (see
+	// SproutIDAndTenantForNKey) rather than just "the current" one: the
+	// caller's tenant isn't known yet at this point (that only comes from
+	// decoding the join token below), but nkey_pub alone already
+	// unambiguously identifies both the sprout and its tenant if it's been
+	// accepted before.
+	if replayTenantID, sproutID, err := SproutIDAndTenantForNKey(nkeyPub); err == nil {
+		return replayExistingEnrollment(ctx, replayTenantID, sproutID, nkeyPub)
 	}
 
 	keyID, secret, ok := splitJoinToken(joinToken)
@@ -186,6 +191,16 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 		return nil, ErrEnrollmentFailed
 	}
 
+	// Defense in depth (workstream E, FLAG FOR SECURITY REVIEW): row.TenantID
+	// is about to be threaded into filesystem paths (tenantAuthDir) and PXC
+	// primary keys for the rest of this call. It's expected to already be a
+	// well-formed saasapi-generated ID (idgen.go's "t_"-prefixed IDs), but
+	// this fails closed rather than trusting that invariant blindly.
+	if !IsValidTenantID(row.TenantID) {
+		log.Errorf("enroll: key_id %s has a malformed tenant_id %q", keyID, row.TenantID)
+		return nil, ErrEnrollmentFailed
+	}
+
 	now := time.Now().UTC()
 	switch {
 	case row.Revoked:
@@ -204,20 +219,26 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 	// hostname, too many colliding sprouts) shouldn't burn a use of an
 	// otherwise-valid, possibly-single-use token — a client-side mistake
 	// on the request shouldn't have the same cost as a real redemption.
-	sproutID, err := resolveEnrollSproutID(hostname, nkeyPub)
+	// Scoped to row.TenantID (the enrollment key's own tenant, not any
+	// global default) so a hostname collision is only ever checked against
+	// that tenant's own sprouts — see resolveEnrollSproutID.
+	sproutID, err := resolveEnrollSproutID(row.TenantID, hostname, nkeyPub)
 	if err != nil {
 		log.Errorf("enroll: resolving sprout id for hostname %q: %v", hostname, err)
 		return nil, ErrEnrollmentFailed
 	}
 
-	// Note: row.TenantID is validated to exist but is deliberately not
-	// threaded into the tenant scoping below — this package's PKI storage
-	// (store.go's tenantID()) is still the single-tenant-per-process
-	// placeholder every other lifecycle function here uses, pending
-	// workstream E's real multi-tenancy. Enrolling against a key issued
-	// for a tenant other than this farmer's configured one isn't
-	// meaningfully different from today's single-tenant behavior, but is
-	// worth knowing about before this ships multi-tenant.
+	// row.TenantID (workstream E, FLAG FOR SECURITY REVIEW: tenant
+	// isolation correctness) is the enrollment key's real tenant, and is
+	// what every PKI/NATS-auth operation below is scoped to — accepting
+	// the sprout, minting/reusing its User JWT, and syncing/pushing its
+	// tenant's Account (lazily provisioning that tenant's Account if this
+	// is its first-ever sprout — see ReloadNKeysForTenant). This is the one
+	// place in this package where the tenant comes from real per-request
+	// data (saas.enrollment_keys) rather than the process-global tenantID()
+	// seam every admin/CLI-driven lifecycle function (AcceptNKey and
+	// friends) still uses — see store.go's tenantID() doc comment for why
+	// that placeholder remains elsewhere.
 	redeemed, err := enrollKeyStore.redeem(keyID)
 	if err != nil {
 		log.Errorf("enroll: redeeming key_id %s: %v", keyID, err)
@@ -228,22 +249,30 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 		return nil, ErrEnrollmentFailed
 	}
 
-	if err := acceptEnrolledNKey(sproutID, nkeyPub); err != nil {
-		log.Errorf("enroll: accepting sprout %s: %v", sproutID, err)
+	if err := acceptEnrolledNKey(row.TenantID, sproutID, nkeyPub); err != nil {
+		log.Errorf("enroll: accepting sprout %s for tenant %s: %v", sproutID, row.TenantID, err)
 		return nil, ErrEnrollmentFailed
 	}
 
-	signedJWT, err := GetSproutUserJWT(sproutID)
+	signedJWT, err := GetSproutUserJWTForTenant(row.TenantID, sproutID)
 	if err != nil {
 		log.Errorf("enroll: sprout %s accepted but no readable JWT: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
+	// TenantX25519Pub is not yet re-keyed per tenant (workstream J, not
+	// this workstream's scope — see tenantbox.go's own doc comment): every
+	// tenant on this farmer currently gets the same NaCl box public key
+	// back. Nothing in this repo uses the corresponding private key to
+	// encrypt anything yet, so this is inert scaffolding rather than a live
+	// cross-tenant confidentiality leak today, but it will need the same
+	// per-tenant treatment this file gives the NATS Account material
+	// before workstream J wires up real payload encryption.
 	tenantPub, err := GetTenantX25519PublicKey()
 	if err != nil {
 		log.Errorf("enroll: sprout %s enrolled but failed to load tenant X25519 key: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
-	gatewayJWT, err := mintGatewayJWTFor(ctx, sproutID, nkeyPub)
+	gatewayJWT, err := mintGatewayJWTFor(ctx, row.TenantID, sproutID, nkeyPub)
 	if err != nil {
 		log.Errorf("enroll: sprout %s enrolled but failed to mint gateway JWT: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
@@ -256,19 +285,23 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollRe
 // replayExistingEnrollment handles design doc §3.3 step 1: an already-
 // accepted nkey_pub gets its existing identity back, no token touched.
 // The gateway JWT is still minted fresh — see EnrollResult.GatewayJWT's
-// doc comment on why it isn't cached like the NATS JWT is.
-func replayExistingEnrollment(ctx context.Context, sproutID, nkeyPub string) (*EnrollResult, error) {
-	existingJWT, err := GetSproutUserJWT(sproutID)
+// doc comment on why it isn't cached like the NATS JWT is. tenantID is the
+// tenant SproutIDAndTenantForNKey found this sprout under, not necessarily
+// whatever tenant a caller might have guessed from context.
+func replayExistingEnrollment(ctx context.Context, tenantID, sproutID, nkeyPub string) (*EnrollResult, error) {
+	existingJWT, err := GetSproutUserJWTForTenant(tenantID, sproutID)
 	if err != nil {
 		log.Errorf("enroll: sprout %s has an accepted nkey but no readable JWT: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
+	// See Enroll's own TenantX25519Pub comment: not yet tenant-scoped
+	// (workstream J).
 	tenantPub, err := GetTenantX25519PublicKey()
 	if err != nil {
 		log.Errorf("enroll: idempotent replay for %s but failed to load tenant X25519 key: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
-	gatewayJWT, err := mintGatewayJWTFor(ctx, sproutID, nkeyPub)
+	gatewayJWT, err := mintGatewayJWTFor(ctx, tenantID, sproutID, nkeyPub)
 	if err != nil {
 		log.Errorf("enroll: idempotent replay for %s but failed to mint gateway JWT: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
@@ -282,13 +315,13 @@ func replayExistingEnrollment(ctx context.Context, sproutID, nkeyPub string) (*E
 // success paths call this, per the implementation brief's "Both tokens
 // must be minted in the same call — don't split into two round-trips"
 // and "don't special-case rotation to mint only one token."
-func mintGatewayJWTFor(ctx context.Context, sproutID, nkeyPub string) (string, error) {
+func mintGatewayJWTFor(ctx context.Context, tenantID, sproutID, nkeyPub string) (string, error) {
 	if gatewayMinter == nil {
 		return "", errors.New("pki: no gateway JWT signer configured (SetGatewaySigner was never called)")
 	}
 	return gatewayMinter.MintGatewayJWT(ctx, gatewayjwt.GatewayClaims{
 		Subject:  nkeyPub,
-		TenantID: tenantID(),
+		TenantID: tenantID,
 		SproutID: sproutID,
 		Expiry:   time.Now().Add(config.GatewayJWTTTL),
 	})
@@ -319,20 +352,23 @@ func hashSecret(secret string) string {
 // applying the same hostname normalization and same-nkey/collision
 // handling as the legacy PutNKey path
 // (internal/api/handlers/pki.go) so both mechanisms agree on how a
-// hostname becomes a sprout ID.
-func resolveEnrollSproutID(hostname, nkeyPub string) (string, error) {
+// hostname becomes a sprout ID. Collision-checked within tenantID only —
+// two different tenants may legitimately each have a sprout resolving to
+// the same base hostname (e.g. "web-01"), and must not collide with each
+// other's sprout IDs.
+func resolveEnrollSproutID(tenantID, hostname, nkeyPub string) (string, error) {
 	base := strings.ToLower(hostname)
 	base = strings.ReplaceAll(base, "_", "-")
 	base = strings.TrimPrefix(base, "-")
 	if !IsValidSproutID(base) {
 		return "", ErrSproutIDInvalid
 	}
-	if registered, matches := NKeyExists(base, nkeyPub); !registered || matches {
+	if registered, matches := NKeyExistsInTenant(tenantID, base, nkeyPub); !registered || matches {
 		return base, nil
 	}
 	for i := 1; i < 100; i++ {
 		id := base + "_" + strconv.Itoa(i)
-		if registered, matches := NKeyExists(id, nkeyPub); !registered || matches {
+		if registered, matches := NKeyExistsInTenant(tenantID, id, nkeyPub); !registered || matches {
 			return id, nil
 		}
 	}
@@ -340,14 +376,19 @@ func resolveEnrollSproutID(hostname, nkeyPub string) (string, error) {
 }
 
 // acceptEnrolledNKey upserts sprout directly into the accepted state in
-// one write. Unlike the legacy Unaccept-then-admin-Accept flow, presenting
-// a valid, unexhausted join token *is* the authorization decision here —
-// there's no separate pending-review step to go through first.
-func acceptEnrolledNKey(id, nkey string) error {
+// one write, scoped to tenantID (the enrollment key's own tenant — see
+// Enroll). Unlike the legacy Unaccept-then-admin-Accept flow, presenting a
+// valid, unexhausted join token *is* the authorization decision here —
+// there's no separate pending-review step to go through first. Reloads via
+// ReloadNKeysForTenant (tenant.go), not the legacy current-tenant
+// ReloadNKeys — this lazily provisions tenantID's own NATS Account (mint +
+// push) the first time it's ever seen, which is what actually makes a
+// freshly-enrolled sprout's User JWT valid against the bus.
+func acceptEnrolledNKey(tenantID, id, nkey string) error {
 	defer func() {
-		if err := ReloadNKeys(); err != nil {
-			log.Errorf("failed to reload NATS auth for enrolled sprout %s: %v", id, err)
+		if err := ReloadNKeysForTenant(tenantID); err != nil {
+			log.Errorf("failed to reload NATS auth for enrolled sprout %s in tenant %s: %v", id, tenantID, err)
 		}
 	}()
-	return upsertNKeyRow(nkeyRow{TenantID: tenantID(), SproutID: id, NKey: nkey, State: stateAccepted})
+	return upsertNKeyRow(nkeyRow{TenantID: tenantID, SproutID: id, NKey: nkey, State: stateAccepted})
 }

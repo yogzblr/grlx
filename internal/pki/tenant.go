@@ -1,0 +1,505 @@
+package pki
+
+// Dynamic tenant Account provisioning — workstream E
+// (docs/design/grlx-fork-roadmap.md, docs/design/grlx-nats-jwt-auth-design.md
+// "one Account per tenant"). This file is what actually makes
+// FarmerOrganization dynamic: jwtauth.go's natsAuthMaterial still holds
+// exactly one "current" tenant Account (named by the static
+// config.FarmerOrganization string, decided once at boot — see its own doc
+// comment), which every existing Accept/Deny/Reject/Unaccept/Delete call
+// and the SIGHUP-driven ReloadNKeys() still operate against unchanged. What
+// this file adds is a second, independent way to get a tenant Account: any
+// tenant ID can have its own Account minted and pushed to the bus resolver
+// at any time, not just the one config names at boot — via ProvisionTenant,
+// called either explicitly (the internal.tenant.provision round trip from
+// internal/saasapi, once wired) or lazily by ReloadNKeysForTenant the first
+// time a sprout enrolls for a tenant (enroll.go), whichever happens first.
+//
+// FLAG FOR SECURITY REVIEW (tenant isolation correctness): every
+// dynamically-provisioned tenant gets its own Account keypair, its own
+// Account JWT, and its own namespace of sprout/user JWTs on disk
+// (tenantAuthDir) — structurally separate from every other tenant's, the
+// same "isolation enforced by which Account a connection authenticated
+// into" property the design doc describes for the legacy single-tenant
+// seam. The operator (and its delegated signing key) remain shared across
+// every tenant by design — that's the trust anchor the whole chain rests
+// on, not a tenant boundary itself; see jwtauth.go's own security-review
+// note on operator key custody, which applies identically here.
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	jwt "github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nkeys"
+
+	log "github.com/gogrlx/grlx/v2/internal/log"
+)
+
+var tenantIDMatcher = regexp.MustCompile(`^[0-9A-Za-z_-]{1,191}$`)
+
+// IsValidTenantID reports whether id is safe to use both as a PXC primary
+// key and as a path component under natsAuthDir (tenantAuthDir joins it
+// directly into a filesystem path, so this also guards against path
+// traversal via a malicious/malformed tenant ID).
+func IsValidTenantID(id string) bool {
+	return tenantIDMatcher.MatchString(id)
+}
+
+// tenantAccountMaterial is one tenant's NATS Account trust material:
+// its own Account keypair, a delegated signing key (so the Account's own
+// root key need not be online at runtime, mirroring the
+// operator/operator-signing split in jwtauth.go), and the current signed
+// Account JWT.
+type tenantAccountMaterial struct {
+	kp        nkeys.KeyPair
+	signingKP nkeys.KeyPair
+	pub       string
+	jwt       string
+}
+
+func tenantsRootDir() string {
+	return filepath.Join(natsAuthDir(), "tenants")
+}
+
+// tenantAuthDir is where a specific tenant's Account keys, Account JWT,
+// and every sprout/cli/farmer User JWT minted under that Account live —
+// the re-keyed-by-tenant counterpart to jwtauth.go's flat, single-tenant
+// natsAuthDir/sproutJWTDir. id must already be validated (IsValidTenantID)
+// by every exported entry point below before reaching here.
+func tenantAuthDir(id string) string {
+	return filepath.Join(tenantsRootDir(), id)
+}
+
+func tenantAccountKeyPath(id string) string { return filepath.Join(tenantAuthDir(id), "account.nk") }
+func tenantAccountSigningKeyPath(id string) string {
+	return filepath.Join(tenantAuthDir(id), "account-signing.nk")
+}
+func tenantAccountJWTPath(id string) string { return filepath.Join(tenantAuthDir(id), "account.jwt") }
+func tenantSproutJWTDir(id string) string   { return filepath.Join(tenantAuthDir(id), "sprouts") }
+
+// sproutJWTPathForTenant is sproutJWTPath (jwtauth.go) re-keyed by tenant —
+// see this file's package doc comment. Two different tenants may each have
+// a sprout named "web-01"; each gets its own file under its own tenant's
+// directory, rather than colliding on config.FarmerPKI/sprouts/jwt/web-01.jwt
+// the way the legacy single-tenant path still does (deliberately — see
+// jwtauth.go, that path is unchanged).
+func sproutJWTPathForTenant(tenantID, sproutID string) string {
+	return filepath.Join(tenantSproutJWTDir(tenantID), sproutID+".jwt")
+}
+
+// externalSeedNameForTenant derives an env-var-safe name for
+// loadOrCreateSeed's external-seed override (loadExternalSeed in
+// jwtauth.go), following the same GRLX_NATS_<NAME>_SEED[_FILE] convention
+// the fixed platform-wide identities use — e.g. tenant ID "t_8f2a" maps to
+// GRLX_NATS_TENANT_T_8F2A_SEED_FILE. Not expected to be set for most
+// tenants today (this is groundwork for OpenBao/per-tenant secret custody,
+// workstream F), but keeps the override mechanism available uniformly
+// rather than only for the handful of fixed identities jwtauth.go names
+// directly.
+func externalSeedNameForTenant(tenantID string) string {
+	return "TENANT_" + strings.ToUpper(strings.ReplaceAll(tenantID, "-", "_"))
+}
+
+// tenantAuthMu guards concurrent bootstrap/persistence of any tenant's
+// Account material below (a pki_tenants row plus its on-disk Account
+// keys/JWT) — the tenant-scoped counterpart to jwtauth.go's authMu, which
+// guards only the legacy single "current tenant"'s material and the
+// platform-wide operator/SYS material. Deliberately a separate lock rather
+// than reusing authMu: every entry point below (ensureTenantAccountLocked,
+// used by ProvisionTenant/ReloadNKeysForTenant/loadTenantAccountMaterial/
+// DeprovisionTenant) first calls ensureNatsAuth(), which takes authMu
+// itself — holding authMu across that call here would deadlock, since
+// Go's sync.Mutex isn't reentrant.
+var tenantAuthMu sync.Mutex
+
+// ensureTenantAccountMaterial loads tenantID's Account keys/JWT from disk,
+// minting and persisting whatever's missing — idempotent, but relies on the
+// caller already holding tenantAuthMu (every call site in this file does,
+// via ensureTenantAccountLocked or loadTenantAccountMaterial) for safety
+// under concurrent calls for the same tenant.
+func ensureTenantAccountMaterial(mat *natsAuthMaterial, tenantID, name string) (*tenantAccountMaterial, bool, error) {
+	if err := os.MkdirAll(tenantAuthDir(tenantID), 0o700); err != nil {
+		return nil, false, err
+	}
+	if err := os.MkdirAll(tenantSproutJWTDir(tenantID), 0o700); err != nil {
+		return nil, false, err
+	}
+
+	tam := &tenantAccountMaterial{}
+	seedName := externalSeedNameForTenant(tenantID)
+
+	var err error
+	tam.kp, err = loadOrCreateSeed(tenantAccountKeyPath(tenantID), seedName, nkeys.CreateAccount)
+	if err != nil {
+		return nil, false, err
+	}
+	tam.pub, err = tam.kp.PublicKey()
+	if err != nil {
+		return nil, false, err
+	}
+	tam.signingKP, err = loadOrCreateSeed(tenantAccountSigningKeyPath(tenantID), seedName+"_SIGNING", nkeys.CreateAccount)
+	if err != nil {
+		return nil, false, err
+	}
+	signingPub, err := tam.signingKP.PublicKey()
+	if err != nil {
+		return nil, false, err
+	}
+
+	minted := false
+	needJWT := true
+	if b, rerr := os.ReadFile(tenantAccountJWTPath(tenantID)); rerr == nil {
+		if ac, derr := jwt.DecodeAccountClaims(string(b)); derr == nil &&
+			ac.Subject == tam.pub && ac.SigningKeys.Contains(signingPub) {
+			tam.jwt = string(b)
+			needJWT = false
+		}
+	}
+	if needJWT {
+		ac := jwt.NewAccountClaims(tam.pub)
+		ac.Name = name
+		ac.SigningKeys.Add(signingPub)
+		signed, encErr := ac.Encode(mat.operatorSigningKP)
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		if werr := os.WriteFile(tenantAccountJWTPath(tenantID), []byte(signed), 0o600); werr != nil {
+			return nil, false, werr
+		}
+		tam.jwt = signed
+		minted = true
+	}
+
+	return tam, minted, nil
+}
+
+// loadTenantAccountMaterial loads a tenant's Account material without
+// creating a new pki_tenants row — used where the caller expects the
+// tenant to already be provisioned (ConfigureNats' resolver-seeding loop)
+// and a missing tenant should surface as an error rather than silently
+// registering one. It does still fill in any missing key/JWT *file* for an
+// already-registered tenant, the same as ensureTenantAccountLocked, since a
+// partially-written tenant directory (e.g. a prior crash mid-provision)
+// should self-heal rather than wedge the resolver.
+func loadTenantAccountMaterial(tenantID string) (*tenantAccountMaterial, error) {
+	mat, err := ensureNatsAuth()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(tenantAccountJWTPath(tenantID)); err != nil {
+		return nil, fmt.Errorf("pki: no Account material found for tenant %q: %w", tenantID, err)
+	}
+	tenantAuthMu.Lock()
+	defer tenantAuthMu.Unlock()
+	tam, _, err := ensureTenantAccountMaterial(mat, tenantID, tenantID)
+	return tam, err
+}
+
+// ensureTenantAccount is the shared bootstrap path for ProvisionTenant and
+// ReloadNKeysForTenant: it ensures a pki_tenants row exists for tenantID
+// (creating one, named nameHint, if this is the first time this tenant has
+// ever been provisioned) and that its Account material exists on disk.
+// provisioned reports whether either the tenant row or the Account
+// material was newly created by this call — callers use it to decide
+// whether a resolver push is required even if syncing sprouts found
+// nothing to change.
+func ensureTenantAccount(tenantID, nameHint string) (mat *natsAuthMaterial, tam *tenantAccountMaterial, provisioned bool, err error) {
+	if !IsValidTenantID(tenantID) {
+		return nil, nil, false, ErrTenantIDInvalid
+	}
+	// ensureNatsAuth takes authMu itself — called before tenantAuthMu below
+	// (never while holding it) to avoid a lock-ordering deadlock with
+	// anything else that might one day take both.
+	mat, err = ensureNatsAuth()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	tam, provisioned, err = ensureTenantAccountLocked(mat, tenantID, nameHint)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return mat, tam, provisioned, nil
+}
+
+// ensureTenantAccountLocked is ensureTenantAccount's body once mat (the
+// platform-wide operator/SYS material) is already in hand — split out so
+// loadTenantAccountMaterial can reuse the same tenantAuthMu-guarded section
+// without re-deriving mat.
+func ensureTenantAccountLocked(mat *natsAuthMaterial, tenantID, nameHint string) (tam *tenantAccountMaterial, provisioned bool, err error) {
+	tenantAuthMu.Lock()
+	defer tenantAuthMu.Unlock()
+
+	row, lookupErr := getTenantRow(tenantID)
+	switch {
+	case lookupErr == nil && row.Deleted:
+		return nil, false, fmt.Errorf("pki: tenant %q was deprovisioned; call ProvisionTenant explicitly to re-provision it", tenantID)
+	case lookupErr == nil:
+		nameHint = row.Name
+	default:
+		name := nameHint
+		if name == "" {
+			name = tenantID
+		}
+		if err := upsertTenantRow(tenantRow{ID: tenantID, Name: name, CreatedAt: time.Now().Unix()}); err != nil {
+			return nil, false, fmt.Errorf("pki: recording tenant %q: %w", tenantID, err)
+		}
+		nameHint = name
+		provisioned = true
+	}
+
+	tam, minted, err := ensureTenantAccountMaterial(mat, tenantID, nameHint)
+	if err != nil {
+		return nil, false, err
+	}
+	return tam, provisioned || minted, nil
+}
+
+// ProvisionTenant creates (or, called again, confirms/refreshes) tenantID's
+// dedicated NATS Account and pushes it to the bus resolver — the concrete
+// "one Account created/pushed per tenant at onboarding" workstream E asks
+// for, replacing the old single static config-loaded FarmerOrganization
+// string as the only way a tenant Account ever came into being. Idempotent:
+// safe to call again for an already-provisioned tenant (e.g. a retried
+// internal.tenant.provision delivery — NATS core gives no dedup on its
+// own), and always (re-)pushes so a resolver that missed an earlier push
+// (bus node started after this call, or a prior push failed) catches up.
+func ProvisionTenant(tenantID, name string) error {
+	mat, tam, _, err := ensureTenantAccount(tenantID, name)
+	if err != nil {
+		log.Errorf("failed to provision tenant %q: %v", tenantID, err)
+		return err
+	}
+	if err := pushAccountUpdate(mat, tam.jwt); err != nil {
+		log.Errorf("failed to push tenant %q's Account JWT to the bus resolver: %v", tenantID, err)
+		return err
+	}
+	log.Infof("Provisioned NATS Account for tenant %q and pushed it to the bus resolver.", tenantID)
+	return nil
+}
+
+// DeprovisionTenant reverses ProvisionTenant: it marks tenantID deleted in
+// the pki_tenants registry and pushes an already-expired Account JWT to the
+// resolver so the bus stops trusting any User JWT issued under it,
+// effective immediately (NATS enforces an Account's own Expires the same
+// way it enforces a revoked User). It does not delete on-disk key material
+// or sprout state — only ProvisionTenant re-establishing trust can bring a
+// deprovisioned tenant back, deliberately (see ensureTenantAccount).
+func DeprovisionTenant(tenantID string) error {
+	if !IsValidTenantID(tenantID) {
+		return ErrTenantIDInvalid
+	}
+	// Same lock-ordering reason as ensureTenantAccount: derive mat (takes
+	// authMu internally) before touching tenantAuthMu, never while holding
+	// it.
+	mat, err := ensureNatsAuth()
+	if err != nil {
+		return err
+	}
+	signedJWT, alreadyDeleted, err := deprovisionTenantLocked(mat, tenantID)
+	if err != nil {
+		return err
+	}
+	if alreadyDeleted {
+		return nil
+	}
+	if err := pushAccountUpdate(mat, signedJWT); err != nil {
+		log.Errorf("failed to push tenant %q's expired Account JWT to the bus resolver: %v", tenantID, err)
+		return err
+	}
+	log.Infof("Deprovisioned tenant %q: Account JWT expired and pushed to the bus resolver.", tenantID)
+	return nil
+}
+
+// deprovisionTenantLocked is DeprovisionTenant's tenantAuthMu-guarded body:
+// it marks tenantID deleted and re-signs its Account JWT with Expires set
+// to now, but leaves the actual bus push to the caller (network I/O
+// shouldn't happen while holding this lock).
+func deprovisionTenantLocked(mat *natsAuthMaterial, tenantID string) (signedJWT string, alreadyDeleted bool, err error) {
+	tenantAuthMu.Lock()
+	defer tenantAuthMu.Unlock()
+
+	row, err := getTenantRow(tenantID)
+	if err != nil {
+		return "", false, err
+	}
+	if row.Deleted {
+		return "", true, nil
+	}
+	tam, _, err := ensureTenantAccountMaterial(mat, tenantID, row.Name)
+	if err != nil {
+		return "", false, err
+	}
+	ac, err := jwt.DecodeAccountClaims(tam.jwt)
+	if err != nil {
+		return "", false, fmt.Errorf("pki: decoding tenant %q's Account JWT: %w", tenantID, err)
+	}
+	ac.Expires = time.Now().Unix()
+	signed, err := ac.Encode(mat.operatorSigningKP)
+	if err != nil {
+		return "", false, fmt.Errorf("pki: re-signing tenant %q's Account JWT with Expires set: %w", tenantID, err)
+	}
+	if err := os.WriteFile(tenantAccountJWTPath(tenantID), []byte(signed), 0o600); err != nil {
+		return "", false, err
+	}
+	if err := markTenantDeleted(tenantID); err != nil {
+		return "", false, err
+	}
+	return signed, false, nil
+}
+
+// syncTenantSprouts is syncNatsAuth (jwtusers.go) parameterized by an
+// explicit tenant instead of the package's current-tenant seam — it
+// rebuilds tenantID's Account revocation list and mints/reuses User JWTs
+// for that tenant's own accepted/unaccepted/denied/rejected sprouts (each
+// already tenant-scoped at the nkeyRow level — see store.go), re-signing
+// and persisting the Account JWT only if its revocation list changed.
+func syncTenantSprouts(mat *natsAuthMaterial, tam *tenantAccountMaterial, tenantID string) (bool, error) {
+	ac, err := jwt.DecodeAccountClaims(tam.jwt)
+	if err != nil {
+		return false, err
+	}
+
+	changed := false
+
+	for _, s := range getNKeysByTypeForTenant(tenantID, "accepted").Sprouts {
+		row, errGet := findNKeyRowInTenant(tenantID, s.SproutID)
+		if errGet != nil {
+			log.Errorf("failed to get NKey for sprout %s in tenant %s: %v", s.SproutID, tenantID, errGet)
+			continue
+		}
+		if ensureUserGranted(ac, row.NKey) {
+			changed = true
+		}
+		path := sproutJWTPathForTenant(tenantID, s.SproutID)
+		if _, mintErr := mintOrReuseUserJWT(path, row.NKey, s.SproutID, sproutPermissions(s.SproutID), tam.pub, tam.signingKP); mintErr != nil {
+			log.Errorf("failed to mint User JWT for sprout %s in tenant %s: %v", s.SproutID, tenantID, mintErr)
+		}
+	}
+
+	for _, state := range []string{"unaccepted", "denied", "rejected"} {
+		for _, s := range getNKeysByTypeForTenant(tenantID, state).Sprouts {
+			row, errGet := findNKeyRowInTenant(tenantID, s.SproutID)
+			if errGet != nil {
+				log.Errorf("failed to get NKey for sprout %s in tenant %s: %v", s.SproutID, tenantID, errGet)
+				continue
+			}
+			if ensureUserRevoked(ac, row.NKey) {
+				changed = true
+			}
+		}
+	}
+
+	if changed {
+		signed, encErr := ac.Encode(mat.operatorSigningKP)
+		if encErr != nil {
+			return false, encErr
+		}
+		if writeErr := os.WriteFile(tenantAccountJWTPath(tenantID), []byte(signed), 0o600); writeErr != nil {
+			return false, writeErr
+		}
+		tam.jwt = signed
+	}
+	return changed, nil
+}
+
+// ReloadNKeysForTenant is ReloadNKeys (nats.go) scoped to a single explicit
+// tenant instead of the package's current-tenant seam: it lazily
+// provisions tenantID's Account if this is the first time it's been seen
+// (see ensureTenantAccount) — this is what lets a sprout enrolling under a
+// brand-new tenant get a working Account even before/without the explicit
+// internal.tenant.provision round trip from internal/saasapi having run —
+// then syncs that tenant's sprout state onto its Account JWT and pushes if
+// anything changed. Called by enroll.go for every enrollment, keyed by the
+// enrollment key's own tenant, not config.FarmerOrganization.
+func ReloadNKeysForTenant(tenantID string) error {
+	mat, tam, provisioned, err := ensureTenantAccount(tenantID, "")
+	if err != nil {
+		log.Errorf("failed to bootstrap NATS auth material for tenant %s: %v", tenantID, err)
+		return err
+	}
+	changed, err := syncTenantSprouts(mat, tam, tenantID)
+	if err != nil {
+		log.Errorf("failed to sync tenant %s's Account JWT: %v", tenantID, err)
+		return err
+	}
+	if !provisioned && !changed {
+		return nil
+	}
+	if err := pushAccountUpdate(mat, tam.jwt); err != nil {
+		log.Errorf("failed to push tenant %s's updated Account JWT to the bus resolver: %v", tenantID, err)
+		return err
+	}
+	log.Tracef("Pushed tenant %s's updated Account JWT to the bus resolver.", tenantID)
+	return nil
+}
+
+// tenantIDsProvisionedOnDisk lists every tenant ID with Account material on
+// disk under tenantsRootDir, by directory name. Used by ConfigureNats
+// (nats.go) to seed the bus resolver with every provisioned tenant's
+// Account — deliberately a filesystem scan rather than a query against the
+// pki_tenants PXC table (see store.go's tenantRow): ConfigureNats runs in
+// both cmd/farmer (core, has a PXC connection) and cmd/farmerbus (the DMZ-side
+// bus process, which by design never calls pki.SetDB — see
+// cmd/farmerbus/main.go's RunNATSServer doc comment on why that process
+// has no business holding a database connection). A PXC-backed lookup here
+// would nil-panic on the bus binary; this only touches config.FarmerPKI,
+// which both binaries already read from for the platform-wide operator/SYS
+// material.
+func tenantIDsProvisionedOnDisk() ([]string, error) {
+	entries, err := os.ReadDir(tenantsRootDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		if !e.IsDir() || !IsValidTenantID(e.Name()) {
+			continue
+		}
+		if _, err := os.Stat(tenantAccountJWTPath(e.Name())); err != nil {
+			continue
+		}
+		ids = append(ids, e.Name())
+	}
+	return ids, nil
+}
+
+// GetSproutUserJWTForTenant is GetSproutUserJWT (jwtusers.go) scoped to an
+// explicit tenant — see this file's package doc comment. Falls back to the
+// legacy flat, single-tenant path (jwtusers.go's sproutJWTPath) when
+// tenantID is the package's current-tenant seam (tenantID()) and no
+// tenant-scoped file exists yet: a sprout accepted via the legacy
+// AcceptNKey/ReloadNKeys admin path (every Accept/Deny/Reject/Unaccept
+// call still uses it, not just Enroll) mints its User JWT there, not under
+// this tenant's own directory. Without this fallback, Enroll's idempotency
+// replay (the only caller today) would wrongly report "accepted but no
+// readable JWT" for any sprout that was only ever admin-accepted, never
+// enrolled through Enroll itself.
+func GetSproutUserJWTForTenant(tenantID, sproutID string) (string, error) {
+	if !IsValidTenantID(tenantID) {
+		return "", ErrTenantIDInvalid
+	}
+	if !IsValidSproutID(sproutID) {
+		return "", ErrSproutIDInvalid
+	}
+	b, err := os.ReadFile(sproutJWTPathForTenant(tenantID, sproutID))
+	if err == nil {
+		return string(b), nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	if tenantID == currentTenantID() {
+		if legacy, legacyErr := os.ReadFile(sproutJWTPath(sproutID)); legacyErr == nil {
+			return string(legacy), nil
+		}
+	}
+	return "", ErrSproutIDNotFound
+}
