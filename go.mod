@@ -25,6 +25,7 @@ require (
 	github.com/nats-io/nats-server/v2 v2.14.5
 	github.com/nats-io/nats.go v1.53.1
 	github.com/nats-io/nkeys v0.4.16
+	github.com/opencontainers/selinux v1.15.0
 	github.com/spf13/cobra v1.10.2
 	github.com/taigrr/jety v0.4.3
 	github.com/taigrr/log-mux v1.2.0
@@ -46,6 +47,7 @@ require (
 
 require (
 	charm.land/lipgloss/v2 v2.0.6 // indirect
+	cyphar.com/go-pathrs v0.2.5 // indirect
 	dario.cat/mergo v1.0.2 // indirect
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
