@@ -16,6 +16,7 @@ import (
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winpowercfg"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winpsget"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winservermanager"
+	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winshortcut"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winsmtpserver"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winsnmp"
 )
