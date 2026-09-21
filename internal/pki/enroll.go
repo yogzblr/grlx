@@ -264,7 +264,15 @@ func Enroll(ctx context.Context, joinToken, nkeyPub, hostname, sproutPub string)
 	// Bootstraps the sprout's half of the payload-encryption keypair
 	// (docs/design/grlx-payload-encryption-design.md "Bootstrap"): the
 	// sprout generated this locally and never sends its private half.
-	if err := upsertSproutBoxKeyActive(tenantID(), sproutID, sproutPub); err != nil {
+	//
+	// Scoped to row.TenantID (the enrollment key's real tenant), not the
+	// process-global tenantID() seam workstream J's original call here
+	// used — pki_sprout_box_keys is (tenant_id, sprout_id)-keyed the same
+	// way pki_nkeys/the JWT storage above are, so writing under the wrong
+	// (global) tenant would let two different tenants' same-named sprouts
+	// collide on this table exactly the way the JWT re-keying elsewhere in
+	// this file was written to prevent.
+	if err := upsertSproutBoxKeyActive(row.TenantID, sproutID, sproutPub); err != nil {
 		log.Errorf("enroll: sprout %s accepted but failed to persist sprout_pub: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}

@@ -309,30 +309,43 @@ func TestEnroll_InvalidSproutPub(t *testing.T) {
 	}
 }
 
+// activeBoxKeyForTenant reads sproutID's active pki_sprout_box_keys row
+// directly, scoped to an explicit tenant — unlike the exported
+// ValidSproutBoxKeys (boxkeys.go), which still reads via the package's
+// current-tenant tenantID() seam (internal/natsapi's decrypt helper is its
+// only caller today; rescoping it is out of this workstream's stated
+// scope). Enroll itself now persists sprout_pub under the enrollment key's
+// real tenant (row.TenantID, not tenantID()) — see enroll.go's fix — so
+// tests asserting on that need a tenant-scoped read too, or they'd only
+// coincidentally pass when the enrollment key's tenant happens to match
+// the process-global seam.
+func activeBoxKeyForTenant(t *testing.T, tenantID, sproutID string) string {
+	t.Helper()
+	var row sproutBoxKeyRow
+	if err := db.Where("tenant_id = ? AND sprout_id = ? AND state = ?", tenantID, sproutID, boxKeyStateActive).First(&row).Error; err != nil {
+		t.Fatalf("reading active box key for tenant %s sprout %s: %v", tenantID, sproutID, err)
+	}
+	return row.Pub
+}
+
 func TestEnroll_PersistsSproutBoxKey(t *testing.T) {
 	store, _ := setupEnrollTest(t)
-	store.rows["ek_1"] = &enrollmentKeyRow{KeyHash: hashSecret("s"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
+	store.rows["ek_1"] = &enrollmentKeyRow{TenantID: "t_1", KeyHash: hashSecret("s"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
 
 	sproutPub := testEnrollBoxPub(t)
 	if _, err := Enroll(t.Context(), "ek_1.s", testEnrollNKey(t), "web-01", sproutPub); err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
 
-	active, grace, err := ValidSproutBoxKeys("web-01")
-	if err != nil {
-		t.Fatalf("ValidSproutBoxKeys: %v", err)
-	}
+	active := activeBoxKeyForTenant(t, "t_1", "web-01")
 	if active != sproutPub {
 		t.Errorf("expected active box key %q, got %q", sproutPub, active)
-	}
-	if len(grace) != 0 {
-		t.Errorf("expected no grace-period keys right after enrollment, got %v", grace)
 	}
 }
 
 func TestEnroll_IdempotentReplayReassertsSproutBoxKey(t *testing.T) {
 	store, _ := setupEnrollTest(t)
-	store.rows["ek_1"] = &enrollmentKeyRow{KeyHash: hashSecret("s"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
+	store.rows["ek_1"] = &enrollmentKeyRow{TenantID: "t_1", KeyHash: hashSecret("s"), Expiry: time.Now().Add(time.Hour), MaxUses: 1}
 
 	nkeyPub := testEnrollNKey(t)
 	sproutPub := testEnrollBoxPub(t)
@@ -346,10 +359,7 @@ func TestEnroll_IdempotentReplayReassertsSproutBoxKey(t *testing.T) {
 	if _, err := Enroll(t.Context(), "bogus.token", nkeyPub, "web-01", sproutPub); err != nil {
 		t.Fatalf("replay Enroll: %v", err)
 	}
-	active, _, err := ValidSproutBoxKeys("web-01")
-	if err != nil {
-		t.Fatalf("ValidSproutBoxKeys: %v", err)
-	}
+	active := activeBoxKeyForTenant(t, "t_1", "web-01")
 	if active != sproutPub {
 		t.Errorf("expected active box key unchanged at %q, got %q", sproutPub, active)
 	}

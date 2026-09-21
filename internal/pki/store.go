@@ -68,8 +68,9 @@ func (tenantRow) TableName() string { return "pki_tenants" }
 
 // Models returns the GORM models this package owns, for callers assembling
 // a single AutoMigrate call across the whole farmer schema (see
-// cmd/farmer/main.go and internal/pxc).
-func Models() []any { return []any{&nkeyRow{}, &tenantRow{}} }
+// cmd/farmer/main.go and internal/pxc). sproutBoxKeyRow is workstream J's
+// (boxkeys.go); tenantRow is this workstream's.
+func Models() []any { return []any{&nkeyRow{}, &tenantRow{}, &sproutBoxKeyRow{}} }
 
 // db is the shared farmer-schema GORM handle. Nil until SetDB is called.
 var db *gorm.DB
