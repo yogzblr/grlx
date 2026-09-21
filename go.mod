@@ -15,6 +15,7 @@ require (
 	github.com/djherbis/atime v1.1.0
 	github.com/fatih/color v1.19.0
 	github.com/glebarez/sqlite v1.11.0
+	github.com/go-ole/go-ole v1.3.0
 	github.com/gogrlx/snack v0.4.4
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
