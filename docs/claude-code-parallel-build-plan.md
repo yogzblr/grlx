@@ -267,6 +267,18 @@ trust chain."
 
 ## 3. Wave 2 — hold until A + H are merged
 
+Before dispatching Wave 2 — one verification task, not a build task, that
+H's merge left genuinely open: the sandboxed environment H was built in had
+no network access to run a live Envoy instance, so `jwt_authn`'s
+Ed25519/EdDSA support was only checked against `jwx`'s own library-level
+round-trip, never against real Envoy. Confirm this somewhere with normal
+network access before relying on `deploy/envoy/` in any real environment —
+pin an Envoy image version confirmed to support EdDSA in `jwt_authn`, and
+run one real enrollment against it (the
+`deploy/envoy/testing/docker-compose.keycloak.yml` setup already checked in
+gives a ready-made way to do this). This isn't gated on anything and
+doesn't need a `claude --cloud` session — it's a local verification step.
+
 **Workstream E — multi-tenancy:**
 ```
 claude --cloud "Implement workstream E from docs/design/grlx-fork-roadmap.md,
@@ -291,27 +303,93 @@ that internal/natsapi/recipes.go's old NATS-based recipe delivery is
 removed in favor of it."
 ```
 
-**Workstream J — payload encryption + rotation:**
+**Workstream J — payload encryption + rotation** (H is merged; note the gap
+its enrollment work left open — see below):
 ```
 claude --cloud "Implement workstream J from docs/design/grlx-fork-roadmap.md
 and docs/design/grlx-payload-encryption-design.md: NaCl box (X25519)
 encryption of NATS payloads. One tenant keypair (farmer-side,
-OpenBao-custodied private key, per workstream F), one sprout keypair
-(generated locally at enrollment, private key never transmitted — not
-even encrypted). Bootstrap both public keys through workstream H's
-enrollment response. Build a shared encrypt/decrypt request/response
-helper in internal/natsapi so this is transparent to individual handlers
-rather than opt-in per handler. Key rotation is sprout-initiated only:
-sprout generates a new keypair locally, sends only the new public key,
-farmer may trigger rotation but never generates or holds a sprout's
-private key. Grace-period overlap reusing the existing PKI accept/deny/
-revoke lifecycle. FLAG FOR SECURITY REVIEW — this is cryptographic code
+OpenBao-custodied private key via internal/certs's existing hand-rolled
+OpenBao client pattern — do not add the OpenBao/Vault SDK, it's MPL-2.0
+and conflicts with this repo's Apache/MIT constraint, see
+internal/certs/tls.go and internal/gatewayjwt/obtransit.go for the
+established pattern), one sprout keypair (generated locally at
+enrollment, private key never transmitted — not even encrypted).
+
+Known gap to close first: internal/pki/enroll.go's Enroll() and
+internal/api/handlers/enroll.go's enrollRequest do NOT yet accept the
+sprout's X25519 public key — only nkey_pub. Add a sprout_pub field to
+the enrollment request, thread it through Enroll(), and persist it
+(sprout_pub -> PXC, per the design doc's 'Storage' section) before
+building anything else. internal/pki/tenantbox.go is today's interim,
+locally-disk-held placeholder for the tenant keypair specifically so the
+enrollment response has *a* real tenant_x25519_pub — replace its local-
+disk custody with real OpenBao custody as part of this workstream, per
+its own doc comment.
+
+Build a shared encrypt/decrypt request/response helper in
+internal/natsapi so this is transparent to individual handlers rather
+than opt-in per handler. Key rotation is sprout-initiated only: sprout
+generates a new keypair locally, sends only the new public key, farmer
+may trigger rotation but never generates or holds a sprout's private
+key. Grace-period overlap reusing the existing PKI accept/deny/revoke
+lifecycle. FLAG FOR SECURITY REVIEW — this is cryptographic code
 defending against a compromised DMZ bus."
 ```
 
 ---
 
 ## 4. Ongoing / fully parallel, no gating — launch whenever you have capacity
+
+```
+claude --cloud "Fix a stale correctness assumption in internal/facts/listener.go:
+RegisterFarmerListener still uses plain nc.Subscribe (fan-out), justified by
+a comment claiming props.SetProp writes into an in-process, in-memory cache.
+That's no longer true — internal/props/store.go's own header comment
+confirms the in-memory propCache was removed when props moved to PXC-backed
+storage (workstream A): 'now reads and writes straight through to the
+shared farmer schema in PXC on every call, with no in-memory cache layered
+on top.' Confirm this yourself by reading internal/props/props.go's
+setProp/getStringProp — every call goes straight to db.Where(...), no map,
+no mutex anywhere in the package.
+
+With shared PXC storage already in place, fan-out here means every farmer
+replica independently processes and UPSERTs every fact update into the
+same PXC row — pure duplicate work, and worse, N replicas racing to write
+the same row on every single fact update, which is exactly the kind of
+write race workstream A's PXC migration was meant to eliminate at the
+storage layer, not reintroduce at the listener layer.
+
+Change RegisterFarmerListener to nc.QueueSubscribe(subject,
+natsCoreQueueGroup, ...) under the same 'grlx-core' queue group
+internal/natsapi/router.go already uses for its route handlers, matching
+that package's existing queue-grouping pattern. Update the function's
+doc comment to explain the correction (not just delete the old reasoning —
+a future reader should understand why this changed, the same way
+internal/props/store.go's own header documents its own transition).
+
+internal/jobs/listener.go's plain Subscribe is correct and NOT in scope
+here — verify its own justification still holds (job data genuinely still
+writes to local disk via config.JobLogDir, confirmed by reading
+internal/jobs/listener.go directly) rather than assuming it does, but do
+not change that file.
+
+Update internal/facts/listener_test.go's
+TestRegisterFarmerListener_FanOutNotQueueGrouped, which currently asserts
+the old (now-wrong) fan-out behavior and will fail once this is fixed.
+Replace it with a test verifying queue-group load balancing, mirroring
+internal/natsapi/router_test.go's TestSubscribe_UsesQueueGroup pattern:
+simulate a second farmer replica via a second QueueSubscribe on the same
+subject and 'grlx-core' group, publish a batch of facts events, and assert
+the simulated replica receives some but not all of them (not zero, not
+every one — if it receives all of them, the fix didn't take; if the real
+listener were queue-grouped incorrectly against a different group name,
+the simulated replica would receive none).
+
+Run go test ./internal/facts/... and go vet ./... before considering this
+done. Small, isolated, mechanical change — no dependency on Wave 2's
+E/I/J work, safe to land independently and immediately."
+```
 
 ```
 claude --cloud "Implement G.2 (Windows user/group provider) from
