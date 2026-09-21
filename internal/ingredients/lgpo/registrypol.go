@@ -318,10 +318,6 @@ func (f *File) MarkAllDeleted(key string) {
 	f.Entries = append(f.Entries, deleteAllValuesEntry(key))
 }
 
-func strings_HasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}
-
 // String implements fmt.Stringer for debugging/logging.
 func (e Entry) String() string {
 	return fmt.Sprintf("%s\\%s (type=%d, %d bytes)", e.Key, e.ValueName, e.Type, len(e.Data))
