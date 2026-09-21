@@ -50,7 +50,7 @@ const (
 // Models returns the GORM models this package owns, for callers assembling
 // a single AutoMigrate call across the whole farmer schema (see
 // cmd/farmer/main.go and internal/pxc).
-func Models() []any { return []any{&nkeyRow{}} }
+func Models() []any { return []any{&nkeyRow{}, &sproutBoxKeyRow{}} }
 
 // db is the shared farmer-schema GORM handle. Nil until SetDB is called.
 var db *gorm.DB

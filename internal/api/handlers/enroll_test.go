@@ -3,15 +3,72 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"golang.org/x/crypto/nacl/box"
+
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/gatewayjwt"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
+
+// withFakeTenantBoxOpenBao points pki's tenant X25519 keypair custody
+// (internal/pki/tenantbox.go) at a mock OpenBao KV v2 server for the
+// duration of the test, pre-seeded with a freshly-generated keypair so a
+// GET always succeeds — these handler-level tests don't need to exercise
+// tenantbox.go's bootstrap-race handling, only that Enroll can reach a
+// tenant_x25519_pub at all. See internal/pki/tenantbox_test.go's
+// mockKVv2Server for the same shape, duplicated here since that type is
+// unexported in a different package.
+func withFakeTenantBoxOpenBao(t *testing.T) {
+	t.Helper()
+	pub, priv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating mock tenant keypair: %v", err)
+	}
+	const token = "test-token"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/grlx/tenant-x25519", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Vault-Token") != token {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"data": map[string]string{
+					"pub":  base64.StdEncoding.EncodeToString(pub[:]),
+					"priv": base64.StdEncoding.EncodeToString(priv[:]),
+				},
+			},
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	t.Setenv(pki.EnvTenantBoxOpenBaoAddr, ts.URL)
+	t.Setenv(pki.EnvTenantBoxOpenBaoKVMount, "secret")
+	t.Setenv(pki.EnvTenantBoxOpenBaoKVPath, "grlx/tenant-x25519")
+	t.Setenv(pki.EnvTenantBoxOpenBaoAuthMethod, pki.TenantBoxAuthMethodToken)
+	t.Setenv(pki.EnvTenantBoxOpenBaoToken, token)
+}
+
+// generateTestBoxPub returns a syntactically-valid, standard-base64-encoded
+// 32-byte X25519 public key for enrollRequest.SproutPub — its actual value
+// is never used cryptographically by these handler-level tests.
+func generateTestBoxPub(t *testing.T) string {
+	t.Helper()
+	var pub [32]byte
+	if _, err := rand.Read(pub[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(pub[:])
+}
 
 // fakeGatewayMinter satisfies pki's unexported gatewayJWTMinter interface
 // structurally (Go allows this: the interface type name is unexported,
@@ -55,11 +112,23 @@ func TestEnroll_MissingFields(t *testing.T) {
 	assertEnrollFailed(t, w)
 }
 
+func TestEnroll_MissingSproutPub(t *testing.T) {
+	setupPKIDirs(t)
+
+	nkey := generateTestUserNKey(t)
+	body, _ := json.Marshal(enrollRequest{JoinToken: "ek_1.secret", NKeyPub: nkey, Hostname: "web-01"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/enroll", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	Enroll(w, req)
+
+	assertEnrollFailed(t, w)
+}
+
 func TestEnroll_UnknownToken(t *testing.T) {
 	setupPKIDirs(t)
 
 	nkey := generateTestUserNKey(t)
-	body, _ := json.Marshal(enrollRequest{JoinToken: "ek_nope.secret", NKeyPub: nkey, Hostname: "web-01"})
+	body, _ := json.Marshal(enrollRequest{JoinToken: "ek_nope.secret", NKeyPub: nkey, Hostname: "web-01", SproutPub: generateTestBoxPub(t)})
 	req := httptest.NewRequest(http.MethodPost, "/v1/enroll", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	Enroll(w, req)
@@ -78,6 +147,7 @@ func TestEnroll_IdempotentReplaySucceeds(t *testing.T) {
 	setupPKIDirs(t)
 	config.FarmerWSPort = "5407"
 	withFakeGatewaySigner(t)
+	withFakeTenantBoxOpenBao(t)
 
 	nkey := generateTestUserNKey(t)
 	if err := pki.UnacceptNKey("web-01", nkey); err != nil {
@@ -87,7 +157,7 @@ func TestEnroll_IdempotentReplaySucceeds(t *testing.T) {
 		t.Fatalf("AcceptNKey: %v", err)
 	}
 
-	body, _ := json.Marshal(enrollRequest{JoinToken: "irrelevant.token", NKeyPub: nkey, Hostname: "web-01"})
+	body, _ := json.Marshal(enrollRequest{JoinToken: "irrelevant.token", NKeyPub: nkey, Hostname: "web-01", SproutPub: generateTestBoxPub(t)})
 	req := httptest.NewRequest(http.MethodPost, "/v1/enroll", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	Enroll(w, req)
