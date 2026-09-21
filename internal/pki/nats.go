@@ -73,6 +73,37 @@ func ConfigureNats() nats_server.Options {
 	}
 	NatsConfig.TLSConfig = &tlsConfig
 
+	// Websocket listener: what Envoy's jwt_authn-gated wss:// route
+	// (docs/design/grlx-envoy-enrollment-design.md) terminates onto.
+	// Reuses the same server certificate as the plain TCP listener above.
+	// Auth here is still the ordinary decentralized JWT/NKey CONNECT-time
+	// check (AccountResolver, set below) — Envoy's JWT validation happens
+	// earlier, in front of this listener, not instead of it; see the
+	// design doc's "two gates, checking different things, not redundant
+	// with each other."
+	//
+	// FarmerWSPort defaults to "5407" via config.LoadConfig, but is left
+	// unset by several existing tests that build config values directly
+	// rather than loading them — treat that as "no websocket listener"
+	// rather than failing the whole server start.
+	if config.FarmerWSPort != "" {
+		wsPort, err := strconv.Atoi(config.FarmerWSPort)
+		if err != nil {
+			log.Panic(err)
+		}
+		NatsConfig.Websocket = nats_server.WebsocketOpts{
+			Host: FarmerInterface,
+			Port: wsPort,
+			TLSConfig: &tls.Config{
+				ServerName:   FarmerInterface,
+				RootCAs:      certPool,
+				Certificates: []tls.Certificate{cert},
+				MinVersion:   tls.VersionTLS12,
+			},
+			AuthTimeout: 10,
+		}
+	}
+
 	mat, err := ensureNatsAuth()
 	if err != nil {
 		log.Panicf("nats: failed to bootstrap decentralized JWT auth material: %v", err)

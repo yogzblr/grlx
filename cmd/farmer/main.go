@@ -33,6 +33,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 	"github.com/gogrlx/grlx/v2/internal/facts"
+	"github.com/gogrlx/grlx/v2/internal/gatewayjwt"
 	"github.com/gogrlx/grlx/v2/internal/heartbeat"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/cmd"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/test"
@@ -93,6 +94,7 @@ func main() {
 	defer log.Flush()
 	initStorage()
 	initRecipeStore()
+	initGatewaySigner()
 	initHeartbeatClient()
 	props.LoadStaticProps(config.StaticProps())
 	loadCohortRegistry()
@@ -202,6 +204,26 @@ func initRecipeStore() {
 	cook.SetStore(store)
 	natsapi.SetRecipeStore(store)
 	handlers.SetRecipeStore(store)
+}
+
+// initGatewaySigner wires up the OpenBao Transit-backed signer for
+// gateway JWTs (internal/gatewayjwt) — the standard alg:EdDSA companion
+// token Envoy's jwt_authn validates, alongside the native NATS User JWT
+// workstream B already mints. Deliberately not fatal if unconfigured
+// (see EnvOpenBaoAddr etc. in internal/gatewayjwt/obtransit.go): existing
+// deployments/dev setups without GRLX_GATEWAY_OPENBAO_* set should still
+// start farmer normally — POST /v1/enroll fails closed
+// (pki.ErrEnrollmentFailed) rather than farmer refusing to boot, until an
+// operator configures OpenBao Transit for this key.
+func initGatewaySigner() {
+	signer, err := gatewayjwt.NewGatewaySigner(config.GatewayTransitKeyName)
+	if err != nil {
+		log.Errorf("gateway JWT signer not configured (POST /v1/enroll will fail until it is): %v", err)
+		return
+	}
+	pki.SetGatewaySigner(signer)
+	handlers.SetGatewaySigner(signer)
+	log.Info("Gateway JWT signer configured")
 }
 
 // initHeartbeatClient connects the Valkey client connection-state reads
