@@ -269,7 +269,7 @@ func (c *obTransitClient) k8sLoginLocked(ctx context.Context) (string, error) {
 
 type transitSignResponse struct {
 	Data struct {
-		Signature string `json:"signature"`
+		Signature  string `json:"signature"`
 		KeyVersion int    `json:"key_version"`
 	} `json:"data"`
 	Errors []string `json:"errors"`
@@ -341,8 +341,8 @@ type transitReadKeyResponse struct {
 	Data struct {
 		Type                 string                           `json:"type"`
 		Keys                 map[string]transitKeyVersionInfo `json:"keys"`
-		MinEncryptionVersion int                               `json:"min_encryption_version"`
-		LatestVersion        int                               `json:"latest_version"`
+		MinEncryptionVersion int                              `json:"min_encryption_version"`
+		LatestVersion        int                              `json:"latest_version"`
 	} `json:"data"`
 	Errors []string `json:"errors"`
 }
