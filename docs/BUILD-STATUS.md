@@ -57,13 +57,15 @@ JWT signing algorithm choice itself.
 Dispatched now that A and H are confirmed merged to `master`. J's brief was
 updated post-H-merge to close a real gap H's enrollment endpoint left open
 (no `sprout_pub` field yet) — verified against `internal/pki/enroll.go` and
-`internal/api/handlers/enroll.go` before dispatching, confirmed accurate.
+`internal/api/handlers/enroll.go` before dispatching, confirmed accurate. All
+three are now merged; J landed first, then E needed a follow-up commit to
+resolve merge fallout against J's box-key tenant scoping.
 
 | Workstream | Description | Cloud session ID | Status | Needs security review |
 |---|---|---|---|---|
-| E | Multi-tenancy: NATS Account-per-tenant (subjects unchanged), re-key `internal/pki/pki.go` by `(tenant_id, sprout_id)`, tenant field on `internal/rbac` cohort/role maps, dynamic `FarmerOrganization` | session_01SwBEMgMkSFan2X3fUC3pkz | dispatched | y — tenant isolation correctness |
-| I | Finish recipe storage migration: confirm A's recipe HTTP endpoint is served behind H's Envoy JWT-gated route, remove `internal/natsapi/recipes.go`'s old NATS-based delivery | session_01QKGaTno21cXoZGp7hrbjbM | dispatched | n |
-| J | Payload encryption + rotation: NaCl `box` (X25519), tenant keypair via OpenBao (replacing `internal/pki/tenantbox.go`'s interim local-disk custody), sprout keypair generated at enrollment. Must first add a `sprout_pub` field to the enrollment request/`Enroll()` (confirmed missing) | session_01AivbiHCYGgL1ywzyTViaK2 | dispatched | y — cryptographic code defending against a compromised DMZ bus |
+| E | Multi-tenancy: NATS Account-per-tenant (subjects unchanged), re-key `internal/pki/pki.go` by `(tenant_id, sprout_id)`, tenant field on `internal/rbac` cohort/role maps, dynamic `FarmerOrganization` | session_01SwBEMgMkSFan2X3fUC3pkz | merged — PR #28 (`c13d290`, `aeec2b8`) | y — tenant isolation correctness |
+| I | Finish recipe storage migration: confirm A's recipe HTTP endpoint is served behind H's Envoy JWT-gated route, remove `internal/natsapi/recipes.go`'s old NATS-based delivery | session_01QKGaTno21cXoZGp7hrbjbM | merged — PR #25 (`e59eb65`) | n |
+| J | Payload encryption + rotation: NaCl `box` (X25519), tenant keypair via OpenBao (replacing `internal/pki/tenantbox.go`'s interim local-disk custody), sprout keypair generated at enrollment. Must first add a `sprout_pub` field to the enrollment request/`Enroll()` (confirmed missing) | session_01AivbiHCYGgL1ywzyTViaK2 | merged — PR #27 (`f5a947d`) | y — cryptographic code defending against a compromised DMZ bus |
 
 ## Ongoing / fully parallel (no gating)
 
@@ -81,6 +83,13 @@ updated post-H-merge to close a real gap H's enrollment endpoint left open
 - The six pre-existing Wave 0 workstreams were confirmed directly against the
   repo (code present, tests present, commits/PRs identified in `git log`)
   rather than re-run, per instruction to skip work already done.
-- All Wave 0 and Wave 1 workstreams are now merged. Wave 2 (E, I, J) is
-  dispatched and in progress; the Envoy/EdDSA verification gap above is
-  still open and needs a human or a docker-capable environment.
+- All of Wave 0, Wave 1, and Wave 2 are now merged. Everything in
+  `docs/claude-code-parallel-build-plan.md` sections 1–3 is done. The
+  Envoy/EdDSA verification gap noted above under Wave 1 is still open and
+  needs a human or a docker-capable environment — it was never gated on
+  Wave 2 and remains the one unresolved item from the plan as dispatched.
+  Section 4's "ongoing / fully parallel" Windows/Linux ingredient
+  workstreams (G.2, G.4, G.6, G.7, H.1, H.2, H.3) have not been dispatched
+  by this coordinator — they were never part of the wave sequence this
+  session was asked to drive, so they're listed here for visibility only,
+  not dispatched.
