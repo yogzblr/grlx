@@ -63,20 +63,18 @@ func TestMain(m *testing.M) {
 	pki.SetDB(pkiDB)
 
 	// Recipes now read through internal/objectstore instead of local disk
-	// (see internal/cook/store.go) — wire a fake S3 backend into both this
-	// package's own recipe handlers and internal/cook (handleCook's
-	// SendCookEvent call chain reads through cook's own store, a separate
-	// injection point). Individual tests Put() whatever recipe content
-	// they need into recipeStore directly; a recipe name that was never
-	// seeded simply resolves as not-found, same as it did against an
-	// empty local-disk directory before this migration.
+	// (see internal/cook/store.go) — wire a fake S3 backend into
+	// internal/cook (handleCook's SendCookEvent call chain reads through
+	// cook's own store). The old natsapi recipe list/get handlers that
+	// also used to share this store are gone (see
+	// docs/design/grlx-fork-roadmap.md workstream I) — that browse
+	// surface now lives in internal/api/handlers/recipes.go instead.
 	store, closeStore, err := objectstoretest.NewStoreForBinary()
 	if err != nil {
 		fmt.Println("opening recipe test store:", err)
 		os.Exit(1)
 	}
 	cook.SetStore(store)
-	SetRecipeStore(store)
 
 	code := m.Run()
 	closeStore()

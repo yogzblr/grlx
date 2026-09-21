@@ -1,7 +1,6 @@
 package natsapi
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/gogrlx/grlx/v2/internal/audit"
 	intauth "github.com/gogrlx/grlx/v2/internal/auth"
-	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 	"github.com/gogrlx/grlx/v2/internal/jobs"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
@@ -558,123 +556,6 @@ func TestHandleJobsCancelInvalidJSON(t *testing.T) {
 	_, err := handleJobsCancel(json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
-	}
-}
-
-// --- handleRecipesGet edge cases ---
-
-func TestHandleRecipesGetEmptyName(t *testing.T) {
-	tmpDir := t.TempDir()
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	params, _ := json.Marshal(map[string]string{"name": ""})
-	_, err := handleRecipesGet(params)
-	if err == nil {
-		t.Fatal("expected error for empty recipe name")
-	}
-}
-
-func TestHandleRecipesGetUsingIDField(t *testing.T) {
-	tmpDir := t.TempDir()
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	content := "steps:\n  test:\n    cmd.run:\n      - name: echo hi\n"
-	recipePath := filepath.Join(tmpDir, "simple.grlx")
-	if err := recipeStore.Put(context.Background(), recipePath, []byte(content)); err != nil {
-		t.Fatal(err)
-	}
-
-	// Use "id" field instead of "name".
-	params, _ := json.Marshal(map[string]string{"id": "simple"})
-	result, err := handleRecipesGet(params)
-	if err != nil {
-		t.Fatalf("handleRecipesGet with id field: %v", err)
-	}
-
-	rc, ok := result.(RecipeContent)
-	if !ok {
-		t.Fatalf("result type = %T, want RecipeContent", result)
-	}
-	if rc.Name != "simple" {
-		t.Errorf("name = %q, want %q", rc.Name, "simple")
-	}
-}
-
-func TestHandleRecipesGetInvalidJSON(t *testing.T) {
-	tmpDir := t.TempDir()
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	_, err := handleRecipesGet(json.RawMessage(`{invalid`))
-	if err == nil {
-		t.Fatal("expected error for invalid JSON")
-	}
-}
-
-func TestHandleRecipesGetDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	// Create a directory where the recipe file would be.
-	dirPath := filepath.Join(tmpDir, "myrecipe.grlx")
-	if err := os.MkdirAll(dirPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	params, _ := json.Marshal(map[string]string{"name": "myrecipe"})
-	_, err := handleRecipesGet(params)
-	if err == nil {
-		t.Fatal("expected error when recipe path is a directory")
-	}
-}
-
-func TestHandleRecipesGetNoRecipeDir(t *testing.T) {
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = ""
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	params, _ := json.Marshal(map[string]string{"name": "test"})
-	_, err := handleRecipesGet(params)
-	if err == nil {
-		t.Fatal("expected error when recipe directory is not configured")
-	}
-}
-
-// TestHandleRecipesListNoMatchingKeys used to assert an error when
-// config.RecipeDir pointed at a local file instead of a directory.
-// Recipes now list against an object-storage key prefix (see
-// internal/objectstore), which has no directory-vs-file distinction — a
-// prefix matching no keys is just an empty list, not an error.
-func TestHandleRecipesListNoMatchingKeys(t *testing.T) {
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = "/no/keys/have/this/prefix"
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	result, err := handleRecipesList(nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	data := result.(map[string][]RecipeInfo)
-	if len(data["recipes"]) != 0 {
-		t.Fatalf("expected 0 recipes, got %d", len(data["recipes"]))
-	}
-}
-
-func TestHandleRecipesListNoDir(t *testing.T) {
-	origRecipeDir := config.RecipeDir
-	config.RecipeDir = ""
-	defer func() { config.RecipeDir = origRecipeDir }()
-
-	_, err := handleRecipesList(nil)
-	if err == nil {
-		t.Fatal("expected error when recipe directory is not configured")
 	}
 }
 

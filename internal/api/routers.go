@@ -16,6 +16,12 @@ import (
 //   - File serving: sprouts download recipe files via the farmer:// scheme,
 //     read from object storage (see handlers.SetRecipeStore) rather than
 //     local disk — docs/design/grlx-master-plan.md Phase 1.
+//   - Recipe browsing (GET /v1/recipes, GET /v1/recipes/{name...}): the
+//     dot-notation list/get surface used by the grlx CLI and web UI,
+//     behind workstream H's Envoy JWT gate (deploy/envoy/envoy.yaml's
+//     /v1/recipes route) — replaces the old NATS-based
+//     internal/natsapi/recipes.go per
+//     docs/design/grlx-fork-roadmap.md workstream I.
 //   - Health checks: an unauthenticated /health endpoint for monitoring
 //     and automated tooling.
 func NewRouter(certificate string) *http.ServeMux {
@@ -43,6 +49,11 @@ func NewRouter(certificate string) *http.ServeMux {
 
 	// File server: serves recipe files over HTTPS (farmer:// scheme).
 	mux.Handle("GET /files/", Logger(Auth(http.HandlerFunc(handlers.GetFile), "FileServer"), "FileServer"))
+
+	// Recipe browsing: dot-notation list/get, used by the grlx CLI and
+	// web UI (docs/design/grlx-fork-roadmap.md workstream I).
+	mux.Handle("GET /v1/recipes", Logger(Auth(http.HandlerFunc(handlers.ListRecipes), "ListRecipes"), "ListRecipes"))
+	mux.Handle("GET /v1/recipes/{name...}", Logger(Auth(http.HandlerFunc(handlers.GetRecipe), "GetRecipe"), "GetRecipe"))
 
 	return mux
 }

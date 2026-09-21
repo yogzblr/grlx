@@ -89,10 +89,6 @@ var routes = map[string]handler{
 	// Shell (interactive SSH-like sessions)
 	MethodShellStart: handleShellStart,
 
-	// Recipes
-	MethodRecipesList: handleRecipesList,
-	MethodRecipesGet:  handleRecipesGet,
-
 	// Audit
 	MethodAuditDates: handleAuditList,
 	MethodAuditQuery: handleAuditQuery,
