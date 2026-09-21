@@ -33,6 +33,11 @@ func NewRouter(certificate string) *http.ServeMux {
 	// itself, validated inside handlers.Enroll/pki.Enroll.
 	mux.Handle("POST /v1/enroll", Logger(http.HandlerFunc(handlers.Enroll), "Enroll"))
 
+	// Gateway JWT JWKS (design doc §2.4 per the "Gateway JWT Companion
+	// Token" brief) — public keys only, no auth required. What Envoy's
+	// jwt_authn remote_jwks (deploy/envoy/envoy.yaml) fetches.
+	mux.Handle("GET /v1/.well-known/jwks.json", Logger(http.HandlerFunc(handlers.JWKS), "JWKS"))
+
 	// Health check (unauthenticated).
 	mux.Handle("GET /health", Logger(http.HandlerFunc(handlers.GetHealth), "GetHealth"))
 

@@ -81,6 +81,18 @@ var (
 	SproutPKI             string
 	SproutRootCA          string
 
+	// GatewayJWTTTL bounds how long a minted gateway JWT
+	// (internal/gatewayjwt) stays valid. Short by design: Envoy's
+	// jwt_authn has no live revocation check of its own, so this expiry
+	// is what makes a revoked sprout's gateway JWT age out promptly —
+	// ongoing per-connection authorization is nats-server's Account/User
+	// JWT model's job, not Envoy's.
+	GatewayJWTTTL time.Duration
+
+	// GatewayTransitKeyName is the OpenBao Transit key name
+	// internal/gatewayjwt signs gateway JWTs with.
+	GatewayTransitKeyName string
+
 	// SproutBusURLs are the externally-reachable wss:// addresses (fronted
 	// by Envoy's jwt_authn-gated route — see
 	// docs/design/grlx-envoy-enrollment-design.md) an enrolling sprout is
@@ -219,6 +231,8 @@ func LoadConfig(binary string) {
 			jety.SetDefault("rootca", filepath.Join(systemConfigRoot, "pki/farmer/tls-rootca.pem"))
 			jety.SetDefault("rootcapriv", filepath.Join(systemConfigRoot, "pki/farmer/tls-rootca-key.pem"))
 			jety.SetDefault("farmerorganization", "grlx farmer")
+			jety.SetDefault("gatewayjwtttl", 24*time.Hour)
+			jety.SetDefault("gatewaytransitkeyname", "grlx-gateway-jwt")
 			jety.SetDefault("s3usessl", true)
 			JobLogDir = jety.GetString("joblogdir")
 			JobLogTTL = jety.GetDuration("joblogttl")
@@ -384,6 +398,8 @@ func LoadConfig(binary string) {
 	NKeySproutPrivFile = jety.GetString("nkeysproutprivfile")
 	NKeySproutPubFile = jety.GetString("nkeysproutpubfile")
 	FarmerOrganization = jety.GetString("farmerorganization")
+	GatewayJWTTTL = jety.GetDuration("gatewayjwtttl")
+	GatewayTransitKeyName = jety.GetString("gatewaytransitkeyname")
 	RootCA = jety.GetString("rootca")
 	RootCAPriv = jety.GetString("rootcapriv")
 	SproutID = jety.GetString("sproutid")

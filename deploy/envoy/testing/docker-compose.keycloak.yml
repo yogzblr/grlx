@@ -1,0 +1,28 @@
+# Keycloak-as-validator harness for the gateway JWT / JWKS endpoint
+# (internal/gatewayjwt). See ../README.md's "Independent JOSE validation"
+# section for why this exists and what it does and doesn't prove.
+#
+# NOT run as part of this repo's CI or by any agent in a network-
+# sandboxed environment — it needs to pull quay.io/keycloak/keycloak,
+# which a restrictive egress policy (like the one this file was written
+# under) blocks. Run it wherever normal container-registry access is
+# available: a developer machine, or a CI runner without that
+# restriction.
+version: "3.8"
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak-realm.json:/opt/keycloak/data/import/grlx-gateway-jwt-realm.json:ro
+    # This harness validates the JWKS document a *running farmer* serves
+    # at GRLX_GATEWAY_.../v1/.well-known/jwks.json. Point
+    # keycloak-realm.json's identityProviders[0].config.jwksUrl at that
+    # farmer's real, network-reachable address before starting this
+    # (farmer itself isn't part of this compose file — it needs OpenBao
+    # Transit configured too, per ../README.md).

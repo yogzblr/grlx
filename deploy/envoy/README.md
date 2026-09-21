@@ -24,27 +24,35 @@ Treat this as a reviewed starting point, not a drop-in production config.
   `5407` (nats-server websocket) match this repo's config defaults
   (`config.FarmerAPIPort`, `config.FarmerWSPort`) — keep them in sync if
   those are overridden at deploy time.
-- **JWKS endpoint** — the biggest open gap, called out in `envoy.yaml`'s
-  header comment: sprout JWTs are NATS User JWTs
-  (`github.com/nats-io/jwt/v2`), signed with the tenant Account's Ed25519
-  NKey signing key, not published as a standard JWKS document anywhere in
-  this repo today. `remote_jwks` in the config points at a
-  `/.well-known/jwks.json` path on farmer's API server that doesn't exist
-  yet. This needs one of:
-  - a new handler on farmer's existing HTTPS API
-    (`internal/api`/`cmd/farmer/main.go`) that derives an OKP/Ed25519 JWK
-    from `internal/pki/jwtauth.go`'s tenant Account signing key and keeps
-    it in sync across signing-key rotation, or
-  - a `local_jwks` fed by the same key material at deploy time, refreshed
-    out-of-band.
-
-  Until one of those lands, the two `jwt_authn`-gated routes in this
-  config will reject every connection — that's a safe failure mode (fails
-  closed), but it means this config isn't yet end-to-end functional on
-  its own.
+- **OpenBao Transit key**: `remote_jwks` now points at a real, built
+  endpoint (`internal/api/handlers/jwks.go`, `GET
+  /v1/.well-known/jwks.json`), but that endpoint serves whatever
+  `internal/gatewayjwt` signs with — which requires an OpenBao Transit
+  Ed25519 key to exist before farmer can mint or serve anything real. See
+  `internal/gatewayjwt/obtransit.go`'s `GRLX_GATEWAY_OPENBAO_*` env vars
+  and the ops prerequisite in the "Gateway JWT Companion Token"
+  implementation brief this package was built from:
+  ```
+  vault secrets enable transit   # or: bao secrets enable transit
+  vault write -f transit/keys/grlx-gateway-jwt type=ed25519
+  vault write transit/keys/grlx-gateway-jwt/config auto_rotate_period=2160h
+  ```
+  Until that key exists and farmer's `GRLX_GATEWAY_OPENBAO_*` env vars
+  are set, farmer starts fine (see `cmd/farmer/main.go`'s
+  `initGatewaySigner` — deliberately non-fatal) but `POST /v1/enroll`
+  fails closed with the generic `enrollment_failed` response, and the two
+  `jwt_authn`-gated routes below reject every connection. Both are safe
+  failure modes, not a functional end-to-end config on their own.
 - **Envoy version**: confirm the deployed Envoy build supports `EdDSA` in
-  `jwt_authn` (added in a relatively recent release) — NATS User JWTs are
-  Ed25519-signed, not RS256/ES256.
+  `jwt_authn` (added in a relatively recent release) — gateway JWTs are
+  Ed25519-signed, not RS256/ES256. `internal/gatewayjwt`'s own tests
+  (`mint_test.go`) validate the minted token and served JWKS against
+  `jwx` (an independent, standards-compliant Go JOSE library) as the
+  closest check achievable without a live Envoy/Keycloak instance in this
+  environment's sandboxed network — see the PR description for why an
+  actual Keycloak/Envoy run wasn't possible here, and re-run that
+  validation somewhere with normal network access before relying on this
+  config in production.
 - **Recipe route target**: `/v1/recipes` currently proxies to farmer's own
   `GET /files/` (`internal/api/handlers/recipes.go`) as the nearest
   existing analogue. `docs/design/grlx-fork-roadmap.md` workstream I
@@ -62,7 +70,11 @@ Treat this as a reviewed starting point, not a drop-in production config.
   farmer-side `POST /v1/enroll` handler this config's enroll route
   proxies to.
 - `internal/pki/enroll.go` — the token validation, atomic redemption, and
-  minting logic behind that handler.
+  minting logic behind that handler (mints both the native NATS JWT and,
+  via `internal/gatewayjwt`, the gateway JWT).
+- `internal/gatewayjwt` — mints the gateway JWT (`mint.go`), talks to
+  OpenBao Transit (`obtransit.go`, `signer.go`), and serves the JWKS
+  document (`jwks.go`) this config's `remote_jwks` fetches.
 - `internal/pki/nats.go`'s `ConfigureNats` — the nats-server websocket
   listener (`config.FarmerWSPort`) this config's default route proxies
   to.

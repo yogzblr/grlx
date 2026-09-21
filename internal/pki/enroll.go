@@ -17,6 +17,7 @@ package pki
 // race against expiry. The specific reason is logged locally (log.Warnf
 // below) for operator visibility, never returned.
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -28,12 +29,36 @@ import (
 
 	"github.com/nats-io/nkeys"
 
+	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/gatewayjwt"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 )
 
 // ErrEnrollmentFailed is the single error every enrollment failure mode
 // collapses to before crossing the HTTP boundary (design doc §3.4).
 var ErrEnrollmentFailed = errors.New("enrollment_failed")
+
+// gatewayJWTMinter abstracts minting the Envoy-facing companion token
+// (internal/gatewayjwt — see its package doc for why a second token
+// exists at all: the NATS User JWT's "ed25519-nkey" alg header isn't
+// something a standard JOSE validator like Envoy's jwt_authn recognizes).
+// An interface here, rather than a direct *gatewayjwt.GatewaySigner
+// dependency, lets tests swap in a fake instead of requiring a live
+// OpenBao Transit backend — the same reasoning as enrollmentKeyStore
+// above.
+type gatewayJWTMinter interface {
+	MintGatewayJWT(ctx context.Context, claims gatewayjwt.GatewayClaims) (string, error)
+}
+
+// gatewayMinter is nil until SetGatewaySigner is called (see
+// cmd/farmer/main.go). Enroll fails closed — ErrEnrollmentFailed, not a
+// panic or a response silently missing gateway_jwt — if it's still nil
+// when an enrollment is attempted.
+var gatewayMinter gatewayJWTMinter
+
+// SetGatewaySigner installs the signer Enroll mints gateway JWTs
+// through. Call once at startup, after gatewayjwt.NewGatewaySigner.
+func SetGatewaySigner(s gatewayJWTMinter) { gatewayMinter = s }
 
 // enrollmentKeyRow mirrors the columns of saas.enrollment_keys this farmer
 // is granted SELECT on (design doc §4.1/§5.1). It deliberately excludes
@@ -100,7 +125,17 @@ func (mysqlEnrollmentKeyStore) redeem(keyID string) (bool, error) {
 // layer for the design doc §3.2 success response.
 type EnrollResult struct {
 	SproutID string
-	JWT      string
+	// JWT is the native NATS User JWT (workstream B, "ed25519-nkey" alg)
+	// — what nats-server itself validates. Unchanged by the gateway JWT
+	// work below.
+	JWT string
+	// GatewayJWT is the standard alg:EdDSA companion token
+	// (internal/gatewayjwt) presented to Envoy's jwt_authn-gated wss://
+	// and recipe-download routes. Minted fresh on every enrollment
+	// response, including idempotent replays — it's meant to be
+	// short-lived (config.GatewayJWTTTL), unlike the cached-to-disk NATS
+	// JWT above.
+	GatewayJWT string
 	// TenantX25519Pub is the tenant's NaCl box public key — see
 	// tenantbox.go's doc comment for why this is an interim, locally-held
 	// placeholder rather than workstream J/F's OpenBao-custodied material.
@@ -114,7 +149,7 @@ type EnrollResult struct {
 // §2.2's subject exists for a split SaaS-API/farmer deployment this repo
 // doesn't have yet) — farmer validates the token against saas schema
 // directly and mints the JWT itself, in one call.
-func Enroll(joinToken, nkeyPub, hostname string) (*EnrollResult, error) {
+func Enroll(ctx context.Context, joinToken, nkeyPub, hostname string) (*EnrollResult, error) {
 	if !nkeys.IsValidPublicUserKey(nkeyPub) {
 		log.Warnf("enroll: rejected malformed nkey_pub")
 		return nil, ErrEnrollmentFailed
@@ -127,7 +162,7 @@ func Enroll(joinToken, nkeyPub, hostname string) (*EnrollResult, error) {
 	// identity back rather than burning a second use of a possibly
 	// single-use token.
 	if sproutID, err := SproutIDForNKey(nkeyPub); err == nil {
-		return replayExistingEnrollment(sproutID)
+		return replayExistingEnrollment(ctx, sproutID, nkeyPub)
 	}
 
 	keyID, secret, ok := splitJoinToken(joinToken)
@@ -208,14 +243,21 @@ func Enroll(joinToken, nkeyPub, hostname string) (*EnrollResult, error) {
 		log.Errorf("enroll: sprout %s enrolled but failed to load tenant X25519 key: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
+	gatewayJWT, err := mintGatewayJWTFor(ctx, sproutID, nkeyPub)
+	if err != nil {
+		log.Errorf("enroll: sprout %s enrolled but failed to mint gateway JWT: %v", sproutID, err)
+		return nil, ErrEnrollmentFailed
+	}
 
 	log.Infof("enroll: sprout %s enrolled via key_id %s", sproutID, keyID)
-	return &EnrollResult{SproutID: sproutID, JWT: signedJWT, TenantX25519Pub: tenantPub}, nil
+	return &EnrollResult{SproutID: sproutID, JWT: signedJWT, GatewayJWT: gatewayJWT, TenantX25519Pub: tenantPub}, nil
 }
 
 // replayExistingEnrollment handles design doc §3.3 step 1: an already-
 // accepted nkey_pub gets its existing identity back, no token touched.
-func replayExistingEnrollment(sproutID string) (*EnrollResult, error) {
+// The gateway JWT is still minted fresh — see EnrollResult.GatewayJWT's
+// doc comment on why it isn't cached like the NATS JWT is.
+func replayExistingEnrollment(ctx context.Context, sproutID, nkeyPub string) (*EnrollResult, error) {
 	existingJWT, err := GetSproutUserJWT(sproutID)
 	if err != nil {
 		log.Errorf("enroll: sprout %s has an accepted nkey but no readable JWT: %v", sproutID, err)
@@ -226,8 +268,30 @@ func replayExistingEnrollment(sproutID string) (*EnrollResult, error) {
 		log.Errorf("enroll: idempotent replay for %s but failed to load tenant X25519 key: %v", sproutID, err)
 		return nil, ErrEnrollmentFailed
 	}
+	gatewayJWT, err := mintGatewayJWTFor(ctx, sproutID, nkeyPub)
+	if err != nil {
+		log.Errorf("enroll: idempotent replay for %s but failed to mint gateway JWT: %v", sproutID, err)
+		return nil, ErrEnrollmentFailed
+	}
 	log.Infof("enroll: sprout %s replayed an existing enrollment (idempotency check)", sproutID)
-	return &EnrollResult{SproutID: sproutID, JWT: existingJWT, TenantX25519Pub: tenantPub}, nil
+	return &EnrollResult{SproutID: sproutID, JWT: existingJWT, GatewayJWT: gatewayJWT, TenantX25519Pub: tenantPub}, nil
+}
+
+// mintGatewayJWTFor builds this sprout's gateway-JWT claims and mints it
+// via the installed gatewayMinter (SetGatewaySigner). Both of Enroll's
+// success paths call this, per the implementation brief's "Both tokens
+// must be minted in the same call — don't split into two round-trips"
+// and "don't special-case rotation to mint only one token."
+func mintGatewayJWTFor(ctx context.Context, sproutID, nkeyPub string) (string, error) {
+	if gatewayMinter == nil {
+		return "", errors.New("pki: no gateway JWT signer configured (SetGatewaySigner was never called)")
+	}
+	return gatewayMinter.MintGatewayJWT(ctx, gatewayjwt.GatewayClaims{
+		Subject:  nkeyPub,
+		TenantID: tenantID(),
+		SproutID: sproutID,
+		Expiry:   time.Now().Add(config.GatewayJWTTTL),
+	})
 }
 
 // splitJoinToken splits design doc §3.1's "{key_id}.{secret}" token on its

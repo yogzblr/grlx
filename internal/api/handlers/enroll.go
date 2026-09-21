@@ -34,9 +34,17 @@ type enrollRequest struct {
 // grlx-envoy-enrollment-design.md's "Response, in one round trip" —
 // everything the sprout needs for every subsequent interaction, issued
 // atomically here rather than across several separate exchanges.
+//
+// jwt and gateway_jwt are two different tokens for two different
+// validators, per the "Gateway JWT Companion Token" brief: jwt is the
+// native NATS User JWT nats-server itself validates (alg:ed25519-nkey);
+// gateway_jwt is a standard alg:EdDSA JWS (internal/gatewayjwt) for
+// Envoy's jwt_authn-gated wss:// and recipe-download routes, since
+// Envoy — unlike nats-server — can't be taught NATS's own JWT dialect.
 type enrollSuccessResponse struct {
 	SproutID        string   `json:"sprout_id"`
 	JWT             string   `json:"jwt"`
+	GatewayJWT      string   `json:"gateway_jwt"`
 	NKeyIdentity    string   `json:"nkey_identity"`
 	TenantX25519Pub string   `json:"tenant_x25519_pub"`
 	NatsURLs        []string `json:"nats_urls"`
@@ -66,7 +74,7 @@ func Enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := pki.Enroll(req.JoinToken, req.NKeyPub, req.Hostname)
+	result, err := pki.Enroll(r.Context(), req.JoinToken, req.NKeyPub, req.Hostname)
 	if err != nil {
 		// pki.Enroll has already logged the specific reason; nothing more
 		// to add here.
@@ -77,6 +85,7 @@ func Enroll(w http.ResponseWriter, r *http.Request) {
 	resp := enrollSuccessResponse{
 		SproutID:        result.SproutID,
 		JWT:             result.JWT,
+		GatewayJWT:      result.GatewayJWT,
 		NKeyIdentity:    req.NKeyPub,
 		TenantX25519Pub: result.TenantX25519Pub,
 		NatsURLs:        enrollBusURLs(),

@@ -28,23 +28,24 @@
 #                           listener (internal/pki/nats.go's
 #                           NatsConfig.Websocket, config.FarmerWSPort).
 #
-# KNOWN GAP, called out explicitly rather than silently glossed over: the
-# jwt_authn provider below points at a JWKS endpoint this repo does not
-# yet serve. Sprout JWTs are NATS User JWTs (github.com/nats-io/jwt/v2),
-# signed with the tenant Account's Ed25519 (NKey) signing key — not
-# published today as a standard JWKS document. Two ways to close this,
-# neither built here:
-#   (a) a small endpoint on farmer's existing HTTPS API server that
-#       derives a JWKS document (kty: OKP, crv: Ed25519) from the tenant
-#       Account's current signing key(s) (internal/pki/jwtauth.go's
-#       natsAuthMaterial.tenantSigningKP) and rotates it whenever that key
-#       rotates, or
-#   (b) an Envoy `local_jwks` fed by a value injected at deploy time from
-#       the same key material, refreshed out-of-band.
-# Until one of those exists, swap `remote_jwks` below for whichever this
-# deployment chose. Also verify EdDSA support in the Envoy build being
-# deployed — jwt_authn added Ed25519/EdDSA support in a relatively recent
-# Envoy release; pin a version known to have it.
+# JWT: NOT the native NATS User JWT. That token's JOSE header is
+# "alg":"ed25519-nkey" (github.com/nats-io/jwt/v2's AlgorithmNkey) — a
+# NATS-specific value no standard JOSE library, Envoy's jwt_authn
+# included, recognizes, and relabeling it after signing isn't possible
+# (the JWS signature covers the header bytes). Envoy instead validates a
+# separate "gateway JWT" (internal/gatewayjwt): same subject/tenant/
+# sprout claims, same underlying trust chain's sprout identity, but a
+# genuinely standard alg:EdDSA JWS, signed by a single platform-wide
+# OpenBao Transit key (never a tenant Account key — see
+# internal/gatewayjwt's package doc for why that split is deliberate).
+# nats-server's own decentralized-JWT auth is entirely unaffected: it
+# keeps validating the native NATS User JWT exactly as workstream B built
+# it, over the same wss:// connection this config merely proxies (the
+# "two gates, checking different things" design).
+#
+# Verify EdDSA support in the Envoy build being deployed — jwt_authn
+# added Ed25519/EdDSA support in a relatively recent Envoy release; pin a
+# version known to have it.
 
 static_resources:
   listeners:
@@ -140,23 +141,29 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
                       providers:
                         sprout_jwt:
-                          issuer: grlx-tenant-account
-                          # See the file-level "KNOWN GAP" note: this
-                          # cluster/path doesn't exist in this repo yet.
+                          # Must match internal/gatewayjwt's
+                          # GatewayIssuer constant ("grlx-gateway") — a
+                          # fixed, platform-wide value, never a tenant
+                          # identifier (see that package's doc comment).
+                          issuer: grlx-gateway
+                          # Served by internal/api/handlers/jwks.go via
+                          # internal/gatewayjwt.JWKSHandler — the gateway
+                          # Transit key's public half(ves), RFC 7517/8037
+                          # shaped (kty: OKP, crv: Ed25519).
                           remote_jwks:
                             http_uri:
-                              uri: "https://farmer.internal:5405/.well-known/jwks.json"
+                              uri: "https://farmer.internal:5405/v1/.well-known/jwks.json"
                               cluster: farmer_api
                               timeout: 5s
                             cache_duration: 300s
                           forward: true
-                          # The NATS User JWT's `sub` claim is the
-                          # sprout's NKey public key (see
-                          # internal/pki/jwtusers.go's
-                          # jwt.NewUserClaims(pubkey)) — forwarded as a
-                          # header so the upstream (nats-server, or the
-                          # recipe service) can see it without
-                          # re-parsing the token.
+                          # The gateway JWT's `sub` claim is the sprout's
+                          # NKey public key — same identity the native
+                          # NATS User JWT names (see
+                          # internal/gatewayjwt/mint.go's GatewayClaims)
+                          # — forwarded as a header so the upstream
+                          # (nats-server, or the recipe service) can see
+                          # it without re-parsing the token.
                           claim_to_headers:
                             - header_name: x-grlx-sprout-nkey
                               claim_name: sub
