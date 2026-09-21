@@ -1,3 +1,8 @@
+//go:build !windows
+
+// Package user implements the "present" method for Linux/Unix targets by
+// shelling out to useradd/usermod. See userPresent_windows.go for the
+// Windows equivalent, backed by the netapi32 NetUser* Win32 API instead.
 package user
 
 import (
@@ -15,9 +20,6 @@ import (
 
 // execCommandContext is a test-overridable factory for exec.Cmd.
 var execCommandContext = exec.CommandContext
-
-// lookupUser is a test-overridable wrapper around user.Lookup.
-var lookupUser = user.Lookup
 
 // validHashPrefixes lists accepted crypt(3) hash algorithm prefixes.
 var validHashPrefixes = []string{
@@ -222,49 +224,4 @@ func buildUsermodArgs(name, uid, gid, shell, home, comment, passwordHash string,
 	}
 	args = append(args, name)
 	return args
-}
-
-// stringParam extracts a string parameter from the params map.
-func stringParam(params map[string]interface{}, key string) string {
-	v, ok := params[key]
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
-	return s
-}
-
-// stringSliceParam extracts a []string parameter, handling both []string
-// and []interface{} (which is what JSON unmarshalling produces).
-func stringSliceParam(params map[string]interface{}, key string) []string {
-	v, ok := params[key]
-	if !ok {
-		return nil
-	}
-	switch vt := v.(type) {
-	case []string:
-		return vt
-	case []interface{}:
-		var out []string
-		for _, item := range vt {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	return nil
-}
-
-// boolParam extracts a bool parameter with a default value.
-func boolParam(params map[string]interface{}, key string, defaultVal bool) bool {
-	v, ok := params[key]
-	if !ok {
-		return defaultVal
-	}
-	b, ok := v.(bool)
-	if !ok {
-		return defaultVal
-	}
-	return b
 }

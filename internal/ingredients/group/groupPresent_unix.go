@@ -1,3 +1,9 @@
+//go:build !windows
+
+// Package group implements the "present"/"absent" methods for Linux/Unix
+// targets by shelling out to groupadd/groupmod/groupdel/gpasswd. See
+// groupPresent_windows.go for the Windows equivalent, backed by the
+// netapi32 NetLocalGroup* Win32 API instead.
 package group
 
 import (
@@ -5,23 +11,16 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"os/user"
 	"strings"
 
 	"github.com/gogrlx/grlx/v2/internal/cook"
 )
 
-// Function variables for system operations — replaceable in tests.
-var (
-	execCommand = func(ctx context.Context, name string, args ...string) error {
-		return exec.CommandContext(ctx, name, args...).Run()
-	}
-	lookupGroup   = user.LookupGroup
-	groupExistsBy = func(name string) bool {
-		_, err := user.LookupGroup(name)
-		return err == nil
-	}
-)
+// execCommand is a test-overridable factory for running groupadd/groupmod/
+// groupdel/gpasswd.
+var execCommand = func(ctx context.Context, name string, args ...string) error {
+	return exec.CommandContext(ctx, name, args...).Run()
+}
 
 func (g Group) present(ctx context.Context, test bool) (cook.Result, error) {
 	var result cook.Result
@@ -164,49 +163,4 @@ func buildGroupmodArgs(name, gid string) []string {
 // setGroupMembers uses gpasswd to set the exact member list for a group.
 func setGroupMembers(ctx context.Context, groupName string, members []string) error {
 	return execCommand(ctx, "gpasswd", "-M", strings.Join(members, ","), groupName)
-}
-
-// stringParam extracts a string parameter from the params map.
-func stringParam(params map[string]interface{}, key string) string {
-	v, ok := params[key]
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
-	return s
-}
-
-// stringSliceParam extracts a []string parameter, handling both []string
-// and []interface{} (which is what JSON unmarshalling produces).
-func stringSliceParam(params map[string]interface{}, key string) []string {
-	v, ok := params[key]
-	if !ok {
-		return nil
-	}
-	switch vt := v.(type) {
-	case []string:
-		return vt
-	case []interface{}:
-		var out []string
-		for _, item := range vt {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	return nil
-}
-
-// boolParam extracts a bool parameter with a default value.
-func boolParam(params map[string]interface{}, key string, defaultVal bool) bool {
-	v, ok := params[key]
-	if !ok {
-		return defaultVal
-	}
-	b, ok := v.(bool)
-	if !ok {
-		return defaultVal
-	}
-	return b
 }
