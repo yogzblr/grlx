@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitions revision="1.0" schemaVersion="1.0" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <policyNamespaces>
+    <target prefix="grlxtest" namespace="Grlx.Test.Policies"/>
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0"/>
+  <categories>
+    <category name="TestCategory" displayName="$(string.TestCategory)"/>
+  </categories>
+  <policies>
+    <policy name="ExampleBoolean" class="Machine"
+            displayName="$(string.ExampleBoolean)" explainText="$(string.ExampleBoolean_Help)"
+            key="Software\Policies\Grlx\Example" valueName="EnableFeature"
+            presentation="$(presentation.ExampleBoolean)">
+      <parentCategory ref="TestCategory"/>
+      <supportedOn ref="grlxtest:SUPPORTED_TestOS"/>
+      <enabledValue><decimal value="1"/></enabledValue>
+      <disabledValue><decimal value="0"/></disabledValue>
+    </policy>
+
+    <policy name="ExampleList" class="Machine"
+            displayName="$(string.ExampleList)" explainText="$(string.ExampleList_Help)"
+            key="Software\Policies\Grlx\Example"
+            presentation="$(presentation.ExampleList)">
+      <parentCategory ref="TestCategory"/>
+      <supportedOn ref="grlxtest:SUPPORTED_TestOS"/>
+      <enabledList defaultKey="Software\Policies\Grlx\Example">
+        <item valueName="ListA"><value><decimal value="1"/></value></item>
+        <item valueName="ListB"><value><string>enabled-b</string></value></item>
+      </enabledList>
+      <disabledList defaultKey="Software\Policies\Grlx\Example">
+        <item valueName="ListA"><value><decimal value="0"/></value></item>
+        <item valueName="ListB"><value><string>disabled-b</string></value></item>
+      </disabledList>
+    </policy>
+
+    <policy name="ExampleElements" class="User"
+            displayName="$(string.ExampleElements)" explainText="$(string.ExampleElements_Help)"
+            key="Software\Policies\Grlx\ExampleElements"
+            presentation="$(presentation.ExampleElements)">
+      <parentCategory ref="TestCategory"/>
+      <supportedOn ref="grlxtest:SUPPORTED_TestOS"/>
+      <elements>
+        <boolean id="MyBool" valueName="MyBoolVal"/>
+        <decimal id="MyNum" valueName="MyNumVal" required="true" minValue="0" maxValue="10"/>
+        <text id="MyText" valueName="MyTextVal" required="false"/>
+      </elements>
+    </policy>
+  </policies>
+</policyDefinitions>
