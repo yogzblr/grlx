@@ -729,7 +729,7 @@ func TestProbeSproutNilConn(t *testing.T) {
 	natsConn = nil
 	defer func() { natsConn = old }()
 
-	if probeSprout("any-sprout") {
+	if probeSprout("acme", "any-sprout") {
 		t.Error("expected false for nil NATS conn")
 	}
 }

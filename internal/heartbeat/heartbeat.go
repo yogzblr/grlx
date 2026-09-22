@@ -27,7 +27,6 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/gogrlx/grlx/v2/internal/config"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
@@ -48,39 +47,30 @@ var client valkey.Client
 // through. Call once at startup.
 func SetClient(c valkey.Client) { client = c }
 
-// tenantID resolves the current tenant scope, matching the identical
-// seam in internal/props, internal/pki, and internal/rbac's store.go
-// files — see their doc comments for why this isn't yet a per-request
-// value. Deliberately not using the CONNECT/DISCONNECT event's own
-// Client.Account field: that's the tenant NATS Account's public key
-// (nats-server's internal Account.Name), a different identifier space
-// than config.FarmerOrganization, which is what every other PXC-backed
-// store in this fork scopes by.
-func tenantID() string {
-	if config.FarmerOrganization != "" {
-		return config.FarmerOrganization
-	}
-	return "default"
-}
-
 func keyFor(tenant, sproutID string) string {
 	return keyPrefix + tenant + ":" + sproutID
 }
 
-// IsOnline reports whether sproutID currently holds a live heartbeat key.
-func IsOnline(ctx context.Context, sproutID string) bool {
+// IsOnline reports whether sproutID, within tenantID, currently holds a
+// live heartbeat key.
+func IsOnline(ctx context.Context, tenantID, sproutID string) bool {
 	if client == nil {
 		return false
 	}
-	n, err := client.Do(ctx, client.B().Exists().Key(keyFor(tenantID(), sproutID)).Build()).ToInt64()
+	n, err := client.Do(ctx, client.B().Exists().Key(keyFor(tenantID, sproutID)).Build()).ToInt64()
 	return err == nil && n > 0
 }
 
 // clientInfo mirrors the fields this package needs from nats-server's
-// server.ClientInfo (events.go) — only User (the authenticated pubkey) is
-// used; Client.Account is deliberately not (see tenantID's doc comment).
+// server.ClientInfo (events.go): User (the authenticated pubkey) and
+// Account (the connecting NATS Account's own public key, JSON-tagged
+// "acc") — the SYS account sees this field for every tenant's
+// connections, not just one, which is what makes CONNECT/DISCONNECT the
+// one call site in this package that can derive a real per-event tenant
+// today (see docs/design/grlx-tenant-context-threading.md).
 type clientInfo struct {
-	User string `json:"user"`
+	User    string `json:"user"`
+	Account string `json:"acc"`
 }
 
 type connectOrDisconnectEvent struct {
@@ -108,47 +98,54 @@ func RegisterListener(nc *nats.Conn) error {
 }
 
 func handleConnect(data []byte) {
-	sproutID, ok := sproutIDFromEvent(data, "CONNECT")
+	tenant, sproutID, ok := sproutIDFromEvent(data, "CONNECT")
 	if !ok || client == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := client.B().Set().Key(keyFor(tenantID(), sproutID)).Value("1").Ex(TTL).Build()
+	cmd := client.B().Set().Key(keyFor(tenant, sproutID)).Value("1").Ex(TTL).Build()
 	if err := client.Do(ctx, cmd).Error(); err != nil {
-		log.Errorf("heartbeat: setting key for sprout %s: %v", sproutID, err)
+		log.Errorf("heartbeat: setting key for sprout %s (tenant %s): %v", sproutID, tenant, err)
 	}
 }
 
 func handleDisconnect(data []byte) {
-	sproutID, ok := sproutIDFromEvent(data, "DISCONNECT")
+	tenant, sproutID, ok := sproutIDFromEvent(data, "DISCONNECT")
 	if !ok || client == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := client.B().Del().Key(keyFor(tenantID(), sproutID)).Build()
+	cmd := client.B().Del().Key(keyFor(tenant, sproutID)).Build()
 	if err := client.Do(ctx, cmd).Error(); err != nil {
-		log.Errorf("heartbeat: deleting key for sprout %s: %v", sproutID, err)
+		log.Errorf("heartbeat: deleting key for sprout %s (tenant %s): %v", sproutID, tenant, err)
 	}
 }
 
-// sproutIDFromEvent decodes a CONNECT/DISCONNECT event and resolves its
-// authenticated pubkey to an accepted sprout ID. ok is false for a
-// malformed event or a connection that isn't a currently-accepted sprout
-// (farmer's own connection, a CLI admin, the SYS push user, or a sprout
-// that was denied/deleted between connecting and this lookup) — none of
-// those are errors worth logging, just events this package has nothing to
-// do with.
-func sproutIDFromEvent(data []byte, kind string) (string, bool) {
+// sproutIDFromEvent decodes a CONNECT/DISCONNECT event, resolves its
+// connecting Account pubkey (ev.Client.Account) to a real tenant ID via
+// pki.TenantIDForAccountPub, and then resolves its authenticated user
+// pubkey to an accepted sprout ID *within that tenant*. ok is false for a
+// malformed event, an Account that isn't a provisioned tenant (the SYS
+// account's own connections, e.g.), or a connection that isn't a
+// currently-accepted sprout of that tenant (farmer's own connection, a CLI
+// admin, or a sprout that was denied/deleted between connecting and this
+// lookup) — none of those are errors worth logging, just events this
+// package has nothing to do with.
+func sproutIDFromEvent(data []byte, kind string) (tenant, sproutID string, ok bool) {
 	var ev connectOrDisconnectEvent
 	if err := json.Unmarshal(data, &ev); err != nil {
 		log.Errorf("heartbeat: decoding %s event: %v", kind, err)
-		return "", false
+		return "", "", false
 	}
-	sproutID, err := pki.SproutIDForNKey(ev.Client.User)
+	tenant, err := pki.TenantIDForAccountPub(ev.Client.Account)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
-	return sproutID, true
+	sproutID, err = pki.SproutIDForNKey(tenant, ev.Client.User)
+	if err != nil {
+		return "", "", false
+	}
+	return tenant, sproutID, true
 }

@@ -150,10 +150,10 @@ func TestEnroll_IdempotentReplaySucceeds(t *testing.T) {
 	withFakeTenantBoxOpenBao(t)
 
 	nkey := generateTestUserNKey(t)
-	if err := pki.UnacceptNKey("web-01", nkey); err != nil {
+	if err := pki.UnacceptNKey(pki.CurrentTenantID(), "web-01", nkey); err != nil {
 		t.Fatalf("UnacceptNKey: %v", err)
 	}
-	if err := pki.AcceptNKey("web-01"); err != nil {
+	if err := pki.AcceptNKey(pki.CurrentTenantID(), "web-01"); err != nil {
 		t.Fatalf("AcceptNKey: %v", err)
 	}
 

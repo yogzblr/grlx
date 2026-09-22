@@ -236,7 +236,7 @@ func TestResolveKeyState_AllStates(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.state, func(t *testing.T) {
-			got := resolveKeyState(tt.id)
+			got := resolveKeyState(pki.CurrentTenantID(), tt.id)
 			if got != tt.state {
 				t.Errorf("resolveKeyState(%q) = %q, want %q", tt.id, got, tt.state)
 			}
@@ -247,7 +247,7 @@ func TestResolveKeyState_AllStates(t *testing.T) {
 func TestResolveKeyState_Unknown(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	got := resolveKeyState("no-such-sprout")
+	got := resolveKeyState(pki.CurrentTenantID(), "no-such-sprout")
 	if got != "unknown" {
 		t.Errorf("resolveKeyState for missing sprout = %q, want %q", got, "unknown")
 	}
@@ -258,7 +258,7 @@ func TestResolveKeyState_Unknown(t *testing.T) {
 func TestProbeSprout_NilConn(t *testing.T) {
 	SetNatsConn(nil)
 
-	if probeSprout("any-sprout") {
+	if probeSprout("acme", "any-sprout") {
 		t.Error("expected false when natsConn is nil")
 	}
 }

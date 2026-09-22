@@ -50,7 +50,12 @@ func PutNKey(w http.ResponseWriter, r *http.Request) {
 	// if it does, append a counter to the end, and check again
 	// if we hit 100 sprouts with the same id, kick back a StatusBadRequest
 
-	registered, matches := pki.NKeyExists(submission.SproutID, submission.NKey)
+	// PutNKey is the legacy pre-enrollment bootstrap path, scoped to the
+	// single connection-level tenant reachable today — see
+	// docs/design/grlx-tenant-context-threading.md.
+	tenantID := pki.CurrentTenantID()
+
+	registered, matches := pki.NKeyExists(tenantID, submission.SproutID, submission.NKey)
 	if registered && matches {
 		log.Trace("A previously known NKey was submitted. Ignoring.")
 		jw, _ := json.Marshal(apitypes.Inline{Success: true})
@@ -60,7 +65,7 @@ func PutNKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if !registered {
 		log.Trace("A previously unknown NKey was submitted. Saving to Unaccepted.")
-		pki.UnacceptNKey(submission.SproutID, submission.NKey)
+		pki.UnacceptNKey(tenantID, submission.SproutID, submission.NKey)
 		jw, _ := json.Marshal(apitypes.Inline{Success: true})
 		w.WriteHeader(http.StatusOK)
 		w.Write(jw)
@@ -68,7 +73,7 @@ func PutNKey(w http.ResponseWriter, r *http.Request) {
 	}
 	// otherwise, it's registered and doesn't match
 	for trailingIndex := 1; trailingIndex < 100; trailingIndex++ {
-		registered, matches := pki.NKeyExists(submission.SproutID+"_"+strconv.Itoa(trailingIndex), submission.NKey)
+		registered, matches := pki.NKeyExists(tenantID, submission.SproutID+"_"+strconv.Itoa(trailingIndex), submission.NKey)
 		if registered && matches {
 			log.Trace("A previously known NKey was submitted. Ignoring.")
 			jw, _ := json.Marshal(apitypes.Inline{Success: true})
@@ -78,7 +83,7 @@ func PutNKey(w http.ResponseWriter, r *http.Request) {
 		}
 		if !registered {
 			log.Trace("A previously accepted ID is presenting a new NKey. Saving to Rejected.")
-			pki.RejectNKey(submission.SproutID+"_"+strconv.Itoa(trailingIndex), submission.NKey)
+			pki.RejectNKey(tenantID, submission.SproutID+"_"+strconv.Itoa(trailingIndex), submission.NKey)
 			jw, _ := json.Marshal(apitypes.Inline{Success: true})
 			w.WriteHeader(http.StatusOK)
 			w.Write(jw)

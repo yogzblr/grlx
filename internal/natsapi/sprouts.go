@@ -21,7 +21,8 @@ type SproutInfo struct {
 }
 
 func handleSproutsList(params json.RawMessage) (any, error) {
-	allKeys := pki.ListNKeysByType()
+	tenantID := pki.CurrentTenantID()
+	allKeys := pki.ListNKeysByType(tenantID)
 	var sprouts []SproutInfo
 
 	type entry struct {
@@ -47,12 +48,12 @@ func handleSproutsList(params json.RawMessage) (any, error) {
 			ID:       e.id,
 			KeyState: e.state,
 		}
-		nkey, err := pki.GetNKey(e.id)
+		nkey, err := pki.GetNKey(tenantID, e.id)
 		if err == nil {
 			info.NKey = nkey
 		}
 		if e.state == "accepted" && natsConn != nil {
-			info.Connected = probeSprout(e.id)
+			info.Connected = probeSprout(tenantID, e.id)
 		}
 		sprouts = append(sprouts, info)
 	}
@@ -102,12 +103,13 @@ func handleSproutsGet(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("invalid sprout ID")
 	}
 
-	nkey, err := pki.GetNKey(km.SproutID)
+	tenantID := pki.CurrentTenantID()
+	nkey, err := pki.GetNKey(tenantID, km.SproutID)
 	if err != nil {
 		return nil, fmt.Errorf("sprout not found")
 	}
 
-	keyState := resolveKeyState(km.SproutID)
+	keyState := resolveKeyState(tenantID, km.SproutID)
 	info := SproutInfo{
 		ID:       km.SproutID,
 		KeyState: keyState,
@@ -115,31 +117,31 @@ func handleSproutsGet(params json.RawMessage) (any, error) {
 	}
 
 	if keyState == "accepted" && natsConn != nil {
-		info.Connected = probeSprout(km.SproutID)
+		info.Connected = probeSprout(tenantID, km.SproutID)
 	}
 
 	return info, nil
 }
 
-// probeSprout reports whether sproutID currently has a live NATS
-// connection to farmer. This used to be a synchronous request/reply ping
-// to the sprout itself (up to sproutPingTimeout=3s per call, ~10x over the
-// <300ms budget for a fleet-listing request) — it now reads a Valkey
-// heartbeat key maintained by internal/heartbeat's
+// probeSprout reports whether sproutID, within tenantID, currently has a
+// live NATS connection to farmer. This used to be a synchronous
+// request/reply ping to the sprout itself (up to sproutPingTimeout=3s per
+// call, ~10x over the <300ms budget for a fleet-listing request) — it now
+// reads a Valkey heartbeat key maintained by internal/heartbeat's
 // $SYS.ACCOUNT.*.CONNECT/DISCONNECT listener, a single fast local read
 // instead of a round trip to the sprout. See
 // docs/design/grlx-master-plan.md Phase 1.
-func probeSprout(sproutID string) bool {
+func probeSprout(tenantID, sproutID string) bool {
 	if natsConn == nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return heartbeat.IsOnline(ctx, sproutID)
+	return heartbeat.IsOnline(ctx, tenantID, sproutID)
 }
 
-func resolveKeyState(sproutID string) string {
-	allKeys := pki.ListNKeysByType()
+func resolveKeyState(tenantID, sproutID string) string {
+	allKeys := pki.ListNKeysByType(tenantID)
 	for _, km := range allKeys.Accepted.Sprouts {
 		if km.SproutID == sproutID {
 			return "accepted"

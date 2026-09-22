@@ -293,7 +293,7 @@ func TestProbeSproutNoHeartbeatClient(t *testing.T) {
 
 	// No Valkey client configured anywhere in this test binary — every
 	// sprout must read as offline regardless of NATS connectivity.
-	if probeSprout("test-sprout") {
+	if probeSprout("acme", "test-sprout") {
 		t.Error("expected probeSprout to return false with no heartbeat client configured")
 	}
 }

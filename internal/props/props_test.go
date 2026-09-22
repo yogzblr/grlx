@@ -8,11 +8,11 @@ import (
 
 func TestSetProp(t *testing.T) {
 	newTestDB(t)
-	err := setProp("sprout-1", "key1", "value1")
+	err := setProp(tenantID(), "sprout-1", "key1", "value1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	got := getStringProp("sprout-1", "key1")
+	got := getStringProp(tenantID(), "sprout-1", "key1")
 	if got != "value1" {
 		t.Errorf("expected 'value1', got %q", got)
 	}
@@ -20,9 +20,9 @@ func TestSetProp(t *testing.T) {
 
 func TestSetPropOverwrite(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "key1", "old")
-	setProp("sprout-1", "key1", "new")
-	got := getStringProp("sprout-1", "key1")
+	setProp(tenantID(), "sprout-1", "key1", "old")
+	setProp(tenantID(), "sprout-1", "key1", "new")
+	got := getStringProp(tenantID(), "sprout-1", "key1")
 	if got != "new" {
 		t.Errorf("expected 'new', got %q", got)
 	}
@@ -30,7 +30,7 @@ func TestSetPropOverwrite(t *testing.T) {
 
 func TestSetPropEmptySproutID(t *testing.T) {
 	newTestDB(t)
-	err := setProp("", "key1", "value1")
+	err := setProp(tenantID(), "", "key1", "value1")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
 	}
@@ -38,7 +38,7 @@ func TestSetPropEmptySproutID(t *testing.T) {
 
 func TestSetPropEmptyName(t *testing.T) {
 	newTestDB(t)
-	err := setProp("sprout-1", "", "value1")
+	err := setProp(tenantID(), "sprout-1", "", "value1")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
 	}
@@ -46,12 +46,12 @@ func TestSetPropEmptyName(t *testing.T) {
 
 func TestDeleteProp(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "key1", "value1")
-	err := deleteProp("sprout-1", "key1")
+	setProp(tenantID(), "sprout-1", "key1", "value1")
+	err := deleteProp(tenantID(), "sprout-1", "key1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	got := getStringProp("sprout-1", "key1")
+	got := getStringProp(tenantID(), "sprout-1", "key1")
 	if got != "" {
 		t.Errorf("expected empty string after delete, got %q", got)
 	}
@@ -59,7 +59,7 @@ func TestDeleteProp(t *testing.T) {
 
 func TestDeletePropNonExistent(t *testing.T) {
 	newTestDB(t)
-	err := deleteProp("sprout-1", "key1")
+	err := deleteProp(tenantID(), "sprout-1", "key1")
 	if err != nil {
 		t.Errorf("expected nil error for deleting non-existent prop, got %v", err)
 	}
@@ -67,7 +67,7 @@ func TestDeletePropNonExistent(t *testing.T) {
 
 func TestDeletePropEmptySproutID(t *testing.T) {
 	newTestDB(t)
-	err := deleteProp("", "key1")
+	err := deleteProp(tenantID(), "", "key1")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
 	}
@@ -75,7 +75,7 @@ func TestDeletePropEmptySproutID(t *testing.T) {
 
 func TestDeletePropEmptyName(t *testing.T) {
 	newTestDB(t)
-	err := deleteProp("sprout-1", "")
+	err := deleteProp(tenantID(), "sprout-1", "")
 	if err != ErrInvalidPropKey {
 		t.Errorf("expected ErrInvalidPropKey, got %v", err)
 	}
@@ -83,7 +83,7 @@ func TestDeletePropEmptyName(t *testing.T) {
 
 func TestGetStringPropMissingSprout(t *testing.T) {
 	newTestDB(t)
-	got := getStringProp("no-such-sprout", "key1")
+	got := getStringProp(tenantID(), "no-such-sprout", "key1")
 	if got != "" {
 		t.Errorf("expected empty string, got %q", got)
 	}
@@ -91,8 +91,8 @@ func TestGetStringPropMissingSprout(t *testing.T) {
 
 func TestGetStringPropMissingKey(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "key1", "value1")
-	got := getStringProp("sprout-1", "no-such-key")
+	setProp(tenantID(), "sprout-1", "key1", "value1")
+	got := getStringProp(tenantID(), "sprout-1", "no-such-key")
 	if got != "" {
 		t.Errorf("expected empty string, got %q", got)
 	}
@@ -100,9 +100,9 @@ func TestGetStringPropMissingKey(t *testing.T) {
 
 func TestGetStringPropExpired(t *testing.T) {
 	newTestDB(t)
-	setPropWithTTL("sprout-1", "key1", "value1", 1*time.Millisecond)
+	setPropWithTTL(tenantID(), "sprout-1", "key1", "value1", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
-	got := getStringProp("sprout-1", "key1")
+	got := getStringProp(tenantID(), "sprout-1", "key1")
 	if got != "" {
 		t.Errorf("expected empty string for expired prop, got %q", got)
 	}
@@ -110,7 +110,7 @@ func TestGetStringPropExpired(t *testing.T) {
 
 func TestGetPropsEmpty(t *testing.T) {
 	newTestDB(t)
-	got := getProps("no-such-sprout")
+	got := getProps(tenantID(), "no-such-sprout")
 	if got != nil {
 		t.Errorf("expected nil, got %v", got)
 	}
@@ -118,11 +118,11 @@ func TestGetPropsEmpty(t *testing.T) {
 
 func TestGetPropsMultiple(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "key1", "value1")
-	setProp("sprout-1", "key2", "value2")
-	setProp("sprout-2", "key3", "value3")
+	setProp(tenantID(), "sprout-1", "key1", "value1")
+	setProp(tenantID(), "sprout-1", "key2", "value2")
+	setProp(tenantID(), "sprout-2", "key3", "value3")
 
-	got := getProps("sprout-1")
+	got := getProps(tenantID(), "sprout-1")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 props, got %d", len(got))
 	}
@@ -136,11 +136,11 @@ func TestGetPropsMultiple(t *testing.T) {
 
 func TestGetPropsExpiryCleanup(t *testing.T) {
 	newTestDB(t)
-	setPropWithTTL("sprout-1", "keep", "yes", 1*time.Hour)
-	setPropWithTTL("sprout-1", "expire", "no", 1*time.Millisecond)
+	setPropWithTTL(tenantID(), "sprout-1", "keep", "yes", 1*time.Hour)
+	setPropWithTTL(tenantID(), "sprout-1", "expire", "no", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 
-	got := getProps("sprout-1")
+	got := getProps(tenantID(), "sprout-1")
 	if len(got) != 1 {
 		t.Fatalf("expected 1 prop after expiry cleanup, got %d", len(got))
 	}
@@ -151,7 +151,7 @@ func TestGetPropsExpiryCleanup(t *testing.T) {
 
 func TestGetStringPropFuncClosure(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "mykey", "myval")
+	setProp(tenantID(), "sprout-1", "mykey", "myval")
 	fn := GetStringPropFunc("sprout-1")
 	got := fn("mykey")
 	if got != "myval" {
@@ -166,7 +166,7 @@ func TestSetPropFuncClosure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	got := getStringProp("sprout-1", "key1")
+	got := getStringProp(tenantID(), "sprout-1", "key1")
 	if got != "val1" {
 		t.Errorf("expected 'val1', got %q", got)
 	}
@@ -174,13 +174,13 @@ func TestSetPropFuncClosure(t *testing.T) {
 
 func TestDeletePropFuncClosure(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "key1", "value1")
+	setProp(tenantID(), "sprout-1", "key1", "value1")
 	fn := GetDeletePropFunc("sprout-1")
 	err := fn("key1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	got := getStringProp("sprout-1", "key1")
+	got := getStringProp(tenantID(), "sprout-1", "key1")
 	if got != "" {
 		t.Errorf("expected empty string after delete, got %q", got)
 	}
@@ -188,7 +188,7 @@ func TestDeletePropFuncClosure(t *testing.T) {
 
 func TestGetPropsFuncClosure(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-1", "a", "1")
+	setProp(tenantID(), "sprout-1", "a", "1")
 	fn := GetPropsFunc("sprout-1")
 	got := fn()
 	if len(got) != 1 || got["a"] != "1" {
@@ -211,15 +211,15 @@ func TestConcurrentAccess(t *testing.T) {
 		wg.Add(3)
 		go func(n int) {
 			defer wg.Done()
-			setProp("sprout-1", "key", "val")
+			setProp(tenantID(), "sprout-1", "key", "val")
 		}(i)
 		go func(n int) {
 			defer wg.Done()
-			getStringProp("sprout-1", "key")
+			getStringProp(tenantID(), "sprout-1", "key")
 		}(i)
 		go func(n int) {
 			defer wg.Done()
-			getProps("sprout-1")
+			getProps(tenantID(), "sprout-1")
 		}(i)
 	}
 	wg.Wait()
@@ -227,21 +227,21 @@ func TestConcurrentAccess(t *testing.T) {
 
 func TestIsolationBetweenSprouts(t *testing.T) {
 	newTestDB(t)
-	setProp("sprout-a", "shared-key", "alpha")
-	setProp("sprout-b", "shared-key", "beta")
+	setProp(tenantID(), "sprout-a", "shared-key", "alpha")
+	setProp(tenantID(), "sprout-b", "shared-key", "beta")
 
-	if got := getStringProp("sprout-a", "shared-key"); got != "alpha" {
+	if got := getStringProp(tenantID(), "sprout-a", "shared-key"); got != "alpha" {
 		t.Errorf("sprout-a expected 'alpha', got %q", got)
 	}
-	if got := getStringProp("sprout-b", "shared-key"); got != "beta" {
+	if got := getStringProp(tenantID(), "sprout-b", "shared-key"); got != "beta" {
 		t.Errorf("sprout-b expected 'beta', got %q", got)
 	}
 
-	deleteProp("sprout-a", "shared-key")
-	if got := getStringProp("sprout-a", "shared-key"); got != "" {
+	deleteProp(tenantID(), "sprout-a", "shared-key")
+	if got := getStringProp(tenantID(), "sprout-a", "shared-key"); got != "" {
 		t.Errorf("sprout-a should be empty after delete, got %q", got)
 	}
-	if got := getStringProp("sprout-b", "shared-key"); got != "beta" {
+	if got := getStringProp(tenantID(), "sprout-b", "shared-key"); got != "beta" {
 		t.Errorf("sprout-b should still be 'beta', got %q", got)
 	}
 }

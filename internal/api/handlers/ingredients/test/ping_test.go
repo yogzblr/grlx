@@ -56,10 +56,10 @@ func setupPingTestPKI(t *testing.T) string {
 // production.
 func addPingTestSprout(t *testing.T, id, nkey string) {
 	t.Helper()
-	if err := pki.UnacceptNKey(id, nkey); err != nil {
+	if err := pki.UnacceptNKey(pki.CurrentTenantID(), id, nkey); err != nil {
 		t.Fatalf("UnacceptNKey(%q): %v", id, err)
 	}
-	if err := pki.AcceptNKey(id); err != nil {
+	if err := pki.AcceptNKey(pki.CurrentTenantID(), id); err != nil {
 		t.Fatalf("AcceptNKey(%q): %v", id, err)
 	}
 }

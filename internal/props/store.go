@@ -52,15 +52,21 @@ var db *gorm.DB
 // Call once at startup, after internal/pxc.OpenDB.
 func SetDB(d *gorm.DB) { db = d }
 
-// tenantID resolves the current tenant scope for every query in this
-// package. See the package doc comment above for why this isn't yet a
-// per-request value.
+// tenantID resolves the current tenant scope for callers with no better
+// source today (internal/natsapi's single shared connection,
+// boot/SIGHUP-time static-prop loading) — see the package doc comment
+// above and docs/design/grlx-tenant-context-threading.md.
 func tenantID() string {
 	if config.FarmerOrganization != "" {
 		return config.FarmerOrganization
 	}
 	return "default"
 }
+
+// CurrentTenantID exports tenantID for callers outside this package that
+// need it explicitly rather than have it read implicitly — see tenantID's
+// doc comment.
+func CurrentTenantID() string { return tenantID() }
 
 func upsertProp(row propRow) error {
 	return db.Clauses(clause.OnConflict{

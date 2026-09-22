@@ -256,6 +256,14 @@ func ensureTenantAccountLocked(mat *natsAuthMaterial, tenantID, nameHint string)
 	if err != nil {
 		return nil, false, err
 	}
+	// Record the Account pubkey on the tenant row so TenantIDForAccountPub
+	// (store.go) can reverse-map it later — see
+	// docs/design/grlx-tenant-context-threading.md. Idempotent: a tenant's
+	// Account keypair never changes once minted, so this is a no-op update
+	// on every call after the first.
+	if err := setTenantAccountPub(tenantID, tam.pub); err != nil {
+		return nil, false, fmt.Errorf("pki: recording tenant %q's Account pubkey: %w", tenantID, err)
+	}
 	return tam, provisioned || minted, nil
 }
 

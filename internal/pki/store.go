@@ -57,11 +57,18 @@ const (
 // should trust it" — see ConfigureNats (nats.go), which seeds the resolver
 // from every non-deleted row here in addition to the legacy single-tenant
 // seam's own Account.
+// AccountPub is the tenant's NATS Account public key (tenantAccountMaterial.pub
+// in tenant.go), filled in once that Account material is first minted. It
+// backs TenantIDForAccountPub's reverse lookup — see that function's doc
+// comment for why this exists: an Account pubkey is a different identifier
+// space than the tenant ID string used everywhere else, and nothing else in
+// this schema records the mapping between them.
 type tenantRow struct {
-	ID        string `gorm:"column:id;primaryKey;size:191"`
-	Name      string `gorm:"column:name;size:255;not null"`
-	Deleted   bool   `gorm:"column:deleted;not null;default:false;index"`
-	CreatedAt int64  `gorm:"column:created_at;not null"`
+	ID         string `gorm:"column:id;primaryKey;size:191"`
+	Name       string `gorm:"column:name;size:255;not null"`
+	Deleted    bool   `gorm:"column:deleted;not null;default:false;index"`
+	CreatedAt  int64  `gorm:"column:created_at;not null"`
+	AccountPub string `gorm:"column:account_pub;size:64;index"`
 }
 
 func (tenantRow) TableName() string { return "pki_tenants" }
@@ -79,9 +86,13 @@ var db *gorm.DB
 // Call once at startup, after internal/pxc.OpenDB.
 func SetDB(d *gorm.DB) { db = d }
 
-// tenantID resolves the current tenant scope for every query in this
-// package. See internal/props/store.go's doc comment for why this isn't
-// yet a per-request value.
+// tenantID resolves the current tenant scope for the handful of genuinely
+// process-level, boot/SIGHUP-time contexts that still don't have a real
+// per-request tenant to thread through (see ReloadNKeys/syncNatsAuth in
+// nats.go/jwtusers.go, and tenant.go's own comparisons against "the legacy
+// current tenant"). See docs/design/grlx-tenant-context-threading.md for
+// why every per-message/per-request call site in this package now takes an
+// explicit tenantID parameter instead of calling this.
 func tenantID() string {
 	if config.FarmerOrganization != "" {
 		return config.FarmerOrganization
@@ -89,22 +100,20 @@ func tenantID() string {
 	return "default"
 }
 
+// CurrentTenantID exports tenantID for callers outside this package
+// (internal/natsapi, internal/api/handlers) that dispatch over the single
+// shared NATS connection/HTTP admin API today — see
+// docs/design/grlx-tenant-context-threading.md: until that connection is
+// made genuinely multi-tenant, this legacy seam's value is the only tenant
+// actually reachable, so it's the honest value for those callers to pass
+// explicitly rather than have it read implicitly inside this package.
+func CurrentTenantID() string { return tenantID() }
+
 // currentTenantID is an alias for tenantID(), for callers in tenant.go
 // that take an explicit tenant ID as a same-named parameter (shadowing the
 // package-level tenantID function within that scope) but still need to
 // compare against or fall back to the current-tenant seam's value.
 func currentTenantID() string { return tenantID() }
-
-func findNKeyRow(id string) (*nkeyRow, error) {
-	if !IsValidSproutID(id) {
-		return nil, ErrSproutIDInvalid
-	}
-	var row nkeyRow
-	if err := db.Where("tenant_id = ? AND sprout_id = ?", tenantID(), id).First(&row).Error; err != nil {
-		return nil, ErrSproutIDNotFound
-	}
-	return &row, nil
-}
 
 // upsertNKeyRow inserts a new sprout NKey row, or updates its nkey/state in
 // place if a row for (tenant, sproutID) already exists.
@@ -115,19 +124,20 @@ func upsertNKeyRow(row nkeyRow) error {
 	}).Create(&row).Error
 }
 
-func setState(id, state string) error {
+func setStateInTenant(tenantID, id, state string) error {
 	return db.Model(&nkeyRow{}).
-		Where("tenant_id = ? AND sprout_id = ?", tenantID(), id).
+		Where("tenant_id = ? AND sprout_id = ?", tenantID, id).
 		Update("state", state).Error
 }
 
-// SproutIDForNKey looks up the accepted sprout ID owning nkey, for the
-// current tenant. Used by internal/heartbeat to map a NATS connection's
+// SproutIDForNKey looks up the accepted sprout ID owning nkey within
+// tenantID. Used by internal/heartbeat to map a NATS connection's
 // authenticated pubkey (see $SYS.ACCOUNT.*.CONNECT/DISCONNECT's
-// ClientInfo.User) back to a sprout ID.
-func SproutIDForNKey(nkey string) (string, error) {
+// ClientInfo.User) back to a sprout ID, once the event's own ClientInfo.Account
+// has been reverse-mapped to a real tenantID via TenantIDForAccountPub.
+func SproutIDForNKey(tenantID, nkey string) (string, error) {
 	var row nkeyRow
-	err := db.Where("tenant_id = ? AND nkey = ? AND state = ?", tenantID(), nkey, stateAccepted).First(&row).Error
+	err := db.Where("tenant_id = ? AND nkey = ? AND state = ?", tenantID, nkey, stateAccepted).First(&row).Error
 	if err != nil {
 		return "", ErrSproutIDNotFound
 	}
@@ -204,4 +214,55 @@ func getTenantRow(id string) (*tenantRow, error) {
 		return nil, ErrTenantNotFound
 	}
 	return &row, nil
+}
+
+// setTenantAccountPub records tenantID's NATS Account public key on its
+// pki_tenants row, so TenantIDForAccountPub can reverse it later. Called
+// from tenant.go once ensureTenantAccountMaterial has minted or loaded that
+// tenant's Account keypair — idempotent, safe to call every time (a
+// tenant's Account keypair never changes after it's first minted).
+func setTenantAccountPub(id, accountPub string) error {
+	return db.Model(&tenantRow{}).Where("id = ?", id).Update("account_pub", accountPub).Error
+}
+
+// TenantIDForAccountPub reverse-looks-up which tenant owns a NATS Account
+// public key — the mapping internal/heartbeat needs to turn a
+// $SYS.ACCOUNT.*.CONNECT/DISCONNECT event's ClientInfo.Account (the
+// connecting Account's real pubkey; see docs/design/
+// grlx-tenant-context-threading.md) into a real tenant ID, instead of the
+// process-global tenantID() seam. Handles both the legacy single-tenant
+// Account (mat.tenantPub, which isn't itself a pki_tenants row) and every
+// dynamically-provisioned tenant (tenant.go's tenantAccountMaterial.pub,
+// recorded via setTenantAccountPub).
+// GetTenantAccountPub returns tenantID's NATS Account public key, once
+// provisioned (see ProvisionTenant) — the id -> pubkey direction of
+// TenantIDForAccountPub's reverse lookup. Exported for tests (and any
+// future caller) that need to know which Account pubkey a given tenant's
+// connections actually authenticate under, e.g. to construct a realistic
+// $SYS.ACCOUNT.*.CONNECT event for internal/heartbeat.
+func GetTenantAccountPub(tenantID string) (string, error) {
+	if tenantID == currentTenantID() {
+		if mat, err := ensureNatsAuth(); err == nil {
+			return mat.tenantPub, nil
+		}
+	}
+	row, err := getTenantRow(tenantID)
+	if err != nil || row.AccountPub == "" {
+		return "", ErrTenantNotFound
+	}
+	return row.AccountPub, nil
+}
+
+func TenantIDForAccountPub(accountPub string) (string, error) {
+	if accountPub == "" {
+		return "", ErrTenantNotFound
+	}
+	if mat, err := ensureNatsAuth(); err == nil && mat.tenantPub == accountPub {
+		return currentTenantID(), nil
+	}
+	var row tenantRow
+	if err := db.Where("account_pub = ? AND deleted = ?", accountPub, false).First(&row).Error; err != nil {
+		return "", ErrTenantNotFound
+	}
+	return row.ID, nil
 }

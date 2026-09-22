@@ -85,25 +85,25 @@ func writeSproutKey(t *testing.T, _, state, id, nkey string) {
 	t.Helper()
 	switch state {
 	case "unaccepted":
-		if err := pki.UnacceptNKey(id, nkey); err != nil {
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), id, nkey); err != nil {
 			t.Fatalf("UnacceptNKey(%q): %v", id, err)
 		}
 	case "accepted":
-		if err := pki.UnacceptNKey(id, nkey); err != nil {
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), id, nkey); err != nil {
 			t.Fatalf("UnacceptNKey(%q): %v", id, err)
 		}
-		if err := pki.AcceptNKey(id); err != nil {
+		if err := pki.AcceptNKey(pki.CurrentTenantID(), id); err != nil {
 			t.Fatalf("AcceptNKey(%q): %v", id, err)
 		}
 	case "denied":
-		if err := pki.UnacceptNKey(id, nkey); err != nil {
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), id, nkey); err != nil {
 			t.Fatalf("UnacceptNKey(%q): %v", id, err)
 		}
-		if err := pki.DenyNKey(id); err != nil {
+		if err := pki.DenyNKey(pki.CurrentTenantID(), id); err != nil {
 			t.Fatalf("DenyNKey(%q): %v", id, err)
 		}
 	case "rejected":
-		if err := pki.RejectNKey(id, nkey); err != nil {
+		if err := pki.RejectNKey(pki.CurrentTenantID(), id, nkey); err != nil {
 			t.Fatalf("RejectNKey(%q): %v", id, err)
 		}
 	default:
@@ -198,7 +198,7 @@ func TestPutNKey_NewSprout(t *testing.T) {
 	}
 
 	// Verify the key was saved as unaccepted.
-	got, err := pki.GetNKey("new-sprout")
+	got, err := pki.GetNKey(pki.CurrentTenantID(), "new-sprout")
 	if err != nil {
 		t.Fatalf("expected key to be saved: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestPutNKey_NewSprout(t *testing.T) {
 		t.Errorf("expected saved key %q, got %q", nkey, got)
 	}
 	found := false
-	for _, s := range pki.GetNKeysByType("unaccepted").Sprouts {
+	for _, s := range pki.GetNKeysByType(pki.CurrentTenantID(), "unaccepted").Sprouts {
 		if s.SproutID == "new-sprout" {
 			found = true
 		}
@@ -262,7 +262,7 @@ func TestPutNKey_SameIDDifferentKey(t *testing.T) {
 
 	// Should have been saved as conflict-sprout_1 in rejected.
 	found := false
-	for _, s := range pki.GetNKeysByType("rejected").Sprouts {
+	for _, s := range pki.GetNKeysByType(pki.CurrentTenantID(), "rejected").Sprouts {
 		if s.SproutID == "conflict-sprout_1" {
 			found = true
 		}

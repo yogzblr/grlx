@@ -167,7 +167,7 @@ func writeKey(t *testing.T, state, sproutID, nkey string) {
 // doesn't exist.
 func keyState(t *testing.T, sproutID string) string {
 	t.Helper()
-	row, err := findNKeyRow(sproutID)
+	row, err := findNKeyRowInTenant(tenantID(), sproutID)
 	if err != nil {
 		return ""
 	}
@@ -226,12 +226,12 @@ func TestSetupPKIFarmer(t *testing.T) {
 func TestUnacceptNKey_NewSprout(t *testing.T) {
 	setupTestPKI(t)
 
-	err := UnacceptNKey("webserver01", "NKEY_ABC123")
+	err := UnacceptNKey(currentTenantID(), "webserver01", "NKEY_ABC123")
 	if err != nil {
 		t.Fatalf("UnacceptNKey failed: %v", err)
 	}
 
-	key, err := GetNKey("webserver01")
+	key, err := GetNKey(currentTenantID(), "webserver01")
 	if err != nil {
 		t.Fatalf("expected key: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestUnacceptNKey_NewSprout(t *testing.T) {
 func TestUnacceptNKey_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	err := UnacceptNKey("-invalid", "NKEY_ABC123")
+	err := UnacceptNKey(currentTenantID(), "-invalid", "NKEY_ABC123")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -257,12 +257,12 @@ func TestAcceptNKey(t *testing.T) {
 
 	writeKey(t, "unaccepted", "db01", "NKEY_DB01")
 
-	err := AcceptNKey("db01")
+	err := AcceptNKey(currentTenantID(), "db01")
 	if err != nil {
 		t.Fatalf("AcceptNKey failed: %v", err)
 	}
 
-	key, err := GetNKey("db01")
+	key, err := GetNKey(currentTenantID(), "db01")
 	if err != nil {
 		t.Fatalf("expected key: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestAcceptNKey_AlreadyAccepted(t *testing.T) {
 
 	writeKey(t, "accepted", "db01", "NKEY_DB01")
 
-	err := AcceptNKey("db01")
+	err := AcceptNKey(currentTenantID(), "db01")
 	if !errors.Is(err, ErrAlreadyAccepted) {
 		t.Errorf("expected ErrAlreadyAccepted, got: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestAcceptNKey_AlreadyAccepted(t *testing.T) {
 func TestAcceptNKey_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	err := AcceptNKey("-nope")
+	err := AcceptNKey(currentTenantID(), "-nope")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestAcceptNKey_InvalidID(t *testing.T) {
 func TestAcceptNKey_NotFound(t *testing.T) {
 	setupTestPKI(t)
 
-	err := AcceptNKey("nonexistent")
+	err := AcceptNKey(currentTenantID(), "nonexistent")
 	if !errors.Is(err, ErrSproutIDNotFound) {
 		t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestDenyNKey(t *testing.T) {
 
 	writeKey(t, "unaccepted", "app01", "NKEY_APP01")
 
-	err := DenyNKey("app01")
+	err := DenyNKey(currentTenantID(), "app01")
 	if err != nil {
 		t.Fatalf("DenyNKey failed: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestDenyNKey_AlreadyDenied(t *testing.T) {
 
 	writeKey(t, "denied", "app01", "NKEY_APP01")
 
-	err := DenyNKey("app01")
+	err := DenyNKey(currentTenantID(), "app01")
 	if !errors.Is(err, ErrAlreadyDenied) {
 		t.Errorf("expected ErrAlreadyDenied, got: %v", err)
 	}
@@ -334,12 +334,12 @@ func TestRejectNKey_ExistingKey(t *testing.T) {
 
 	writeKey(t, "unaccepted", "rogue01", "NKEY_ROGUE")
 
-	err := RejectNKey("rogue01", "")
+	err := RejectNKey(currentTenantID(), "rogue01", "")
 	if err != nil {
 		t.Fatalf("RejectNKey failed: %v", err)
 	}
 
-	key, err := GetNKey("rogue01")
+	key, err := GetNKey(currentTenantID(), "rogue01")
 	if err != nil {
 		t.Fatalf("expected key: %v", err)
 	}
@@ -355,12 +355,12 @@ func TestRejectNKey_NewKeyDirect(t *testing.T) {
 	setupTestPKI(t)
 
 	// Reject a sprout that doesn't exist yet — creates directly as rejected.
-	err := RejectNKey("badactor", "NKEY_BAD")
+	err := RejectNKey(currentTenantID(), "badactor", "NKEY_BAD")
 	if err != nil {
 		t.Fatalf("RejectNKey failed: %v", err)
 	}
 
-	key, err := GetNKey("badactor")
+	key, err := GetNKey(currentTenantID(), "badactor")
 	if err != nil {
 		t.Fatalf("expected key: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestRejectNKey_AlreadyRejected(t *testing.T) {
 
 	writeKey(t, "rejected", "rogue01", "NKEY_ROGUE")
 
-	err := RejectNKey("rogue01", "")
+	err := RejectNKey(currentTenantID(), "rogue01", "")
 	if !errors.Is(err, ErrAlreadyRejected) {
 		t.Errorf("expected ErrAlreadyRejected, got: %v", err)
 	}
@@ -385,12 +385,12 @@ func TestDeleteNKey(t *testing.T) {
 
 	writeKey(t, "accepted", "old01", "NKEY_OLD")
 
-	err := DeleteNKey("old01")
+	err := DeleteNKey(currentTenantID(), "old01")
 	if err != nil {
 		t.Fatalf("DeleteNKey failed: %v", err)
 	}
 
-	if _, err := GetNKey("old01"); !errors.Is(err, ErrSproutIDNotFound) {
+	if _, err := GetNKey(currentTenantID(), "old01"); !errors.Is(err, ErrSproutIDNotFound) {
 		t.Error("expected key to be deleted")
 	}
 }
@@ -398,7 +398,7 @@ func TestDeleteNKey(t *testing.T) {
 func TestDeleteNKey_NotFound(t *testing.T) {
 	setupTestPKI(t)
 
-	err := DeleteNKey("ghost")
+	err := DeleteNKey(currentTenantID(), "ghost")
 	if !errors.Is(err, ErrSproutIDNotFound) {
 		t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestDeleteNKey_NotFound(t *testing.T) {
 func TestDeleteNKey_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	err := DeleteNKey("-bad")
+	err := DeleteNKey(currentTenantID(), "-bad")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -418,7 +418,7 @@ func TestGetNKey(t *testing.T) {
 
 	writeKey(t, "accepted", "cache01", "NKEY_CACHE01")
 
-	key, err := GetNKey("cache01")
+	key, err := GetNKey(currentTenantID(), "cache01")
 	if err != nil {
 		t.Fatalf("GetNKey failed: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestGetNKey(t *testing.T) {
 func TestGetNKey_NotFound(t *testing.T) {
 	setupTestPKI(t)
 
-	_, err := GetNKey("missing")
+	_, err := GetNKey(currentTenantID(), "missing")
 	if !errors.Is(err, ErrSproutIDNotFound) {
 		t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestGetNKey_NotFound(t *testing.T) {
 func TestGetNKey_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	_, err := GetNKey("-invalid")
+	_, err := GetNKey(currentTenantID(), "-invalid")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -455,7 +455,7 @@ func TestGetNKey_FromEachState(t *testing.T) {
 		writeKey(t, state, sproutID, expectedKey)
 
 		t.Run(state, func(t *testing.T) {
-			key, err := GetNKey(sproutID)
+			key, err := GetNKey(currentTenantID(), sproutID)
 			if err != nil {
 				t.Fatalf("GetNKey(%q) failed: %v", sproutID, err)
 			}
@@ -472,7 +472,7 @@ func TestNKeyExists(t *testing.T) {
 	writeKey(t, "accepted", "exist01", "NKEY_EXIST")
 
 	t.Run("exists and matches", func(t *testing.T) {
-		registered, matches := NKeyExists("exist01", "NKEY_EXIST")
+		registered, matches := NKeyExists(currentTenantID(), "exist01", "NKEY_EXIST")
 		if !registered {
 			t.Error("expected registered=true")
 		}
@@ -482,7 +482,7 @@ func TestNKeyExists(t *testing.T) {
 	})
 
 	t.Run("exists but mismatches", func(t *testing.T) {
-		registered, matches := NKeyExists("exist01", "WRONG_KEY")
+		registered, matches := NKeyExists(currentTenantID(), "exist01", "WRONG_KEY")
 		if !registered {
 			t.Error("expected registered=true")
 		}
@@ -492,7 +492,7 @@ func TestNKeyExists(t *testing.T) {
 	})
 
 	t.Run("not registered", func(t *testing.T) {
-		registered, matches := NKeyExists("nope", "ANY")
+		registered, matches := NKeyExists(currentTenantID(), "nope", "ANY")
 		if registered {
 			t.Error("expected registered=false")
 		}
@@ -510,28 +510,28 @@ func TestGetNKeysByType(t *testing.T) {
 	writeKey(t, "denied", "d1", "KEY_D1")
 
 	t.Run("accepted", func(t *testing.T) {
-		ks := GetNKeysByType("accepted")
+		ks := GetNKeysByType(currentTenantID(), "accepted")
 		if len(ks.Sprouts) != 2 {
 			t.Errorf("expected 2 accepted sprouts, got %d", len(ks.Sprouts))
 		}
 	})
 
 	t.Run("denied", func(t *testing.T) {
-		ks := GetNKeysByType("denied")
+		ks := GetNKeysByType(currentTenantID(), "denied")
 		if len(ks.Sprouts) != 1 {
 			t.Errorf("expected 1 denied sprout, got %d", len(ks.Sprouts))
 		}
 	})
 
 	t.Run("empty state", func(t *testing.T) {
-		ks := GetNKeysByType("rejected")
+		ks := GetNKeysByType(currentTenantID(), "rejected")
 		if len(ks.Sprouts) != 0 {
 			t.Errorf("expected 0 rejected sprouts, got %d", len(ks.Sprouts))
 		}
 	})
 
 	t.Run("invalid state", func(t *testing.T) {
-		ks := GetNKeysByType("bogus")
+		ks := GetNKeysByType(currentTenantID(), "bogus")
 		if len(ks.Sprouts) != 0 {
 			t.Errorf("expected 0 sprouts for invalid state, got %d", len(ks.Sprouts))
 		}
@@ -546,7 +546,7 @@ func TestListNKeysByType(t *testing.T) {
 	writeKey(t, "denied", "d1", "KEY_D1")
 	writeKey(t, "rejected", "r1", "KEY_R1")
 
-	all := ListNKeysByType()
+	all := ListNKeysByType(currentTenantID())
 	if len(all.Accepted.Sprouts) != 1 {
 		t.Errorf("expected 1 accepted, got %d", len(all.Accepted.Sprouts))
 	}
@@ -567,12 +567,12 @@ func TestAcceptThenDeny(t *testing.T) {
 	writeKey(t, "unaccepted", "flip01", "NKEY_FLIP")
 
 	// Accept it.
-	if err := AcceptNKey("flip01"); err != nil {
+	if err := AcceptNKey(currentTenantID(), "flip01"); err != nil {
 		t.Fatalf("AcceptNKey: %v", err)
 	}
 
 	// Verify it's accepted.
-	ks := GetNKeysByType("accepted")
+	ks := GetNKeysByType(currentTenantID(), "accepted")
 	found := false
 	for _, s := range ks.Sprouts {
 		if s.SproutID == "flip01" {
@@ -585,18 +585,18 @@ func TestAcceptThenDeny(t *testing.T) {
 	}
 
 	// Deny it.
-	if err := DenyNKey("flip01"); err != nil {
+	if err := DenyNKey(currentTenantID(), "flip01"); err != nil {
 		t.Fatalf("DenyNKey: %v", err)
 	}
 
 	// Should be in denied, not accepted.
-	ksAccepted := GetNKeysByType("accepted")
+	ksAccepted := GetNKeysByType(currentTenantID(), "accepted")
 	for _, s := range ksAccepted.Sprouts {
 		if s.SproutID == "flip01" {
 			t.Error("flip01 still in accepted after DenyNKey")
 		}
 	}
-	ksDenied := GetNKeysByType("denied")
+	ksDenied := GetNKeysByType(currentTenantID(), "denied")
 	found = false
 	for _, s := range ksDenied.Sprouts {
 		if s.SproutID == "flip01" {
@@ -679,7 +679,7 @@ func TestUnacceptNKey_MoveFromAccepted(t *testing.T) {
 
 	writeKey(t, "accepted", "revoke01", "NKEY_REVOKE")
 
-	err := UnacceptNKey("revoke01", "")
+	err := UnacceptNKey(currentTenantID(), "revoke01", "")
 	if err != nil {
 		t.Fatalf("UnacceptNKey failed: %v", err)
 	}
@@ -694,7 +694,7 @@ func TestUnacceptNKey_AlreadyUnaccepted(t *testing.T) {
 
 	writeKey(t, "unaccepted", "already01", "NKEY_ALREADY")
 
-	err := UnacceptNKey("already01", "")
+	err := UnacceptNKey(currentTenantID(), "already01", "")
 	if !errors.Is(err, ErrAlreadyUnaccepted) {
 		t.Errorf("expected ErrAlreadyUnaccepted, got: %v", err)
 	}
@@ -981,7 +981,7 @@ func TestPutNKey_ServerError(t *testing.T) {
 func TestDenyNKey_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	err := DenyNKey("-invalid")
+	err := DenyNKey(currentTenantID(), "-invalid")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -990,7 +990,7 @@ func TestDenyNKey_InvalidID(t *testing.T) {
 func TestDenyNKey_NotFound(t *testing.T) {
 	setupTestPKI(t)
 
-	err := DenyNKey("ghost")
+	err := DenyNKey(currentTenantID(), "ghost")
 	if !errors.Is(err, ErrSproutIDNotFound) {
 		t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 	}
@@ -999,7 +999,7 @@ func TestDenyNKey_NotFound(t *testing.T) {
 func TestRejectNKey_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	err := RejectNKey("-invalid", "")
+	err := RejectNKey(currentTenantID(), "-invalid", "")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -1008,7 +1008,7 @@ func TestRejectNKey_InvalidID(t *testing.T) {
 func TestRejectNKey_NotFound(t *testing.T) {
 	setupTestPKI(t)
 
-	err := RejectNKey("ghost", "")
+	err := RejectNKey(currentTenantID(), "ghost", "")
 	if !errors.Is(err, ErrSproutIDNotFound) {
 		t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 	}
@@ -1030,13 +1030,13 @@ func TestAcceptNKey_WithSuffix(t *testing.T) {
 	// Create the suffixed key.
 	writeKey(t, "unaccepted", "web01_2", "NKEY_WEB01_2")
 
-	err := AcceptNKey("web01_2")
+	err := AcceptNKey(currentTenantID(), "web01_2")
 	if err != nil {
 		t.Fatalf("AcceptNKey with suffix failed: %v", err)
 	}
 
 	// Should be accepted as "web01" (base name).
-	key, err := GetNKey("web01")
+	key, err := GetNKey(currentTenantID(), "web01")
 	if err != nil {
 		t.Fatalf("expected key at base id: %v", err)
 	}
@@ -1050,7 +1050,7 @@ func TestNKeyExists_Mismatch(t *testing.T) {
 
 	writeKey(t, "accepted", "unreadable01", "SECRET")
 
-	registered, matches := NKeyExists("unreadable01", "WRONG")
+	registered, matches := NKeyExists(currentTenantID(), "unreadable01", "WRONG")
 	if !registered {
 		t.Error("expected registered=true")
 	}
@@ -1086,7 +1086,7 @@ func generateSelfSignedCertPEM(t *testing.T) []byte {
 func TestFindNKeyRow_InvalidID(t *testing.T) {
 	setupTestPKI(t)
 
-	_, err := findNKeyRow("-bad")
+	_, err := findNKeyRowInTenant(tenantID(), "-bad")
 	if !errors.Is(err, ErrSproutIDInvalid) {
 		t.Errorf("expected ErrSproutIDInvalid, got: %v", err)
 	}
@@ -1189,13 +1189,13 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	setupTestPKI(t)
 
 	// 1. Register as unaccepted.
-	err := UnacceptNKey("lifecycle01", "NKEY_LIFE")
+	err := UnacceptNKey(currentTenantID(), "lifecycle01", "NKEY_LIFE")
 	if err != nil {
 		t.Fatalf("UnacceptNKey: %v", err)
 	}
 
 	// 2. Accept.
-	err = AcceptNKey("lifecycle01")
+	err = AcceptNKey(currentTenantID(), "lifecycle01")
 	if err != nil {
 		t.Fatalf("AcceptNKey: %v", err)
 	}
@@ -1204,7 +1204,7 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	}
 
 	// 3. Reject.
-	err = RejectNKey("lifecycle01", "")
+	err = RejectNKey(currentTenantID(), "lifecycle01", "")
 	if err != nil {
 		t.Fatalf("RejectNKey: %v", err)
 	}
@@ -1213,7 +1213,7 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	}
 
 	// 4. Unaccept again.
-	err = UnacceptNKey("lifecycle01", "")
+	err = UnacceptNKey(currentTenantID(), "lifecycle01", "")
 	if err != nil {
 		t.Fatalf("UnacceptNKey (from rejected): %v", err)
 	}
@@ -1222,11 +1222,11 @@ func TestKeyLifecycle_FullCycle(t *testing.T) {
 	}
 
 	// 5. Delete.
-	err = DeleteNKey("lifecycle01")
+	err = DeleteNKey(currentTenantID(), "lifecycle01")
 	if err != nil {
 		t.Fatalf("DeleteNKey: %v", err)
 	}
-	if _, err := GetNKey("lifecycle01"); !errors.Is(err, ErrSproutIDNotFound) {
+	if _, err := GetNKey(currentTenantID(), "lifecycle01"); !errors.Is(err, ErrSproutIDNotFound) {
 		t.Error("expected key removed after delete")
 	}
 }
@@ -1238,7 +1238,7 @@ func TestSproutIDForNKey(t *testing.T) {
 	writeKey(t, "unaccepted", "web02", "UDEF456")
 
 	t.Run("accepted sprout resolves", func(t *testing.T) {
-		id, err := SproutIDForNKey("UABC123")
+		id, err := SproutIDForNKey(currentTenantID(), "UABC123")
 		if err != nil {
 			t.Fatalf("SproutIDForNKey failed: %v", err)
 		}
@@ -1248,14 +1248,14 @@ func TestSproutIDForNKey(t *testing.T) {
 	})
 
 	t.Run("unaccepted sprout does not resolve", func(t *testing.T) {
-		_, err := SproutIDForNKey("UDEF456")
+		_, err := SproutIDForNKey(currentTenantID(), "UDEF456")
 		if !errors.Is(err, ErrSproutIDNotFound) {
 			t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 		}
 	})
 
 	t.Run("unknown key does not resolve", func(t *testing.T) {
-		_, err := SproutIDForNKey("UNKNOWN")
+		_, err := SproutIDForNKey(currentTenantID(), "UNKNOWN")
 		if !errors.Is(err, ErrSproutIDNotFound) {
 			t.Errorf("expected ErrSproutIDNotFound, got: %v", err)
 		}

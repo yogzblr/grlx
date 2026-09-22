@@ -37,7 +37,7 @@ func TestGetPropsExportedWithExpiredEntries(t *testing.T) {
 	newTestDB(t)
 
 	// Short TTL prop.
-	setPropWithTTL("exp-sprout", "temp", "gone", 1*time.Millisecond)
+	setPropWithTTL(tenantID(), "exp-sprout", "temp", "gone", 1*time.Millisecond)
 	// Long TTL prop.
 	SetProp("exp-sprout", "stable", "here")
 

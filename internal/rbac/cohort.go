@@ -401,7 +401,7 @@ func (r *Registry) resolve(name string, allSproutIDs []string, visited map[strin
 	case CohortTypeStatic:
 		return resolveStatic(c), nil
 	case CohortTypeDynamic:
-		return resolveDynamic(c, allSproutIDs), nil
+		return resolveDynamic(r.tenantID, c, allSproutIDs), nil
 	case CohortTypeCompound:
 		return r.resolveCompound(c, allSproutIDs, visited, depth)
 	default:
@@ -417,10 +417,16 @@ func resolveStatic(c *Cohort) map[string]bool {
 	return result
 }
 
-func resolveDynamic(c *Cohort, allSproutIDs []string) map[string]bool {
+// resolveDynamic evaluates a dynamic cohort's membership by reading each
+// candidate sprout's properties within tenantID — the calling Registry's
+// own tenant (see Registry.tenantID), not props' package-global seam. A
+// Registry explicitly constructed for tenant A must never resolve
+// membership against tenant B's (or the legacy tenant's) prop values; see
+// docs/design/grlx-tenant-context-threading.md.
+func resolveDynamic(tenantID string, c *Cohort, allSproutIDs []string) map[string]bool {
 	result := make(map[string]bool)
 	for _, sproutID := range allSproutIDs {
-		getProp := props.GetStringPropFunc(sproutID)
+		getProp := props.GetStringPropFuncForTenant(tenantID, sproutID)
 		val := getProp(c.Match.PropName)
 		if matchesPropValue(val, c.Match.PropValue) {
 			result[sproutID] = true

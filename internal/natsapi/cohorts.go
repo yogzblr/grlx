@@ -84,7 +84,7 @@ func handleCohortsGet(params json.RawMessage) (any, error) {
 	}
 
 	// Resolve current membership for the detail view.
-	allKeys := pki.ListNKeysByType()
+	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)
@@ -124,7 +124,7 @@ func handleCohortsResolve(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("cohort name is required")
 	}
 
-	allKeys := pki.ListNKeysByType()
+	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)
@@ -169,7 +169,7 @@ func handleCohortsRefresh(params json.RawMessage) (any, error) {
 		}
 	}
 
-	allKeys := pki.ListNKeysByType()
+	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)

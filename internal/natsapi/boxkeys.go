@@ -37,7 +37,7 @@ func handlePKIRotateBoxKey(params json.RawMessage) (any, error) {
 	if km.SproutID == "" {
 		return nil, fmt.Errorf("id is required")
 	}
-	registered, _ := pki.NKeyExists(km.SproutID, "")
+	registered, _ := pki.NKeyExists(pki.CurrentTenantID(), km.SproutID, "")
 	if !registered {
 		return nil, fmt.Errorf("unknown sprout: %s", km.SproutID)
 	}
@@ -80,7 +80,7 @@ func handleBoxKeySubmit(msg *nats.Msg) {
 		log.Errorf("boxkeys: empty pub in submission from %s", sproutID)
 		return
 	}
-	if err := pki.RotateSproutBoxKey(sproutID, req.Pub, config.BoxKeyGraceDuration); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), sproutID, req.Pub, config.BoxKeyGraceDuration); err != nil {
 		log.Errorf("boxkeys: failed to record new box key for %s: %v", sproutID, err)
 		return
 	}

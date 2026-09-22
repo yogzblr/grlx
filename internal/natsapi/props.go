@@ -22,7 +22,7 @@ func handlePropsGetAll(params json.RawMessage) (any, error) {
 	if p.SproutID == "" {
 		return nil, fmt.Errorf("sprout_id is required")
 	}
-	allProps := props.GetProps(p.SproutID)
+	allProps := props.GetPropsForTenant(props.CurrentTenantID(), p.SproutID)
 	if allProps == nil {
 		allProps = make(map[string]interface{})
 	}
@@ -37,7 +37,7 @@ func handlePropsGet(params json.RawMessage) (any, error) {
 	if p.SproutID == "" || p.Name == "" {
 		return nil, fmt.Errorf("sprout_id and name are required")
 	}
-	value := props.GetStringProp(p.SproutID, p.Name)
+	value := props.GetStringPropForTenant(props.CurrentTenantID(), p.SproutID, p.Name)
 	return map[string]string{
 		"sprout_id": p.SproutID,
 		"name":      p.Name,
@@ -53,7 +53,7 @@ func handlePropsSet(params json.RawMessage) (any, error) {
 	if p.SproutID == "" || p.Name == "" {
 		return nil, fmt.Errorf("sprout_id and name are required")
 	}
-	if err := props.SetProp(p.SproutID, p.Name, p.Value); err != nil {
+	if err := props.SetPropForTenant(props.CurrentTenantID(), p.SproutID, p.Name, p.Value); err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil
@@ -67,7 +67,7 @@ func handlePropsDelete(params json.RawMessage) (any, error) {
 	if p.SproutID == "" || p.Name == "" {
 		return nil, fmt.Errorf("sprout_id and name are required")
 	}
-	if err := props.DeleteProp(p.SproutID, p.Name); err != nil {
+	if err := props.DeletePropForTenant(props.CurrentTenantID(), p.SproutID, p.Name); err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil

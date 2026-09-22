@@ -32,7 +32,7 @@ func handleCook(params json.RawMessage) (any, error) {
 		if !pki.IsValidSproutID(target.SproutID) || strings.Contains(target.SproutID, "_") {
 			return nil, fmt.Errorf("invalid sprout ID: %s", target.SproutID)
 		}
-		registered, _ := pki.NKeyExists(target.SproutID, "")
+		registered, _ := pki.NKeyExists(pki.CurrentTenantID(), target.SproutID, "")
 		if !registered {
 			return nil, fmt.Errorf("unknown sprout: %s", target.SproutID)
 		}

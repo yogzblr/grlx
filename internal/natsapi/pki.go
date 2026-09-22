@@ -7,7 +7,7 @@ import (
 )
 
 func handlePKIList(_ json.RawMessage) (any, error) {
-	return pki.ListNKeysByType(), nil
+	return pki.ListNKeysByType(pki.CurrentTenantID()), nil
 }
 
 func handlePKIAccept(params json.RawMessage) (any, error) {
@@ -15,7 +15,7 @@ func handlePKIAccept(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.AcceptNKey(km.SproutID)
+	err := pki.AcceptNKey(pki.CurrentTenantID(), km.SproutID)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +27,7 @@ func handlePKIReject(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.RejectNKey(km.SproutID, "")
+	err := pki.RejectNKey(pki.CurrentTenantID(), km.SproutID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +39,7 @@ func handlePKIDeny(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.DenyNKey(km.SproutID)
+	err := pki.DenyNKey(pki.CurrentTenantID(), km.SproutID)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +51,7 @@ func handlePKIUnaccept(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.UnacceptNKey(km.SproutID, "")
+	err := pki.UnacceptNKey(pki.CurrentTenantID(), km.SproutID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func handlePKIDelete(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.DeleteNKey(km.SproutID)
+	err := pki.DeleteNKey(pki.CurrentTenantID(), km.SproutID)
 	if err != nil {
 		return nil, err
 	}
