@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources revision="1.0" schemaVersion="1.0" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName/>
+  <description/>
+  <resources>
+    <stringTable>
+      <string id="TestCategory">Test Category</string>
+      <string id="ExampleBoolean">Example Boolean Policy</string>
+      <string id="ExampleBoolean_Help">Enables or disables the example feature.</string>
+      <string id="ExampleList">Example List Policy</string>
+      <string id="ExampleList_Help">Sets a pair of related values together.</string>
+      <string id="ExampleElements">Example Elements Policy</string>
+      <string id="ExampleElements_Help">Demonstrates boolean/decimal/text elements.</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="ExampleBoolean"/>
+      <presentation id="ExampleList"/>
+      <presentation id="ExampleElements">
+        <checkBox refId="MyBool">Enable My Bool</checkBox>
+        <decimalTextBox refId="MyNum">Max retries:</decimalTextBox>
+        <textBox refId="MyText"><label>Custom text:</label></textBox>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>
