@@ -46,10 +46,10 @@ func WithTargetStep(id StepID) CookOption {
 	}
 }
 
-func populateFuncMap(sproutID string) template.FuncMap {
+func populateFuncMap(tenantID, sproutID string) template.FuncMap {
 	v := template.FuncMap{}
-	v["props"] = props.GetStringPropFunc(sproutID)
-	v["hostname"] = props.GetHostnameFunc(sproutID)
+	v["props"] = props.GetStringPropFuncForTenant(tenantID, sproutID)
+	v["hostname"] = props.GetHostnameFuncForTenant(tenantID, sproutID)
 
 	// Environment variable access.
 	v["env"] = os.Getenv
@@ -100,7 +100,7 @@ func populateFuncMap(sproutID string) template.FuncMap {
 // process.
 func SendCookEvent(tenantID, sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
 	basepath := getBasePath()
-	includes, err := collectAllIncludes(sproutID, basepath, recipeID)
+	includes, err := collectAllIncludes(tenantID, sproutID, basepath, recipeID)
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func SendCookEvent(tenantID, sproutID string, recipeID RecipeName, JID string, t
 		if fpErr != nil {
 			return fpErr
 		}
-		b, renderErr := renderRecipeTemplate(sproutID, fp, f)
+		b, renderErr := renderRecipeTemplate(tenantID, sproutID, fp, f)
 		if renderErr != nil {
 			return renderErr
 		}

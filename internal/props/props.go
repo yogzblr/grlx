@@ -149,6 +149,15 @@ func GetHostnameFunc(sproutID string) func() string {
 	}
 }
 
+// GetHostnameFuncForTenant is GetHostnameFunc scoped to an explicit tenant
+// instead of the package's current-tenant seam — see
+// GetStringPropFuncForTenant.
+func GetHostnameFuncForTenant(tenantID, sproutID string) func() string {
+	return func() string {
+		return hostname(sproutID)
+	}
+}
+
 func hostname(sproutID string) string {
 	hostname, err := os.Hostname()
 	if err != nil {

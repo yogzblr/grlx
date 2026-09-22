@@ -65,13 +65,13 @@ func TestRegisterFarmerListener_ValidFacts(t *testing.T) {
 	nc.Flush()
 	time.Sleep(100 * time.Millisecond)
 
-	if got := props.GetStringProp("sprout-listener-test", "os"); got != "linux" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-listener-test", "os"); got != "linux" {
 		t.Errorf("expected os=linux, got %q", got)
 	}
-	if got := props.GetStringProp("sprout-listener-test", "hostname"); got != "listener-test-host" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-listener-test", "hostname"); got != "listener-test-host" {
 		t.Errorf("expected hostname=listener-test-host, got %q", got)
 	}
-	if got := props.GetStringProp("sprout-listener-test", "num_cpu"); got != "4" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-listener-test", "num_cpu"); got != "4" {
 		t.Errorf("expected num_cpu=4, got %q", got)
 	}
 }
@@ -102,7 +102,7 @@ func TestRegisterFarmerListener_EmptySproutID(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Props should not have been stored for empty sprout ID.
-	if got := props.GetStringProp("", "os"); got != "" {
+	if got := props.GetStringPropForTenant("t_test", "", "os"); got != "" {
 		t.Errorf("expected empty prop for empty sprout ID, got %q", got)
 	}
 }
@@ -191,7 +191,7 @@ func TestRegisterFarmerListener_UsesQueueGroup(t *testing.T) {
 	// Between the primary listener and the simulated replica, every event
 	// was still handled by exactly one queue member — the primary
 	// listener processed its share and stored the props.
-	if got := props.GetStringProp("sprout-queue-group-test", "hostname"); got != "queue-group-host" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-queue-group-test", "hostname"); got != "queue-group-host" {
 		t.Errorf("expected hostname=queue-group-host, got %q", got)
 	}
 }
@@ -225,13 +225,13 @@ func TestRegisterFarmerListener_MultipleSprouts(t *testing.T) {
 	nc.Flush()
 	time.Sleep(150 * time.Millisecond)
 
-	if got := props.GetStringProp("sprout-a", "os"); got != "linux" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-a", "os"); got != "linux" {
 		t.Errorf("sprout-a os: expected linux, got %q", got)
 	}
-	if got := props.GetStringProp("sprout-b", "os"); got != "darwin" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-b", "os"); got != "darwin" {
 		t.Errorf("sprout-b os: expected darwin, got %q", got)
 	}
-	if got := props.GetStringProp("sprout-c", "hostname"); got != "host-c" {
+	if got := props.GetStringPropForTenant("t_test", "sprout-c", "hostname"); got != "host-c" {
 		t.Errorf("sprout-c hostname: expected host-c, got %q", got)
 	}
 }

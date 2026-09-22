@@ -23,10 +23,14 @@ const natsCoreQueueGroup = "grlx-core"
 // docs/design/grlx-tenant-context-threading.md's Option A; called once per
 // tenant connection by cmd/farmer/main.go, so every tenant's facts traffic
 // reaches farmer, not just the legacy tenant's) — and stores them as props
-// on the farmer side. Fact storage itself (internal/props) stays on the
-// bare, legacy-tenant-scoped functions: giving fact ingestion real
-// per-tenant prop scoping is a separate, larger workstream outside this
-// task's file scope (see the design doc's own carve-out for this package).
+// on the farmer side, scoped to tenantID via props.SetPropForTenant. Before
+// this, fact storage stayed on the bare, legacy-tenant-scoped functions
+// regardless of which tenant connection a fact arrived on — inert while
+// farmer only had one shared connection, but a live cross-tenant leak once
+// each tenant got its own connection (this same design doc's Option A):
+// every tenant's facts landed under the legacy tenant, so a real tenant's
+// own prop queries found nothing and the legacy tenant's view silently
+// accumulated everyone else's facts.
 //
 // This used to intentionally use plain Subscribe (fan-out), not
 // QueueSubscribe, on the reasoning that props.SetProp wrote into an
@@ -52,7 +56,7 @@ func RegisterFarmerListener(tenantID string, nc *nats.Conn) {
 			log.Error("facts: received facts with empty sprout ID")
 			return
 		}
-		storeFacts(sf)
+		storeFacts(tenantID, sf)
 		log.Noticef("facts: received system facts from %s (os=%s arch=%s)", sf.SproutID, sf.OS, sf.Arch)
 	})
 	if err != nil {
@@ -60,24 +64,27 @@ func RegisterFarmerListener(tenantID string, nc *nats.Conn) {
 	}
 }
 
-// storeFacts writes system facts into the props store.
-func storeFacts(sf SystemFacts) {
+// storeFacts writes system facts into the props store, scoped to tenantID
+// — the tenant of the per-tenant NATS connection the facts arrived on (see
+// RegisterFarmerListener), not the bare, legacy-tenant-scoped seam.
+func storeFacts(tenantID string, sf SystemFacts) {
 	sid := sf.SproutID
-	props.SetProp(sid, "os", sf.OS)
-	props.SetProp(sid, "arch", sf.Arch)
-	props.SetProp(sid, "hostname", sf.Hostname)
-	props.SetProp(sid, "go_version", sf.GoVersion)
-	props.SetProp(sid, "num_cpu", fmt.Sprintf("%d", sf.NumCPU))
+	props.SetPropForTenant(tenantID, sid, "os", sf.OS)
+	props.SetPropForTenant(tenantID, sid, "arch", sf.Arch)
+	props.SetPropForTenant(tenantID, sid, "hostname", sf.Hostname)
+	props.SetPropForTenant(tenantID, sid, "go_version", sf.GoVersion)
+	props.SetPropForTenant(tenantID, sid, "num_cpu", fmt.Sprintf("%d", sf.NumCPU))
 	if len(sf.IPAddresses) > 0 {
 		ipsJSON, _ := json.Marshal(sf.IPAddresses)
-		props.SetProp(sid, "ip_addresses", string(ipsJSON))
+		props.SetPropForTenant(tenantID, sid, "ip_addresses", string(ipsJSON))
 	}
-	storeHardwareFacts(sid, sf.Hardware)
+	storeHardwareFacts(tenantID, sid, sf.Hardware)
 }
 
 // storeHardwareFacts writes non-empty hardware/BIOS facts into the props
-// store. hw is nil when the sprout couldn't reach its SMBIOS table.
-func storeHardwareFacts(sid string, hw *HardwareFacts) {
+// store, scoped to tenantID. hw is nil when the sprout couldn't reach its
+// SMBIOS table.
+func storeHardwareFacts(tenantID, sid string, hw *HardwareFacts) {
 	if hw == nil || hw.IsZero() {
 		return
 	}
@@ -98,6 +105,6 @@ func storeHardwareFacts(sid string, hw *HardwareFacts) {
 		if value == "" {
 			continue
 		}
-		props.SetProp(sid, key, value)
+		props.SetPropForTenant(tenantID, sid, key, value)
 	}
 }

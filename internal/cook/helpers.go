@@ -139,7 +139,7 @@ func recipeToStep(id string, recipe map[string]interface{}) (Step, error) {
 	return Step{}, errors.New("error: recipe must have exactly one key")
 }
 
-func collectAllIncludes(sproutID, basepath string, recipeID RecipeName) ([]RecipeName, error) {
+func collectAllIncludes(tenantID, sproutID, basepath string, recipeID RecipeName) ([]RecipeName, error) {
 	// pass in an ID to a Recipe
 	recipeFilePath, err := ResolveRecipeFilePath(basepath, recipeID)
 	if err != nil {
@@ -150,7 +150,7 @@ func collectAllIncludes(sproutID, basepath string, recipeID RecipeName) ([]Recip
 		return []RecipeName{}, err
 	}
 	// parse file imports
-	starterIncludes, err := extractIncludes(sproutID, basepath, string(recipeID), f)
+	starterIncludes, err := extractIncludes(tenantID, sproutID, basepath, string(recipeID), f)
 	if err != nil {
 		return []RecipeName{}, err
 	}
@@ -159,7 +159,7 @@ func collectAllIncludes(sproutID, basepath string, recipeID RecipeName) ([]Recip
 	for _, si := range starterIncludes {
 		includeSet[si] = false
 	}
-	includeSet, err = collectIncludesRecurse(sproutID, basepath, includeSet)
+	includeSet, err = collectIncludesRecurse(tenantID, sproutID, basepath, includeSet)
 	if err != nil {
 		return []RecipeName{}, err
 	}
@@ -407,8 +407,8 @@ func getBasePath() string {
 	return config.RecipeDir
 }
 
-func extractIncludes(sproutID, basepath, recipePath string, file []byte) ([]RecipeName, error) {
-	recipeBytes, err := renderRecipeTemplate(sproutID, recipePath, file)
+func extractIncludes(tenantID, sproutID, basepath, recipePath string, file []byte) ([]RecipeName, error) {
+	recipeBytes, err := renderRecipeTemplate(tenantID, sproutID, recipePath, file)
 	if err != nil {
 		return []RecipeName{}, err
 	}
@@ -434,9 +434,9 @@ func extractIncludes(sproutID, basepath, recipePath string, file []byte) ([]Reci
 	return includeList, nil
 }
 
-func renderRecipeTemplate(sproutID, recipeName string, file []byte) ([]byte, error) {
+func renderRecipeTemplate(tenantID, sproutID, recipeName string, file []byte) ([]byte, error) {
 	temp := template.New(recipeName)
-	gFuncs := populateFuncMap(sproutID)
+	gFuncs := populateFuncMap(tenantID, sproutID)
 	temp.Funcs(gFuncs)
 	rt, err := temp.Parse(string(file))
 	if err != nil {
@@ -457,7 +457,7 @@ func unmarshalRecipe(recipe []byte) (map[string]interface{}, error) {
 	return rmap, err
 }
 
-func collectIncludesRecurse(sproutID, basepath string, starter map[RecipeName]bool) (map[RecipeName]bool, error) {
+func collectIncludesRecurse(tenantID, sproutID, basepath string, starter map[RecipeName]bool) (map[RecipeName]bool, error) {
 	allIncluded := false
 	for !allIncluded {
 		allIncluded = true
@@ -474,7 +474,7 @@ func collectIncludesRecurse(sproutID, basepath string, starter map[RecipeName]bo
 					return starter, err
 				}
 				// parse file imports
-				eIncludes, err := extractIncludes(sproutID, basepath, string(inc), f)
+				eIncludes, err := extractIncludes(tenantID, sproutID, basepath, string(inc), f)
 				if err != nil {
 					return starter, err
 				}
@@ -484,7 +484,7 @@ func collectIncludesRecurse(sproutID, basepath string, starter map[RecipeName]bo
 					}
 				}
 
-				newIncludes, err := collectIncludesRecurse(sproutID, basepath, starter)
+				newIncludes, err := collectIncludesRecurse(tenantID, sproutID, basepath, starter)
 				if err != nil {
 					return newIncludes, err
 				}

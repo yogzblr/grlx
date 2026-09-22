@@ -17,6 +17,19 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/props"
 )
 
+// testPropsTenantID is the tenant used by this package's existing
+// props/template tests that aren't specifically about tenant isolation
+// (see TestRenderRecipeTemplate_TenantIsolation in template_props_test.go
+// for that one) — it matches props' bare, legacy-tenant-scoped functions'
+// implicit tenant (tenantID() in internal/props/store.go, "default" here
+// since config.FarmerOrganization is never set in this package's tests),
+// so prop fixtures written via the existing bare props.SetProp calls stay
+// visible once tenantID is threaded through the render chain. Distinct
+// from cook_coverage_test.go's own testTenantID ("t_test"), which scopes
+// SendCookEvent's farmerConnFor NATS connection lookup instead — an
+// unrelated concern that predates this constant.
+const testPropsTenantID = "default"
+
 func TestMain(m *testing.M) {
 	// Set RecipeDir to the test fixtures directory
 	_, filename, _, _ := runtime.Caller(0)
