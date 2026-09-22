@@ -58,10 +58,10 @@ func addCmdTestSprout(t *testing.T, _, state, id, nkey string) {
 	if state != "accepted" {
 		t.Fatalf("addCmdTestSprout: unsupported state %q", state)
 	}
-	if err := pki.UnacceptNKey(id, nkey); err != nil {
+	if err := pki.UnacceptNKey(pki.CurrentTenantID(), id, nkey); err != nil {
 		t.Fatalf("UnacceptNKey(%q): %v", id, err)
 	}
-	if err := pki.AcceptNKey(id); err != nil {
+	if err := pki.AcceptNKey(pki.CurrentTenantID(), id); err != nil {
 		t.Fatalf("AcceptNKey(%q): %v", id, err)
 	}
 }

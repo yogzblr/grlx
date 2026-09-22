@@ -149,25 +149,25 @@ func writeNKey(t *testing.T, _, state, sproutID, nkey string) {
 	t.Helper()
 	switch state {
 	case "unaccepted":
-		if err := pki.UnacceptNKey(sproutID, nkey); err != nil {
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
 			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
 		}
 	case "accepted":
-		if err := pki.UnacceptNKey(sproutID, nkey); err != nil {
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
 			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
 		}
-		if err := pki.AcceptNKey(sproutID); err != nil {
+		if err := pki.AcceptNKey(pki.CurrentTenantID(), sproutID); err != nil {
 			t.Fatalf("AcceptNKey(%q): %v", sproutID, err)
 		}
 	case "denied":
-		if err := pki.UnacceptNKey(sproutID, nkey); err != nil {
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
 			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
 		}
-		if err := pki.DenyNKey(sproutID); err != nil {
+		if err := pki.DenyNKey(pki.CurrentTenantID(), sproutID); err != nil {
 			t.Fatalf("DenyNKey(%q): %v", sproutID, err)
 		}
 	case "rejected":
-		if err := pki.RejectNKey(sproutID, nkey); err != nil {
+		if err := pki.RejectNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
 			t.Fatalf("RejectNKey(%q): %v", sproutID, err)
 		}
 	default:
@@ -235,7 +235,7 @@ func TestHandlePKIAccept(t *testing.T) {
 	}
 
 	// Verify key moved to accepted.
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	found := false
 	for _, km := range keys.Accepted.Sprouts {
 		if km.SproutID == "sprout-new" {
@@ -283,7 +283,7 @@ func TestHandlePKIReject(t *testing.T) {
 		t.Fatal("expected success=true")
 	}
 
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	for _, km := range keys.Accepted.Sprouts {
 		if km.SproutID == "sprout-rej" {
 			t.Error("sprout-rej still in accepted after reject")
@@ -316,7 +316,7 @@ func TestHandlePKIDeny(t *testing.T) {
 		t.Fatal("expected success=true")
 	}
 
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	found := false
 	for _, km := range keys.Denied.Sprouts {
 		if km.SproutID == "sprout-deny" {
@@ -381,7 +381,7 @@ func TestHandlePKIDelete(t *testing.T) {
 	}
 
 	// Verify key is gone from all states.
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	for _, km := range keys.Unaccepted.Sprouts {
 		if km.SproutID == "sprout-del" {
 			t.Error("sprout-del still exists after delete")
@@ -559,7 +559,7 @@ func TestResolveKeyState(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := resolveKeyState(tt.id)
+		got := resolveKeyState(pki.CurrentTenantID(), tt.id)
 		if got != tt.want {
 			t.Errorf("resolveKeyState(%q) = %q, want %q", tt.id, got, tt.want)
 		}
@@ -573,7 +573,7 @@ func TestProbeSproutNoConn(t *testing.T) {
 	natsConn = nil
 	defer func() { natsConn = old }()
 
-	if probeSprout("any-sprout") {
+	if probeSprout("acme", "any-sprout") {
 		t.Error("expected false when natsConn is nil")
 	}
 }

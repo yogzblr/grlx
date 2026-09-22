@@ -125,14 +125,13 @@ func upsertSproutBoxKeyActive(tenantID, sproutID, pub string) error {
 // keep decrypting correctly until the window closes. Idempotent: rotating
 // to a key that is already active is a no-op, so a sprout retrying a
 // dropped rotation confirmation doesn't grace its own current key.
-func RotateSproutBoxKey(sproutID, newPub string, graceDuration time.Duration) error {
+func RotateSproutBoxKey(tenantID, sproutID, newPub string, graceDuration time.Duration) error {
 	if _, err := decodeBoxPub(newPub); err != nil {
 		return err
 	}
-	tid := tenantID()
 	return db.Transaction(func(tx *gorm.DB) error {
 		var rows []sproutBoxKeyRow
-		if err := tx.Where("tenant_id = ? AND sprout_id = ? AND state = ?", tid, sproutID, boxKeyStateActive).
+		if err := tx.Where("tenant_id = ? AND sprout_id = ? AND state = ?", tenantID, sproutID, boxKeyStateActive).
 			Find(&rows).Error; err != nil {
 			return err
 		}
@@ -144,7 +143,7 @@ func RotateSproutBoxKey(sproutID, newPub string, graceDuration time.Duration) er
 		graceUntil := time.Now().UTC().Add(graceDuration)
 		for _, r := range rows {
 			if err := tx.Model(&sproutBoxKeyRow{}).
-				Where("tenant_id = ? AND sprout_id = ? AND pub = ?", tid, sproutID, r.Pub).
+				Where("tenant_id = ? AND sprout_id = ? AND pub = ?", tenantID, sproutID, r.Pub).
 				Updates(map[string]any{"state": boxKeyStateGrace, "grace_until": graceUntil}).Error; err != nil {
 				return err
 			}
@@ -153,7 +152,7 @@ func RotateSproutBoxKey(sproutID, newPub string, graceDuration time.Duration) er
 			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "sprout_id"}, {Name: "pub"}},
 			DoUpdates: clause.AssignmentColumns([]string{"state", "grace_until"}),
 		}).Create(&sproutBoxKeyRow{
-			TenantID: tid, SproutID: sproutID, Pub: newPub, State: boxKeyStateActive, GraceUntil: nil,
+			TenantID: tenantID, SproutID: sproutID, Pub: newPub, State: boxKeyStateActive, GraceUntil: nil,
 		}).Error
 	})
 }
@@ -173,12 +172,11 @@ func RotateSproutBoxKey(sproutID, newPub string, graceDuration time.Duration) er
 // result either way (the query below only asks for grace_until in the
 // future), so it doesn't affect correctness, only how long a stale
 // "grace" label lingers for admin listing purposes.
-func ValidSproutBoxKeys(sproutID string) (active string, grace []string, err error) {
-	tid := tenantID()
+func ValidSproutBoxKeys(tenantID, sproutID string) (active string, grace []string, err error) {
 	now := time.Now().UTC()
 
 	if sweepErr := db.Model(&sproutBoxKeyRow{}).
-		Where("tenant_id = ? AND sprout_id = ? AND state = ? AND grace_until <= ?", tid, sproutID, boxKeyStateGrace, now).
+		Where("tenant_id = ? AND sprout_id = ? AND state = ? AND grace_until <= ?", tenantID, sproutID, boxKeyStateGrace, now).
 		Update("state", boxKeyStateRevoked).Error; sweepErr != nil {
 		log.Warnf("pki: failed to sweep expired grace-period box keys for sprout %s: %v", sproutID, sweepErr)
 	}
@@ -186,7 +184,7 @@ func ValidSproutBoxKeys(sproutID string) (active string, grace []string, err err
 	var rows []sproutBoxKeyRow
 	if err := db.Where(
 		"tenant_id = ? AND sprout_id = ? AND (state = ? OR (state = ? AND grace_until > ?))",
-		tid, sproutID, boxKeyStateActive, boxKeyStateGrace, now,
+		tenantID, sproutID, boxKeyStateActive, boxKeyStateGrace, now,
 	).Find(&rows).Error; err != nil {
 		return "", nil, err
 	}

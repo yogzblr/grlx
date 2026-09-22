@@ -149,9 +149,9 @@ func syncNatsAuth(mat *natsAuthMaterial) (bool, error) {
 		}
 	}
 
-	for _, s := range GetNKeysByType("accepted").Sprouts {
+	for _, s := range GetNKeysByType(currentTenantID(), "accepted").Sprouts {
 		log.Tracef("Syncing accepted sprout `%s` onto the tenant Account JWT", s.SproutID)
-		key, errGet := GetNKey(s.SproutID)
+		key, errGet := GetNKey(currentTenantID(), s.SproutID)
 		if errGet != nil {
 			log.Errorf("failed to get NKey for sprout %s: %v", s.SproutID, errGet)
 			continue
@@ -165,8 +165,8 @@ func syncNatsAuth(mat *natsAuthMaterial) (bool, error) {
 	}
 
 	for _, state := range []string{"unaccepted", "denied", "rejected"} {
-		for _, s := range GetNKeysByType(state).Sprouts {
-			key, errGet := GetNKey(s.SproutID)
+		for _, s := range GetNKeysByType(currentTenantID(), state).Sprouts {
+			key, errGet := GetNKey(currentTenantID(), s.SproutID)
 			if errGet != nil {
 				log.Errorf("failed to get NKey for sprout %s: %v", s.SproutID, errGet)
 				continue

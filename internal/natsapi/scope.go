@@ -113,7 +113,7 @@ func extractSproutsGetID(params json.RawMessage) ([]string, error) {
 // allAcceptedSproutIDs returns all accepted sprout IDs from the PKI store.
 // This is used by the cohort resolver to evaluate dynamic cohorts.
 func allAcceptedSproutIDs() []string {
-	allKeys := pki.ListNKeysByType()
+	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
 	ids := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		ids = append(ids, km.SproutID)

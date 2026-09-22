@@ -97,7 +97,7 @@ func TestHandleBoxKeySubmit_RecordsNewActiveKey(t *testing.T) {
 	}
 	handleBoxKeySubmit(msg)
 
-	active, _, err := pki.ValidSproutBoxKeys("web-01")
+	active, _, err := pki.ValidSproutBoxKeys(pki.CurrentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestHandleBoxKeySubmit_GracesThePreviousKey(t *testing.T) {
 	oldPub := testBoxPubForNatsAPI(t)
 	newPub := testBoxPubForNatsAPI(t)
 
-	if err := pki.RotateSproutBoxKey("web-01", oldPub, time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", oldPub, time.Hour); err != nil {
 		t.Fatalf("seeding initial key: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestHandleBoxKeySubmit_GracesThePreviousKey(t *testing.T) {
 	}
 	handleBoxKeySubmit(msg)
 
-	active, grace, err := pki.ValidSproutBoxKeys("web-01")
+	active, grace, err := pki.ValidSproutBoxKeys(pki.CurrentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestHandleBoxKeySubmit_IgnoresEmptyPub(t *testing.T) {
 	msg := &nats.Msg{Subject: SproutSubject("web-01", "boxkey.pub"), Data: mustMarshal(t, boxKeySubmitRequest{Pub: ""})}
 	handleBoxKeySubmit(msg)
 
-	if _, _, err := pki.ValidSproutBoxKeys("web-01"); err == nil {
+	if _, _, err := pki.ValidSproutBoxKeys(pki.CurrentTenantID(), "web-01"); err == nil {
 		t.Fatal("expected no box key to be recorded for an empty pub")
 	}
 }

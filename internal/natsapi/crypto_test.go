@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,7 +141,7 @@ func openAsSprout(t *testing.T, sprout sproutKeypair, tenantPub *[32]byte, data 
 func TestPublishEncryptedTo_NoConnection(t *testing.T) {
 	setupCryptoTest(t)
 	sprout := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-01", sprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", sprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding sprout box key: %v", err)
 	}
 
@@ -151,7 +152,7 @@ func TestPublishEncryptedTo_NoConnection(t *testing.T) {
 	type payload struct {
 		Msg string `json:"msg"`
 	}
-	if err := PublishEncryptedTo("web-01", "grlx.sprouts.web-01.test", payload{Msg: "hi"}); err == nil {
+	if err := PublishEncryptedTo(pki.CurrentTenantID(), "web-01", "grlx.sprouts.web-01.test", payload{Msg: "hi"}); err == nil {
 		t.Fatal("expected an error when no NATS connection is available")
 	}
 }
@@ -159,7 +160,7 @@ func TestPublishEncryptedTo_NoConnection(t *testing.T) {
 func TestSealForSprout_RoundTripsWithSprout(t *testing.T) {
 	setupCryptoTest(t)
 	sprout := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-01", sprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", sprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding sprout box key: %v", err)
 	}
 	tenantPub, _, err := pki.GetTenantX25519KeyPair()
@@ -167,7 +168,7 @@ func TestSealForSprout_RoundTripsWithSprout(t *testing.T) {
 		t.Fatalf("GetTenantX25519KeyPair: %v", err)
 	}
 
-	sealed, err := sealForSprout("web-01", []byte(`{"cmd":"reboot"}`))
+	sealed, err := sealForSprout(pki.CurrentTenantID(), "web-01", []byte(`{"cmd":"reboot"}`))
 	if err != nil {
 		t.Fatalf("sealForSprout: %v", err)
 	}
@@ -184,7 +185,7 @@ func TestSealForSprout_RoundTripsWithSprout(t *testing.T) {
 func TestOpenFromSprout_DecryptsRealSproutPayload(t *testing.T) {
 	setupCryptoTest(t)
 	sprout := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-01", sprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", sprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding sprout box key: %v", err)
 	}
 	tenantPub, _, err := pki.GetTenantX25519KeyPair()
@@ -197,7 +198,7 @@ func TestOpenFromSprout_DecryptsRealSproutPayload(t *testing.T) {
 	var out struct {
 		OS string `json:"os"`
 	}
-	if err := DecryptEncryptedFrom("web-01", sealed, &out); err != nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-01", sealed, &out); err != nil {
 		t.Fatalf("DecryptEncryptedFrom: %v", err)
 	}
 	if out.OS != "linux" {
@@ -209,12 +210,12 @@ func TestOpenFromSprout_GracePeriodStillDecrypts(t *testing.T) {
 	setupCryptoTest(t)
 	oldSprout := newSproutKeypair(t)
 	newSprout := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-01", oldSprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", oldSprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding initial sprout box key: %v", err)
 	}
 	// Rotate to a new key; the old one should remain valid for the grace
 	// window per the design doc's "Key rotation".
-	if err := pki.RotateSproutBoxKey("web-01", newSprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", newSprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("rotating sprout box key: %v", err)
 	}
 	tenantPub, _, err := pki.GetTenantX25519KeyPair()
@@ -226,7 +227,7 @@ func TestOpenFromSprout_GracePeriodStillDecrypts(t *testing.T) {
 	// must still decrypt.
 	sealed := sealAsSprout(t, oldSprout, tenantPub, []byte(`{"still":"valid"}`))
 	var out map[string]string
-	if err := DecryptEncryptedFrom("web-01", sealed, &out); err != nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-01", sealed, &out); err != nil {
 		t.Fatalf("expected the graced old key to still decrypt, got: %v", err)
 	}
 	if out["still"] != "valid" {
@@ -238,12 +239,12 @@ func TestOpenFromSprout_ExpiredGraceKeyFailsToDecrypt(t *testing.T) {
 	setupCryptoTest(t)
 	oldSprout := newSproutKeypair(t)
 	newSprout := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-01", oldSprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", oldSprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding initial sprout box key: %v", err)
 	}
 	// A negative grace duration means the old key's grace window has
 	// already closed by the time we try to use it.
-	if err := pki.RotateSproutBoxKey("web-01", newSprout.pubB64(), -time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", newSprout.pubB64(), -time.Hour); err != nil {
 		t.Fatalf("rotating sprout box key: %v", err)
 	}
 	tenantPub, _, err := pki.GetTenantX25519KeyPair()
@@ -252,7 +253,7 @@ func TestOpenFromSprout_ExpiredGraceKeyFailsToDecrypt(t *testing.T) {
 	}
 
 	sealed := sealAsSprout(t, oldSprout, tenantPub, []byte(`{"expired":"key"}`))
-	if err := DecryptEncryptedFrom("web-01", sealed, new(map[string]string)); err == nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-01", sealed, new(map[string]string)); err == nil {
 		t.Fatal("expected decryption under an expired grace-period key to fail")
 	}
 }
@@ -261,10 +262,10 @@ func TestOpenFromSprout_WrongSproutFailsToDecrypt(t *testing.T) {
 	setupCryptoTest(t)
 	sproutA := newSproutKeypair(t)
 	sproutB := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-a", sproutA.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-a", sproutA.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding sprout a box key: %v", err)
 	}
-	if err := pki.RotateSproutBoxKey("web-b", sproutB.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-b", sproutB.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding sprout b box key: %v", err)
 	}
 	tenantPub, _, err := pki.GetTenantX25519KeyPair()
@@ -275,7 +276,7 @@ func TestOpenFromSprout_WrongSproutFailsToDecrypt(t *testing.T) {
 	// Sealed as sprout A, but the farmer is told to decrypt it as if it
 	// came from sprout B (wrong key on the decrypt side).
 	sealed := sealAsSprout(t, sproutA, tenantPub, []byte(`{"x":"y"}`))
-	if err := DecryptEncryptedFrom("web-b", sealed, new(map[string]string)); err == nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-b", sealed, new(map[string]string)); err == nil {
 		t.Fatal("expected decryption against the wrong sprout's key to fail")
 	}
 }
@@ -283,7 +284,7 @@ func TestOpenFromSprout_WrongSproutFailsToDecrypt(t *testing.T) {
 func TestOpenFromSprout_TamperedCiphertextFails(t *testing.T) {
 	setupCryptoTest(t)
 	sprout := newSproutKeypair(t)
-	if err := pki.RotateSproutBoxKey("web-01", sprout.pubB64(), time.Hour); err != nil {
+	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), "web-01", sprout.pubB64(), time.Hour); err != nil {
 		t.Fatalf("seeding sprout box key: %v", err)
 	}
 	tenantPub, _, err := pki.GetTenantX25519KeyPair()
@@ -299,17 +300,93 @@ func TestOpenFromSprout_TamperedCiphertextFails(t *testing.T) {
 	env.Ciphertext[0] ^= 0xFF // flip a bit
 	tampered, _ := json.Marshal(env)
 
-	if err := DecryptEncryptedFrom("web-01", tampered, new(map[string]string)); err == nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-01", tampered, new(map[string]string)); err == nil {
 		t.Fatal("expected tampered ciphertext to fail authentication")
 	}
 }
 
 func TestOpenFromSprout_MalformedEnvelopeFails(t *testing.T) {
 	setupCryptoTest(t)
-	if err := DecryptEncryptedFrom("web-01", []byte("not json"), new(map[string]string)); err == nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-01", []byte("not json"), new(map[string]string)); err == nil {
 		t.Fatal("expected malformed envelope JSON to fail")
 	}
-	if err := DecryptEncryptedFrom("web-01", []byte(`{"n":"aGk=","c":"aGk="}`), new(map[string]string)); err == nil {
+	if err := DecryptEncryptedFrom(pki.CurrentTenantID(), "web-01", []byte(`{"n":"aGk=","c":"aGk="}`), new(map[string]string)); err == nil {
 		t.Fatal("expected a too-short nonce to fail")
+	}
+}
+
+// TestOpenFromSprout_TwoTenantsSameSproutID_DecryptConcurrentlyWithoutCrossing
+// exercises the box-key decrypt path (openFromSprout/ValidSproutBoxKeys)
+// against two distinct tenants that both happen to have accepted a sprout
+// under the exact same sprout ID ("web-01") with their own, different box
+// keys — a real scenario, since sprout IDs are chosen per tenant
+// independently. Both tenants' payloads are decrypted concurrently, not
+// asserted one after the other, and each must only ever decrypt under its
+// own tenant's key: this is the same tenant-scoping bug class PR #28 fixed
+// once for a different call site (see
+// docs/design/grlx-tenant-context-threading.md) — asserting a single
+// tenant twice would leave a regression back to the process-global
+// tenantID() seam invisible here exactly as it was before that fix.
+func TestOpenFromSprout_TwoTenantsSameSproutID_DecryptConcurrentlyWithoutCrossing(t *testing.T) {
+	setupCryptoTest(t)
+	const sproutID = "web-01"
+
+	sproutA := newSproutKeypair(t)
+	sproutB := newSproutKeypair(t)
+	if err := pki.RotateSproutBoxKey("t_a", sproutID, sproutA.pubB64(), time.Hour); err != nil {
+		t.Fatalf("seeding t_a's sprout box key: %v", err)
+	}
+	if err := pki.RotateSproutBoxKey("t_b", sproutID, sproutB.pubB64(), time.Hour); err != nil {
+		t.Fatalf("seeding t_b's sprout box key: %v", err)
+	}
+
+	tenantPub, _, err := pki.GetTenantX25519KeyPair()
+	if err != nil {
+		t.Fatalf("GetTenantX25519KeyPair: %v", err)
+	}
+
+	sealedA := sealAsSprout(t, sproutA, tenantPub, []byte(`{"tenant":"a"}`))
+	sealedB := sealAsSprout(t, sproutB, tenantPub, []byte(`{"tenant":"b"}`))
+
+	type result struct {
+		tenant string
+		out    map[string]string
+		err    error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		var out map[string]string
+		err := DecryptEncryptedFrom("t_a", sproutID, sealedA, &out)
+		results <- result{"t_a", out, err}
+	}()
+	go func() {
+		defer wg.Done()
+		var out map[string]string
+		err := DecryptEncryptedFrom("t_b", sproutID, sealedB, &out)
+		results <- result{"t_b", out, err}
+	}()
+	wg.Wait()
+	close(results)
+
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("DecryptEncryptedFrom(%s) failed: %v", r.tenant, r.err)
+		}
+		want := map[string]string{"tenant": r.tenant[len(r.tenant)-1:]}
+		if r.out["tenant"] != want["tenant"] {
+			t.Errorf("%s decrypted %v, want %v", r.tenant, r.out, want)
+		}
+	}
+
+	// Cross-tenant decryption must fail: t_a's ciphertext under t_b's key
+	// lookup, and vice versa.
+	if err := DecryptEncryptedFrom("t_b", sproutID, sealedA, new(map[string]string)); err == nil {
+		t.Error("expected t_a's payload to fail decryption under t_b's box key")
+	}
+	if err := DecryptEncryptedFrom("t_a", sproutID, sealedB, new(map[string]string)); err == nil {
+		t.Error("expected t_b's payload to fail decryption under t_a's box key")
 	}
 }

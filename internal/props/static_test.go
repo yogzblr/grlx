@@ -64,7 +64,7 @@ func TestClearStaticProps(t *testing.T) {
 	LoadStaticProps(cfg)
 
 	// Also set a dynamic prop.
-	setPropWithTTL("web-1", "dynamic-key", "dynamic-val", DefaultPropTTL)
+	setPropWithTTL(tenantID(), "web-1", "dynamic-key", "dynamic-val", DefaultPropTTL)
 
 	// Clear static.
 	ClearStaticProps()

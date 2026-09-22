@@ -155,7 +155,7 @@ func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {
 
 	// Accept: mints a JWT and pushes the (now-changed) tenant Account JWT
 	// to the running bus's resolver.
-	if err := AcceptNKey("sprout01"); err != nil {
+	if err := AcceptNKey(currentTenantID(), "sprout01"); err != nil {
 		t.Fatalf("AcceptNKey failed: %v", err)
 	}
 	sproutJWT, err := GetSproutUserJWT("sprout01")
@@ -215,7 +215,7 @@ func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {
 
 	// Deny: revokes the sprout's pubkey on the tenant Account and pushes
 	// the update. The exact same JWT + seed must now be rejected.
-	if err := DenyNKey("sprout01"); err != nil {
+	if err := DenyNKey(currentTenantID(), "sprout01"); err != nil {
 		t.Fatalf("DenyNKey failed: %v", err)
 	}
 	if _, err := dialAsSprout(t, sproutJWT, sproutSeed); err == nil {
@@ -225,7 +225,7 @@ func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {
 	// Re-accept (from denied, not unaccepted): AcceptNKey searches all
 	// state directories, and clearing the revocation alone is enough to
 	// make the *same* previously-minted JWT valid again.
-	if err := AcceptNKey("sprout01"); err != nil {
+	if err := AcceptNKey(currentTenantID(), "sprout01"); err != nil {
 		t.Fatalf("re-AcceptNKey failed: %v", err)
 	}
 	nc2, err := dialAsSprout(t, sproutJWT, sproutSeed)
@@ -245,7 +245,7 @@ func TestJWTLifecycle_RejectAlsoRevokes(t *testing.T) {
 	sproutSeed, _ := sproutKP.Seed()
 	writeKey(t, "unaccepted", "rogue01", sproutPub)
 
-	if err := AcceptNKey("rogue01"); err != nil {
+	if err := AcceptNKey(currentTenantID(), "rogue01"); err != nil {
 		t.Fatalf("AcceptNKey failed: %v", err)
 	}
 	sproutJWT, err := GetSproutUserJWT("rogue01")
@@ -258,7 +258,7 @@ func TestJWTLifecycle_RejectAlsoRevokes(t *testing.T) {
 		nc.Close()
 	}
 
-	if err := RejectNKey("rogue01", ""); err != nil {
+	if err := RejectNKey(currentTenantID(), "rogue01", ""); err != nil {
 		t.Fatalf("RejectNKey failed: %v", err)
 	}
 	if _, err := dialAsSprout(t, sproutJWT, sproutSeed); err == nil {
@@ -305,7 +305,7 @@ func TestReloadNKeys_PushesWithoutLocalNatsServerHandle(t *testing.T) {
 	// Accept: this calls ReloadNKeys via defer with no local NatsServer
 	// handle. It must still push the updated tenant Account JWT to the
 	// bus's resolver over the network for the sprout to be able to connect.
-	if err := AcceptNKey("split-sprout01"); err != nil {
+	if err := AcceptNKey(currentTenantID(), "split-sprout01"); err != nil {
 		t.Fatalf("AcceptNKey failed: %v", err)
 	}
 	sproutJWT, err := GetSproutUserJWT("split-sprout01")

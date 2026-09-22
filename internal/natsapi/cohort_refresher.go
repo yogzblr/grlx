@@ -57,7 +57,7 @@ func refreshAllCohorts() {
 		return
 	}
 
-	allKeys := pki.ListNKeysByType()
+	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)

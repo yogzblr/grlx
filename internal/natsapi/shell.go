@@ -33,7 +33,7 @@ func handleShellStart(params json.RawMessage) (any, error) {
 	if !pki.IsValidSproutID(req.SproutID) || strings.Contains(req.SproutID, "_") {
 		return nil, fmt.Errorf("invalid sprout ID: %s", req.SproutID)
 	}
-	registered, _ := pki.NKeyExists(req.SproutID, "")
+	registered, _ := pki.NKeyExists(pki.CurrentTenantID(), req.SproutID, "")
 	if !registered {
 		return nil, fmt.Errorf("unknown sprout: %s", req.SproutID)
 	}

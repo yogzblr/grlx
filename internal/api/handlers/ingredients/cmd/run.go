@@ -39,7 +39,7 @@ func HCmdRun(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		registered, _ := pki.NKeyExists(target.SproutID, "")
+		registered, _ := pki.NKeyExists(pki.CurrentTenantID(), target.SproutID, "")
 		if !registered {
 			var results apitypes.TargetedResults
 			results.Results = nil

@@ -71,12 +71,12 @@ func decodeBoxPubKey(b64 string) (*[32]byte, error) {
 // see the design doc's "Key rotation": farmer always encrypts new
 // outbound traffic under whatever the sprout most recently told it is
 // current).
-func sealForSprout(sproutID string, plaintext []byte) ([]byte, error) {
+func sealForSprout(tenantID, sproutID string, plaintext []byte) ([]byte, error) {
 	_, tenantPriv, err := pki.GetTenantX25519KeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("natsapi: loading tenant keypair: %w", err)
 	}
-	activePub, _, err := pki.ValidSproutBoxKeys(sproutID)
+	activePub, _, err := pki.ValidSproutBoxKeys(tenantID, sproutID)
 	if err != nil {
 		return nil, fmt.Errorf("natsapi: loading box key for sprout %s: %w", sproutID, err)
 	}
@@ -99,7 +99,7 @@ func sealForSprout(sproutID string, plaintext []byte) ([]byte, error) {
 // then any former key still inside its post-rotation grace window (the
 // design doc's "grace period... both old and new public keys accepted
 // for a short overlap window").
-func openFromSprout(sproutID string, envelope []byte) ([]byte, error) {
+func openFromSprout(tenantID, sproutID string, envelope []byte) ([]byte, error) {
 	var env EncryptedEnvelope
 	if err := json.Unmarshal(envelope, &env); err != nil {
 		return nil, fmt.Errorf("%w: decoding envelope: %v", ErrDecryptFailed, err)
@@ -114,7 +114,7 @@ func openFromSprout(sproutID string, envelope []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("natsapi: loading tenant keypair: %w", err)
 	}
-	active, grace, err := pki.ValidSproutBoxKeys(sproutID)
+	active, grace, err := pki.ValidSproutBoxKeys(tenantID, sproutID)
 	if err != nil {
 		return nil, fmt.Errorf("natsapi: loading box key for sprout %s: %w", sproutID, err)
 	}
@@ -139,7 +139,7 @@ func openFromSprout(sproutID string, envelope []byte) ([]byte, error) {
 // sealForSprout), and publishes the result to subject. The transparent
 // replacement for natsConn.Publish(subject, plaintextJSON) at a
 // farmer->sprout payload boundary this workstream covers.
-func PublishEncryptedTo(sproutID, subject string, v any) error {
+func PublishEncryptedTo(tenantID, sproutID, subject string, v any) error {
 	if natsConn == nil {
 		return fmt.Errorf("natsapi: NATS connection not available")
 	}
@@ -147,7 +147,7 @@ func PublishEncryptedTo(sproutID, subject string, v any) error {
 	if err != nil {
 		return fmt.Errorf("natsapi: marshaling payload for %s: %w", sproutID, err)
 	}
-	ciphertext, err := sealForSprout(sproutID, plaintext)
+	ciphertext, err := sealForSprout(tenantID, sproutID, plaintext)
 	if err != nil {
 		return err
 	}
@@ -158,8 +158,8 @@ func PublishEncryptedTo(sproutID, subject string, v any) error {
 // sproutID, wire-shaped as EncryptedEnvelope — and JSON-unmarshals the
 // result into v. The transparent counterpart handlers use when receiving
 // a sprout-originated payload this workstream covers.
-func DecryptEncryptedFrom(sproutID string, data []byte, v any) error {
-	plaintext, err := openFromSprout(sproutID, data)
+func DecryptEncryptedFrom(tenantID, sproutID string, data []byte, v any) error {
+	plaintext, err := openFromSprout(tenantID, sproutID, data)
 	if err != nil {
 		return err
 	}

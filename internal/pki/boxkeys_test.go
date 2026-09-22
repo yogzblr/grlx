@@ -32,7 +32,7 @@ func TestDecodeBoxPub(t *testing.T) {
 func TestValidSproutBoxKeys_NoneEnrolled(t *testing.T) {
 	setupTestPKI(t)
 
-	if _, _, err := ValidSproutBoxKeys("nobody"); err != ErrNoActiveBoxKey {
+	if _, _, err := ValidSproutBoxKeys(currentTenantID(), "nobody"); err != ErrNoActiveBoxKey {
 		t.Fatalf("expected ErrNoActiveBoxKey, got %v", err)
 	}
 }
@@ -48,7 +48,7 @@ func TestUpsertSproutBoxKeyActive_IdempotentSamePub(t *testing.T) {
 		t.Fatalf("second upsert: %v", err)
 	}
 
-	active, grace, err := ValidSproutBoxKeys("web-01")
+	active, grace, err := ValidSproutBoxKeys(currentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}
@@ -75,11 +75,11 @@ func TestRotateSproutBoxKey_GracesThePreviousKey(t *testing.T) {
 	if err := upsertSproutBoxKeyActive(tenantID(), "web-01", oldPub); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	if err := RotateSproutBoxKey("web-01", newPub, time.Hour); err != nil {
+	if err := RotateSproutBoxKey(currentTenantID(), "web-01", newPub, time.Hour); err != nil {
 		t.Fatalf("RotateSproutBoxKey: %v", err)
 	}
 
-	active, grace, err := ValidSproutBoxKeys("web-01")
+	active, grace, err := ValidSproutBoxKeys(currentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}
@@ -99,11 +99,11 @@ func TestRotateSproutBoxKey_IdempotentWhenAlreadyActive(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 	// Rotating to the pub that's already active must not grace it.
-	if err := RotateSproutBoxKey("web-01", pub, time.Hour); err != nil {
+	if err := RotateSproutBoxKey(currentTenantID(), "web-01", pub, time.Hour); err != nil {
 		t.Fatalf("RotateSproutBoxKey: %v", err)
 	}
 
-	active, grace, err := ValidSproutBoxKeys("web-01")
+	active, grace, err := ValidSproutBoxKeys(currentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestRotateSproutBoxKey_RejectsMalformedNewPub(t *testing.T) {
 	if err := upsertSproutBoxKeyActive(tenantID(), "web-01", testBoxPub(t)); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	if err := RotateSproutBoxKey("web-01", "not-valid", time.Hour); err == nil {
+	if err := RotateSproutBoxKey(currentTenantID(), "web-01", "not-valid", time.Hour); err == nil {
 		t.Fatal("expected an error for a malformed new pub")
 	}
 }
@@ -135,11 +135,11 @@ func TestValidSproutBoxKeys_ExpiredGraceKeyExcludedAndSwept(t *testing.T) {
 	}
 	// A negative grace duration means the old key's grace window has
 	// already closed by the time we ask.
-	if err := RotateSproutBoxKey("web-01", newPub, -time.Hour); err != nil {
+	if err := RotateSproutBoxKey(currentTenantID(), "web-01", newPub, -time.Hour); err != nil {
 		t.Fatalf("RotateSproutBoxKey: %v", err)
 	}
 
-	active, grace, err := ValidSproutBoxKeys("web-01")
+	active, grace, err := ValidSproutBoxKeys(currentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}
@@ -174,14 +174,14 @@ func TestRotateSproutBoxKey_MultipleRotationsOverlapIndependently(t *testing.T) 
 	if err := upsertSproutBoxKeyActive(tenantID(), "web-01", pub1); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	if err := RotateSproutBoxKey("web-01", pub2, time.Hour); err != nil {
+	if err := RotateSproutBoxKey(currentTenantID(), "web-01", pub2, time.Hour); err != nil {
 		t.Fatalf("rotate 1: %v", err)
 	}
-	if err := RotateSproutBoxKey("web-01", pub3, time.Hour); err != nil {
+	if err := RotateSproutBoxKey(currentTenantID(), "web-01", pub3, time.Hour); err != nil {
 		t.Fatalf("rotate 2: %v", err)
 	}
 
-	active, grace, err := ValidSproutBoxKeys("web-01")
+	active, grace, err := ValidSproutBoxKeys(currentTenantID(), "web-01")
 	if err != nil {
 		t.Fatalf("ValidSproutBoxKeys: %v", err)
 	}

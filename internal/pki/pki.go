@@ -116,47 +116,72 @@ func IsValidSproutID(id string) bool {
 	return true
 }
 
-func AcceptNKey(id string) error {
+// reloadNKeysFor syncs and pushes tenantID's NATS Account after an
+// Accept/Deny/Reject/Unaccept/Delete call. tenantID's own Account
+// (ReloadNKeysForTenant) is used for every tenant except the legacy
+// current-tenant seam (currentTenantID()), which instead uses the
+// original, flat single-tenant path (ReloadNKeys/syncNatsAuth,
+// jwtusers.go's sproutJWTPath) — that path predates tenant.go's
+// tenants/<id>/ layout and is what GetSproutUserJWT (jwtusers.go) and
+// every other legacy caller still reads from. Treating the legacy tenant
+// as just another ID for ReloadNKeysForTenant would silently start
+// provisioning a *second*, separate Account under tenants/<id>/ for it,
+// orphaning every sprout the flat legacy path already manages. See
+// docs/design/grlx-tenant-context-threading.md.
+func reloadNKeysFor(tenantID string) error {
+	if tenantID == currentTenantID() {
+		return ReloadNKeys()
+	}
+	return ReloadNKeysForTenant(tenantID)
+}
+
+// AcceptNKey moves sproutID from unaccepted/denied/rejected into accepted
+// within tenantID, syncing and pushing that tenant's own NATS Account
+// afterward (reloadNKeysFor) — not unconditionally the legacy
+// current-tenant seam, so accepting a sprout under a
+// dynamically-provisioned tenant reloads the right Account. See
+// docs/design/grlx-tenant-context-threading.md.
+func AcceptNKey(tenantID, id string) error {
 	defer func() {
-		if err := ReloadNKeys(); err != nil {
-			log.Errorf("failed to reload NATS auth for accepted sprout %s: %v", id, err)
+		if err := reloadNKeysFor(tenantID); err != nil {
+			log.Errorf("failed to reload NATS auth for accepted sprout %s in tenant %s: %v", id, tenantID, err)
 		}
 	}()
 	base := strings.SplitN(id, "_", 2)[0]
 	if !IsValidSproutID(base) {
 		return ErrSproutIDInvalid
 	}
-	row, err := findNKeyRow(id)
+	row, err := findNKeyRowInTenant(tenantID, id)
 	if err != nil {
 		return err
 	}
 	if len(strings.SplitN(id, "_", 2)) > 1 {
-		DeleteNKey(base)
+		DeleteNKey(tenantID, base)
 	}
 	if id == base && row.State == stateAccepted {
 		return ErrAlreadyAccepted
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("tenant_id = ? AND sprout_id = ?", tenantID(), id).Delete(&nkeyRow{}).Error; err != nil {
+		if err := tx.Where("tenant_id = ? AND sprout_id = ?", tenantID, id).Delete(&nkeyRow{}).Error; err != nil {
 			return err
 		}
 		return tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "sprout_id"}},
 			DoUpdates: clause.AssignmentColumns([]string{"nkey", "state"}),
-		}).Create(&nkeyRow{TenantID: tenantID(), SproutID: base, NKey: row.NKey, State: stateAccepted}).Error
+		}).Create(&nkeyRow{TenantID: tenantID, SproutID: base, NKey: row.NKey, State: stateAccepted}).Error
 	})
 }
 
-func DeleteNKey(id string) error {
+func DeleteNKey(tenantID, id string) error {
 	defer func() {
-		if err := ReloadNKeys(); err != nil {
-			log.Errorf("failed to reload NATS auth for deleted sprout %s: %v", id, err)
+		if err := reloadNKeysFor(tenantID); err != nil {
+			log.Errorf("failed to reload NATS auth for deleted sprout %s in tenant %s: %v", id, tenantID, err)
 		}
 	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	res := db.Where("tenant_id = ? AND sprout_id = ?", tenantID(), id).Delete(&nkeyRow{})
+	res := db.Where("tenant_id = ? AND sprout_id = ?", tenantID, id).Delete(&nkeyRow{})
 	if res.Error != nil {
 		return res.Error
 	}
@@ -166,37 +191,37 @@ func DeleteNKey(id string) error {
 	return nil
 }
 
-func DenyNKey(id string) error {
+func DenyNKey(tenantID, id string) error {
 	defer func() {
-		if err := ReloadNKeys(); err != nil {
-			log.Errorf("failed to reload NATS auth for denied sprout %s: %v", id, err)
+		if err := reloadNKeysFor(tenantID); err != nil {
+			log.Errorf("failed to reload NATS auth for denied sprout %s in tenant %s: %v", id, tenantID, err)
 		}
 	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	row, err := findNKeyRow(id)
+	row, err := findNKeyRowInTenant(tenantID, id)
 	if err != nil {
 		return err
 	}
 	if row.State == stateDenied {
 		return ErrAlreadyDenied
 	}
-	return setState(id, stateDenied)
+	return setStateInTenant(tenantID, id, stateDenied)
 }
 
-func UnacceptNKey(id string, nkey string) error {
+func UnacceptNKey(tenantID, id string, nkey string) error {
 	defer func() {
-		if err := ReloadNKeys(); err != nil {
-			log.Errorf("failed to reload NATS auth for unaccepted sprout %s: %v", id, err)
+		if err := reloadNKeysFor(tenantID); err != nil {
+			log.Errorf("failed to reload NATS auth for unaccepted sprout %s in tenant %s: %v", id, tenantID, err)
 		}
 	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	row, err := findNKeyRow(id)
+	row, err := findNKeyRowInTenant(tenantID, id)
 	if nkey != "" && err == ErrSproutIDNotFound {
-		return upsertNKeyRow(nkeyRow{TenantID: tenantID(), SproutID: id, NKey: nkey, State: stateUnaccepted})
+		return upsertNKeyRow(nkeyRow{TenantID: tenantID, SproutID: id, NKey: nkey, State: stateUnaccepted})
 	}
 	if err != nil {
 		return err
@@ -204,16 +229,17 @@ func UnacceptNKey(id string, nkey string) error {
 	if row.State == stateUnaccepted {
 		return ErrAlreadyUnaccepted
 	}
-	return setState(id, stateUnaccepted)
+	return setStateInTenant(tenantID, id, stateUnaccepted)
 }
 
-func GetNKeysByType(set string) KeySet {
-	return getNKeysByTypeForTenant(tenantID(), set)
+// GetNKeysByType returns every sprout in the given lifecycle state
+// ("unaccepted"/"accepted"/"denied"/"rejected") within tenantID.
+func GetNKeysByType(tenantID, set string) KeySet {
+	return getNKeysByTypeForTenant(tenantID, set)
 }
 
-// getNKeysByTypeForTenant is GetNKeysByType scoped to an explicit tenant
-// instead of the package's current-tenant seam — used by tenant.go's
-// per-tenant sync path (syncTenantSprouts).
+// getNKeysByTypeForTenant is GetNKeysByType's implementation, also used
+// directly by tenant.go's per-tenant sync path (syncTenantSprouts).
 func getNKeysByTypeForTenant(tenantID, set string) KeySet {
 	keySet := KeySet{}
 	keySet.Sprouts = []KeyManager{}
@@ -237,27 +263,27 @@ func getNKeysByTypeForTenant(tenantID, set string) KeySet {
 	return keySet
 }
 
-func ListNKeysByType() KeysByType {
+func ListNKeysByType(tenantID string) KeysByType {
 	var allKeys KeysByType
-	allKeys.Accepted = GetNKeysByType("accepted")
-	allKeys.Denied = GetNKeysByType("denied")
-	allKeys.Rejected = GetNKeysByType("rejected")
-	allKeys.Unaccepted = GetNKeysByType("unaccepted")
+	allKeys.Accepted = GetNKeysByType(tenantID, "accepted")
+	allKeys.Denied = GetNKeysByType(tenantID, "denied")
+	allKeys.Rejected = GetNKeysByType(tenantID, "rejected")
+	allKeys.Unaccepted = GetNKeysByType(tenantID, "unaccepted")
 	return allKeys
 }
 
-func RejectNKey(id string, nkey string) error {
+func RejectNKey(tenantID, id string, nkey string) error {
 	defer func() {
-		if err := ReloadNKeys(); err != nil {
-			log.Errorf("failed to reload NATS auth for rejected sprout %s: %v", id, err)
+		if err := reloadNKeysFor(tenantID); err != nil {
+			log.Errorf("failed to reload NATS auth for rejected sprout %s in tenant %s: %v", id, tenantID, err)
 		}
 	}()
 	if !IsValidSproutID(id) {
 		return ErrSproutIDInvalid
 	}
-	row, err := findNKeyRow(id)
+	row, err := findNKeyRowInTenant(tenantID, id)
 	if nkey != "" && err == ErrSproutIDNotFound {
-		return upsertNKeyRow(nkeyRow{TenantID: tenantID(), SproutID: id, NKey: nkey, State: stateRejected})
+		return upsertNKeyRow(nkeyRow{TenantID: tenantID, SproutID: id, NKey: nkey, State: stateRejected})
 	}
 	if err != nil {
 		return err
@@ -265,23 +291,19 @@ func RejectNKey(id string, nkey string) error {
 	if row.State == stateRejected {
 		return ErrAlreadyRejected
 	}
-	return setState(id, stateRejected)
+	return setStateInTenant(tenantID, id, stateRejected)
 }
 
-func GetNKey(id string) (string, error) {
-	row, err := findNKeyRow(id)
+func GetNKey(tenantID, id string) (string, error) {
+	row, err := findNKeyRowInTenant(tenantID, id)
 	if err != nil {
 		return "", err
 	}
 	return row.NKey, nil
 }
 
-func NKeyExists(id string, nkey string) (Registered bool, Matches bool) {
-	row, err := findNKeyRow(id)
-	if err != nil {
-		return false, false
-	}
-	return true, row.NKey == nkey
+func NKeyExists(tenantID, id string, nkey string) (Registered bool, Matches bool) {
+	return NKeyExistsInTenant(tenantID, id, nkey)
 }
 
 func FetchRootCA(filename string) error {
