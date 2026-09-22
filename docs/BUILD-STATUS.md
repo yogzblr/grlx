@@ -74,12 +74,12 @@ resolve merge fallout against J's box-key tenant scoping.
 | D (facts listener) | `internal/facts/listener.go`'s `RegisterFarmerListener` still used plain fan-out `Subscribe`, justified by a stale comment from before workstream A removed `props/store.go`'s in-memory cache; queue-grouped it under `grlx-core` to stop every replica double-writing the same PXC row on every fact update | not dispatched by this coordinator — found already merged | merged — PR #24 (`e9aa2ea`) | n |
 | G.2 | Windows user/group provider (`internal/ingredients/user`, `group` — Windows-specific files) using `deploymenttheory/go-bindings-win32`'s netmanagement package | session_01ArigyXKLB5a2gV449zBGZB | merged — PR #32 (`20a6ac5`) | y — user/group creation, and the dependency is young (v0.2.x) |
 | G.4 | Windows DACL/ACL ingredient (`internal/ingredients/windacl`) using `hectane/go-acl` for file ACLs, extended to registry-key ACLs (`SE_REGISTRY_KEY`) | session_01BVU6xoX7h7tzkscFYUTY8U | merged — PR #37 (`c39c84f`) | y — propagation/inheritance semantics are a security-relevant bug class |
-| G.6 | Shortcut COM ingredient (`internal/ingredients/winshortcut`, IShellLink) using `go-ole/go-ole`, to prove the COM lifecycle pattern | session_01GXJ5vf5Fdo9fMxdoFAe5rE | merged — PR #30 (`cbd1fe0`) — **partial**: only Shortcut landed; Task Scheduler and Windows Update were the brief's intended next steps and are not yet built | y — COM lifecycle bugs (missed Release, wrong apartment threading) |
+| G.6 | Shortcut COM ingredient (`internal/ingredients/winshortcut`, IShellLink) using `go-ole/go-ole`, to prove the COM lifecycle pattern | session_01GXJ5vf5Fdo9fMxdoFAe5rE | merged — PR #30 (`cbd1fe0`); Task Scheduler + Windows Update remainder completed below | y — COM lifecycle bugs (missed Release, wrong apartment threading) |
 | G.7 | v1 subset of LGPO (`internal/ingredients/lgpo`) — parses `registry.pol` (`encoding/binary`) and ADMX/ADML (`encoding/xml`) | session_01XYVPKvrCssvaGQTd9MbEs3 | merged — PR #33 (`265e47f`, `4b07925`) | n |
 | H.1 | Linux network/route management (`internal/ingredients/network`) using `vishvananda/netlink`, with a verify-connectivity-or-roll-back guard | session_01Q9NMvFaiFykjHmvCpqSn36 | merged — PR #31 (`111e414`) | n |
 | H.2 | nftables firewall ingredient (`internal/ingredients/firewall`) using `google/nftables` | session_015pQ7NBWmSxJFht6DQyrrbs | merged — PR #36 (`01dcb6b`) | y — a firewall ingredient can lock out or expose a host |
 | H.3 | SELinux ingredient (`internal/ingredients/selinux`) using `opencontainers/selinux` | session_012DtUVSVbEHb11Uz4KzW4Tt | merged — PR #34 (`4693ca9`) | y — CERT-In/DPDP-relevant: silently degrading to permissive is compliance-visible |
-| G.6 remainder | Task Scheduler (Task Scheduler 2.0 COM API) and Windows Update (WUA COM API) ingredients using `go-ole/go-ole`, following `winshortcut`'s established COM lifecycle pattern | session_0139sK5LWbknewZ5sUMBXJa5 | dispatched | y — COM lifecycle bugs, plus Windows Update install actions are a real blast-radius concern |
+| G.6 remainder | Task Scheduler (`internal/ingredients/wintaskscheduler`, Task Scheduler 2.0 COM API) and Windows Update (`internal/ingredients/winupdate`, WUA COM API) ingredients using `go-ole/go-ole`, following `winshortcut`'s established COM lifecycle pattern | session_0139sK5LWbknewZ5sUMBXJa5 | merged — PR #38 (`a49361a`) | y — COM lifecycle bugs, plus Windows Update install actions are a real blast-radius concern |
 
 Before dispatching, validated against `master` that none of the seven were
 already implemented: no ACL/DACL, Task Scheduler/WUA/Shortcut, LGPO,
@@ -100,9 +100,11 @@ Windows variants, `windacl`, `winshortcut`, `lgpo`, `network`, `firewall`,
   "FLAG FOR SECURITY REVIEW." Per `CLAUDE.md`, none of the flagged
   workstreams should be treated as "done" or "safe to merge" even after
   their tests pass — only as "ready for review."
-- All of Wave 0, Wave 1, Wave 2, and Section 4's seven ongoing workstreams
-  are merged, except G.6's remainder (Task Scheduler + Windows Update),
-  which is now dispatched to close out full G.6 parity.
+- All of Wave 0, Wave 1, Wave 2, and Section 4's ongoing workstreams —
+  including G.6's Task Scheduler + Windows Update remainder — are now
+  merged. The only item from the whole plan still open is the Envoy/EdDSA
+  verification gap noted under Wave 1, which needs a human or a
+  docker-capable environment.
 - The six pre-existing Wave 0 workstreams were confirmed directly against the
   repo (code present, tests present, commits/PRs identified in `git log`)
   rather than re-run, per instruction to skip work already done.
