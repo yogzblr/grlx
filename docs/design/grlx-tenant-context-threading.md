@@ -248,3 +248,33 @@ as "the storage/business-logic layer is now provably tenant-correct when
 given a real tenant ID," not as "multi-tenant NATS traffic isolation is
 solved" — those are still open, and are named above as the concrete next
 steps.
+
+## Update, post PR #40/#41: the RBAC/auth gap above is resolved, not deferred
+
+Option A (per-tenant NATS connections, PRs #40 and #41) closed the
+transport and storage-layer gaps this doc originally flagged. The
+RBAC/auth policy-layer gap named just above was re-examined against this
+codebase's actual access model, rather than against RBAC's role model in
+the abstract, and closed as a deliberate non-issue:
+
+- Farmer's entire NATS API surface is called exclusively by the SaaS
+  API's own privileged service credential
+  (`cloudxp-machine-manager-api-design.md`'s "Internal API — Farmer (SaaS
+  API only)"). A tenant, a human, or CloudXP itself never calls farmer
+  directly.
+- `cmd/grlx`, the only other code path that authenticates to farmer's bus
+  independently of the SaaS API, is never issued to anyone — confirmed,
+  not assumed.
+- Tenant boundary enforcement was never RBAC's job on the SaaS-API path
+  regardless: it happens via the point-of-effect data-ownership checks
+  this doc's own Phase 2 work built into `internal/pki`/`internal/props`/
+  `internal/facts` (a request's asserted `tenant_id` checked against a
+  sprout's actually-stored `tenant_id`). RBAC's role model answers "is
+  this kind of action allowed," never "for which tenant" — it was never
+  the right tool for this specific boundary.
+
+See `internal/auth/auth.go`'s `policyState` doc comment for the
+authoritative version of this decision, kept next to the code it governs.
+**Revisit this if the access model ever changes** — the CLI gets issued
+to anyone for direct access, or any caller other than the SaaS API's own
+credential is ever granted access to farmer's internal subjects.
