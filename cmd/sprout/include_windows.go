@@ -20,4 +20,6 @@ import (
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winshortcut"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winsmtpserver"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winsnmp"
+	_ "github.com/gogrlx/grlx/v2/internal/ingredients/wintaskscheduler"
+	_ "github.com/gogrlx/grlx/v2/internal/ingredients/winupdate"
 )
