@@ -24,6 +24,36 @@ var (
 
 // policyState holds the loaded RBAC policy. It is populated by LoadPolicy
 // during farmer startup and used by all auth checks.
+//
+// This policy has no tenant concept — one config-file-driven policy for
+// the whole farmer process, regardless of which tenant a request concerns.
+// Flagged as an open gap in docs/design/grlx-tenant-context-threading.md
+// while workstream E's tenant-isolation work (PRs #28, #39-#41) was
+// landing; resolved as a deliberate non-issue, not deferred work, once
+// confirmed against this codebase's actual access model rather than
+// against RBAC's role model in the abstract:
+//
+//   - Farmer's entire NATS API surface is called exclusively by the SaaS
+//     API's own privileged service credential (see
+//     cloudxp-machine-manager-api-design.md's "Internal API — Farmer
+//     (SaaS API only)"). A tenant, a human, or CloudXP itself never calls
+//     farmer directly.
+//   - cmd/grlx, the only other code path that authenticates to farmer's
+//     bus independently of the SaaS API (internal/api/client/nats.go
+//     dials config.FarmerBusURL directly), is never issued to anyone —
+//     confirmed, not assumed. If that ever changes — the CLI gets handed
+//     to ops/support for direct access, or any caller other than the
+//     SaaS API's own credential is ever granted access to farmer's
+//     internal subjects — this decision needs revisiting, since RBAC
+//     would then be the only thing standing between that caller's
+//     permitted actions and which tenant they can perform them against.
+//   - Tenant boundary enforcement itself was never RBAC's job on the
+//     SaaS-API path regardless: it happens via the point-of-effect
+//     data-ownership checks in internal/pki, internal/props, and
+//     internal/facts (a request's asserted tenant_id checked against a
+//     sprout's actually-stored tenant_id) — RBAC's role model answers
+//     "is this kind of action allowed," never "for which tenant," so it
+//     was never the right tool for this boundary in the first place.
 var (
 	policyMu    sync.RWMutex
 	roleStore   *rbac.RoleStore
