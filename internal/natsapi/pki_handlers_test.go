@@ -14,24 +14,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
-// setupNatsAPIPKI mirrors the pki_test.go setup so PKI handlers can
-// manipulate sprout keys during tests without hitting log.Fatalf.
+// setupNatsAPIPKI wires up an in-memory PKI store (see
+// internal/pki/store.go) plus the same TLS/NKey scaffolding pki_test.go's
+// setupTestPKI uses, so PKI handlers can manipulate sprout keys during
+// tests without hitting log.Fatalf. The returned directory is still used
+// by callers for unrelated TLS fixture paths.
 func setupNatsAPIPKI(t *testing.T) string {
 	t.Helper()
+
+	dsn := "file:" + t.Name() + "-pki?mode=memory&cache=shared"
+	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening pki test db: %v", err)
+	}
+	if err := gdb.AutoMigrate(pki.Models()...); err != nil {
+		t.Fatalf("migrating pki test db: %v", err)
+	}
+	pki.SetDB(gdb)
+	t.Cleanup(func() { pki.SetDB(sharedPKIDB) })
+
 	tmpDir := t.TempDir()
 	pkiDir := filepath.Join(tmpDir, "pki") + "/"
 	config.FarmerPKI = pkiDir
-
-	for _, state := range []string{"unaccepted", "accepted", "denied", "rejected"} {
-		dir := filepath.Join(pkiDir, "sprouts", state)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("create %s dir: %v", state, err)
-		}
-	}
 
 	// Dummy farmer pub key so ReloadNKeys doesn't fatal.
 	farmerPubFile := filepath.Join(tmpDir, "farmer.pub")
@@ -130,11 +141,37 @@ func writeTestPEM(t *testing.T, path, blockType string, data []byte) {
 	}
 }
 
-func writeNKey(t *testing.T, pkiDir, state, sproutID, nkey string) {
+// writeNKey registers sproutID at the given lifecycle state via the same
+// pki functions the handlers under test use, rather than writing storage
+// directly. pkiDir is unused (kept so existing call sites don't need to
+// change) now that PKI state lives in PXC, not on disk.
+func writeNKey(t *testing.T, _, state, sproutID, nkey string) {
 	t.Helper()
-	path := filepath.Join(pkiDir, "sprouts", state, sproutID)
-	if err := os.WriteFile(path, []byte(nkey), 0o600); err != nil {
-		t.Fatalf("write key file %s: %v", path, err)
+	switch state {
+	case "unaccepted":
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
+		}
+	case "accepted":
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
+		}
+		if err := pki.AcceptNKey(pki.CurrentTenantID(), sproutID); err != nil {
+			t.Fatalf("AcceptNKey(%q): %v", sproutID, err)
+		}
+	case "denied":
+		if err := pki.UnacceptNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
+			t.Fatalf("UnacceptNKey(%q): %v", sproutID, err)
+		}
+		if err := pki.DenyNKey(pki.CurrentTenantID(), sproutID); err != nil {
+			t.Fatalf("DenyNKey(%q): %v", sproutID, err)
+		}
+	case "rejected":
+		if err := pki.RejectNKey(pki.CurrentTenantID(), sproutID, nkey); err != nil {
+			t.Fatalf("RejectNKey(%q): %v", sproutID, err)
+		}
+	default:
+		t.Fatalf("writeNKey: unknown state %q", state)
 	}
 }
 
@@ -143,7 +180,7 @@ func writeNKey(t *testing.T, pkiDir, state, sproutID, nkey string) {
 func TestHandlePKIListEmpty(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	result, err := handlePKIList(nil)
+	result, err := handlePKIList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handlePKIList: %v", err)
 	}
@@ -164,7 +201,7 @@ func TestHandlePKIListWithKeys(t *testing.T) {
 	writeNKey(t, pkiDir, "accepted", "sprout-b", "UKEY_B")
 	writeNKey(t, pkiDir, "denied", "sprout-c", "UKEY_C")
 
-	result, err := handlePKIList(nil)
+	result, err := handlePKIList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handlePKIList: %v", err)
 	}
@@ -187,7 +224,7 @@ func TestHandlePKIAccept(t *testing.T) {
 	writeNKey(t, pkiDir, "unaccepted", "sprout-new", "UKEY_NEW")
 
 	params := json.RawMessage(`{"id":"sprout-new"}`)
-	result, err := handlePKIAccept(params)
+	result, err := handlePKIAccept(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePKIAccept: %v", err)
 	}
@@ -198,7 +235,7 @@ func TestHandlePKIAccept(t *testing.T) {
 	}
 
 	// Verify key moved to accepted.
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	found := false
 	for _, km := range keys.Accepted.Sprouts {
 		if km.SproutID == "sprout-new" {
@@ -214,7 +251,7 @@ func TestHandlePKIAccept(t *testing.T) {
 func TestHandlePKIAcceptInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handlePKIAccept(json.RawMessage(`{invalid`))
+	_, err := handlePKIAccept(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -224,7 +261,7 @@ func TestHandlePKIAcceptNonexistent(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"id":"does-not-exist"}`)
-	_, err := handlePKIAccept(params)
+	_, err := handlePKIAccept(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent sprout")
 	}
@@ -236,7 +273,7 @@ func TestHandlePKIReject(t *testing.T) {
 	writeNKey(t, pkiDir, "accepted", "sprout-rej", "UKEY_REJ")
 
 	params := json.RawMessage(`{"id":"sprout-rej"}`)
-	result, err := handlePKIReject(params)
+	result, err := handlePKIReject(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePKIReject: %v", err)
 	}
@@ -246,7 +283,7 @@ func TestHandlePKIReject(t *testing.T) {
 		t.Fatal("expected success=true")
 	}
 
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	for _, km := range keys.Accepted.Sprouts {
 		if km.SproutID == "sprout-rej" {
 			t.Error("sprout-rej still in accepted after reject")
@@ -257,7 +294,7 @@ func TestHandlePKIReject(t *testing.T) {
 func TestHandlePKIRejectInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handlePKIReject(json.RawMessage(`{invalid`))
+	_, err := handlePKIReject(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -269,7 +306,7 @@ func TestHandlePKIDeny(t *testing.T) {
 	writeNKey(t, pkiDir, "unaccepted", "sprout-deny", "UKEY_DENY")
 
 	params := json.RawMessage(`{"id":"sprout-deny"}`)
-	result, err := handlePKIDeny(params)
+	result, err := handlePKIDeny(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePKIDeny: %v", err)
 	}
@@ -279,7 +316,7 @@ func TestHandlePKIDeny(t *testing.T) {
 		t.Fatal("expected success=true")
 	}
 
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	found := false
 	for _, km := range keys.Denied.Sprouts {
 		if km.SproutID == "sprout-deny" {
@@ -295,7 +332,7 @@ func TestHandlePKIDeny(t *testing.T) {
 func TestHandlePKIDenyInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handlePKIDeny(json.RawMessage(`{invalid`))
+	_, err := handlePKIDeny(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -307,7 +344,7 @@ func TestHandlePKIUnaccept(t *testing.T) {
 	writeNKey(t, pkiDir, "accepted", "sprout-unacc", "UKEY_UNACC")
 
 	params := json.RawMessage(`{"id":"sprout-unacc"}`)
-	result, err := handlePKIUnaccept(params)
+	result, err := handlePKIUnaccept(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePKIUnaccept: %v", err)
 	}
@@ -321,7 +358,7 @@ func TestHandlePKIUnaccept(t *testing.T) {
 func TestHandlePKIUnacceptInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handlePKIUnaccept(json.RawMessage(`{invalid`))
+	_, err := handlePKIUnaccept(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -333,7 +370,7 @@ func TestHandlePKIDelete(t *testing.T) {
 	writeNKey(t, pkiDir, "unaccepted", "sprout-del", "UKEY_DEL")
 
 	params := json.RawMessage(`{"id":"sprout-del"}`)
-	result, err := handlePKIDelete(params)
+	result, err := handlePKIDelete(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePKIDelete: %v", err)
 	}
@@ -344,7 +381,7 @@ func TestHandlePKIDelete(t *testing.T) {
 	}
 
 	// Verify key is gone from all states.
-	keys := pki.ListNKeysByType()
+	keys := pki.ListNKeysByType(pki.CurrentTenantID())
 	for _, km := range keys.Unaccepted.Sprouts {
 		if km.SproutID == "sprout-del" {
 			t.Error("sprout-del still exists after delete")
@@ -355,7 +392,7 @@ func TestHandlePKIDelete(t *testing.T) {
 func TestHandlePKIDeleteInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handlePKIDelete(json.RawMessage(`{invalid`))
+	_, err := handlePKIDelete(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -365,7 +402,7 @@ func TestHandlePKIDeleteNonexistent(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"id":"ghost"}`)
-	_, err := handlePKIDelete(params)
+	_, err := handlePKIDelete(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent sprout")
 	}
@@ -377,11 +414,9 @@ func TestHandleSproutsListEmpty(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	// Ensure no NATS conn for probe.
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn(pki.CurrentTenantID())
 
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
 	}
@@ -398,15 +433,13 @@ func TestHandleSproutsListEmpty(t *testing.T) {
 func TestHandleSproutsListWithSprouts(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn(pki.CurrentTenantID())
 
 	writeNKey(t, pkiDir, "accepted", "sprout-alpha", "UKEY_ALPHA")
 	writeNKey(t, pkiDir, "unaccepted", "sprout-beta", "UKEY_BETA")
 	writeNKey(t, pkiDir, "denied", "sprout-gamma", "UKEY_GAMMA")
 
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
 	}
@@ -434,14 +467,12 @@ func TestHandleSproutsListWithSprouts(t *testing.T) {
 func TestHandleSproutsGetFound(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn(pki.CurrentTenantID())
 
 	writeNKey(t, pkiDir, "accepted", "sprout-found", "UKEY_FOUND")
 
 	params := json.RawMessage(`{"id":"sprout-found"}`)
-	result, err := handleSproutsGet(params)
+	result, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleSproutsGet: %v", err)
 	}
@@ -465,7 +496,7 @@ func TestHandleSproutsGetNotFound(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"id":"sprout-ghost"}`)
-	_, err := handleSproutsGet(params)
+	_, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent sprout")
 	}
@@ -474,7 +505,7 @@ func TestHandleSproutsGetNotFound(t *testing.T) {
 func TestHandleSproutsGetInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleSproutsGet(json.RawMessage(`{invalid`))
+	_, err := handleSproutsGet(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -484,7 +515,7 @@ func TestHandleSproutsGetInvalidID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"id":"INVALID_UPPER"}`)
-	_, err := handleSproutsGet(params)
+	_, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid sprout ID")
 	}
@@ -494,7 +525,7 @@ func TestHandleSproutsGetEmptyID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"id":""}`)
-	_, err := handleSproutsGet(params)
+	_, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty sprout ID")
 	}
@@ -522,7 +553,7 @@ func TestResolveKeyState(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := resolveKeyState(tt.id)
+		got := resolveKeyState(pki.CurrentTenantID(), tt.id)
 		if got != tt.want {
 			t.Errorf("resolveKeyState(%q) = %q, want %q", tt.id, got, tt.want)
 		}
@@ -532,11 +563,9 @@ func TestResolveKeyState(t *testing.T) {
 // --- probeSprout tests ---
 
 func TestProbeSproutNoConn(t *testing.T) {
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn(pki.CurrentTenantID())
 
-	if probeSprout("any-sprout") {
+	if probeSprout("acme", "any-sprout") {
 		t.Error("expected false when natsConn is nil")
 	}
 }
@@ -544,12 +573,12 @@ func TestProbeSproutNoConn(t *testing.T) {
 // --- SetNatsConn test ---
 
 func TestSetNatsConn(t *testing.T) {
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
-	SetNatsConn(nil)
-	if natsConn != nil {
-		t.Error("expected nil after SetNatsConn(nil)")
+	SetNatsConn(tenantID, nil)
+	if natsConnFor(tenantID) != nil {
+		t.Error("expected nil after SetNatsConn(tenantID, nil)")
 	}
 }
 
@@ -558,7 +587,7 @@ func TestSetNatsConn(t *testing.T) {
 func TestHandleCmdRunInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleCmdRun(json.RawMessage(`{invalid`))
+	_, err := handleCmdRun(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -568,7 +597,7 @@ func TestHandleCmdRunInvalidSproutID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"INVALID_UPPER"}],"action":{"command":"echo hello"}}`)
-	_, err := handleCmdRun(params)
+	_, err := handleCmdRun(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid sprout ID")
 	}
@@ -578,7 +607,7 @@ func TestHandleCmdRunUnknownSprout(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"unknown-sprout"}],"action":{"command":"echo hello"}}`)
-	_, err := handleCmdRun(params)
+	_, err := handleCmdRun(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for unknown sprout")
 	}
@@ -588,7 +617,7 @@ func TestHandleCmdRunSproutIDWithUnderscore(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"sprout_bad"}],"action":{"command":"echo hello"}}`)
-	_, err := handleCmdRun(params)
+	_, err := handleCmdRun(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for sprout ID with underscore")
 	}
@@ -599,7 +628,7 @@ func TestHandleCmdRunSproutIDWithUnderscore(t *testing.T) {
 func TestHandleTestPingInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleTestPing(json.RawMessage(`{invalid`))
+	_, err := handleTestPing(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -609,7 +638,7 @@ func TestHandleTestPingInvalidSproutID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"BAD_ID"}],"action":{"ping":true}}`)
-	_, err := handleTestPing(params)
+	_, err := handleTestPing(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid sprout ID")
 	}
@@ -619,7 +648,7 @@ func TestHandleTestPingUnknownSprout(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"unknown-sprout"}],"action":{"ping":true}}`)
-	_, err := handleTestPing(params)
+	_, err := handleTestPing(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for unknown sprout")
 	}
@@ -630,7 +659,7 @@ func TestHandleTestPingUnknownSprout(t *testing.T) {
 func TestHandleCookInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleCook(json.RawMessage(`{invalid`))
+	_, err := handleCook(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -640,7 +669,7 @@ func TestHandleCookInvalidSproutID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"BAD_UPPER"}],"action":{"recipe":"test.sls"}}`)
-	_, err := handleCook(params)
+	_, err := handleCook(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid sprout ID")
 	}
@@ -650,7 +679,7 @@ func TestHandleCookUnknownSprout(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"target":[{"id":"ghost-sprout"}],"action":{"recipe":"test.sls"}}`)
-	_, err := handleCook(params)
+	_, err := handleCook(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for unknown sprout")
 	}
@@ -662,12 +691,10 @@ func TestHandleCookNoNATSConn(t *testing.T) {
 	writeNKey(t, pkiDir, "accepted", "sprout-cook", "UKEY_COOK")
 	// Register the sprout as having an NKey to pass the existence check.
 
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn(pki.CurrentTenantID())
 
 	params := json.RawMessage(`{"target":[{"id":"sprout-cook"}],"action":{"recipe":"test.sls"}}`)
-	_, err := handleCook(params)
+	_, err := handleCook(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error when NATS not available")
 	}
@@ -681,7 +708,7 @@ func TestHandleCookNoNATSConn(t *testing.T) {
 func TestHandleShellStartInvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleShellStart(json.RawMessage(`{invalid`))
+	_, err := handleShellStart(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -691,7 +718,7 @@ func TestHandleShellStartMissingSproutID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{}`)
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for missing sprout_id")
 	}
@@ -701,7 +728,7 @@ func TestHandleShellStartInvalidSproutID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"sprout_id":"BAD_UPPER"}`)
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid sprout ID")
 	}
@@ -711,7 +738,7 @@ func TestHandleShellStartUnknownSprout(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"sprout_id":"unknown-sprout"}`)
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for unknown sprout")
 	}
@@ -721,7 +748,7 @@ func TestHandleShellStartSproutIDWithUnderscore(t *testing.T) {
 	setupNatsAPIPKI(t)
 
 	params := json.RawMessage(`{"sprout_id":"sprout_bad"}`)
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for sprout ID with underscore")
 	}
@@ -792,38 +819,38 @@ func TestLogShellEndNilLogger(t *testing.T) {
 // --- Auth add/remove user tests ---
 
 func TestHandleAuthAddUserMissingFields(t *testing.T) {
-	_, err := handleAuthAddUser(json.RawMessage(`{}`))
+	_, err := handleAuthAddUser(pki.CurrentTenantID(), json.RawMessage(`{}`))
 	if err == nil {
 		t.Fatal("expected error for missing fields")
 	}
 
-	_, err = handleAuthAddUser(json.RawMessage(`{"pubkey":"UTEST"}`))
+	_, err = handleAuthAddUser(pki.CurrentTenantID(), json.RawMessage(`{"pubkey":"UTEST"}`))
 	if err == nil {
 		t.Fatal("expected error for missing role")
 	}
 
-	_, err = handleAuthAddUser(json.RawMessage(`{"role":"admin"}`))
+	_, err = handleAuthAddUser(pki.CurrentTenantID(), json.RawMessage(`{"role":"admin"}`))
 	if err == nil {
 		t.Fatal("expected error for missing pubkey")
 	}
 }
 
 func TestHandleAuthAddUserInvalidJSON(t *testing.T) {
-	_, err := handleAuthAddUser(json.RawMessage(`{invalid`))
+	_, err := handleAuthAddUser(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
 }
 
 func TestHandleAuthRemoveUserMissingPubkey(t *testing.T) {
-	_, err := handleAuthRemoveUser(json.RawMessage(`{}`))
+	_, err := handleAuthRemoveUser(pki.CurrentTenantID(), json.RawMessage(`{}`))
 	if err == nil {
 		t.Fatal("expected error for missing pubkey")
 	}
 }
 
 func TestHandleAuthRemoveUserInvalidJSON(t *testing.T) {
-	_, err := handleAuthRemoveUser(json.RawMessage(`{invalid`))
+	_, err := handleAuthRemoveUser(pki.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -840,7 +867,7 @@ func TestAllAcceptedSproutIDs(t *testing.T) {
 	writeNKey(t, pkiDir, "accepted", "sprout-scope-b", "UKEY_B")
 	writeNKey(t, pkiDir, "unaccepted", "sprout-scope-c", "UKEY_C")
 
-	ids := allAcceptedSproutIDs()
+	ids := allAcceptedSproutIDs(pki.CurrentTenantID())
 	if len(ids) != 2 {
 		t.Fatalf("expected 2 accepted IDs, got %d", len(ids))
 	}
@@ -857,7 +884,7 @@ func TestAllAcceptedSproutIDs(t *testing.T) {
 func TestAllAcceptedSproutIDsEmpty(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	ids := allAcceptedSproutIDs()
+	ids := allAcceptedSproutIDs(pki.CurrentTenantID())
 	if len(ids) != 0 {
 		t.Errorf("expected 0 accepted IDs, got %d", len(ids))
 	}

@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"gorm.io/gorm"
 
 	apitypes "github.com/gogrlx/grlx/v2/internal/api/types"
 	"github.com/gogrlx/grlx/v2/internal/config"
@@ -19,23 +21,48 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
+// setupCmdTestPKI wires up an in-memory PKI store (see
+// internal/pki/store.go) plus a dummy farmer pub key, so pki lifecycle
+// calls (via addCmdTestSprout) don't hit ReloadNKeys' log.Fatalf path.
 func setupCmdTestPKI(t *testing.T) string {
 	t.Helper()
+
+	dsn := "file:" + t.Name() + "-pki?mode=memory&cache=shared"
+	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening pki test db: %v", err)
+	}
+	if err := gdb.AutoMigrate(pki.Models()...); err != nil {
+		t.Fatalf("migrating pki test db: %v", err)
+	}
+	pki.SetDB(gdb)
+	t.Cleanup(func() { pki.SetDB(nil) })
+
 	dir := t.TempDir()
 	config.FarmerPKI = dir + "/"
-	for _, state := range []string{"accepted", "unaccepted", "denied", "rejected"} {
-		if err := os.MkdirAll(filepath.Join(dir, "sprouts", state), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	farmerPubFile := filepath.Join(dir, "farmer.pub")
+	if err := os.WriteFile(farmerPubFile, []byte("UFAKE_FARMER_KEY_FOR_TESTING"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	config.NKeyFarmerPubFile = farmerPubFile
+	pki.NatsServer = nil
 	return dir
 }
 
-func addCmdTestSprout(t *testing.T, dir, state, id, nkey string) {
+// addCmdTestSprout registers id as an accepted sprout with the given nkey,
+// via the same lifecycle pki.UnacceptNKey/AcceptNKey handlers use in
+// production. dir is unused (kept so existing call sites don't need to
+// change) now that PKI state lives in PXC, not on disk.
+func addCmdTestSprout(t *testing.T, _, state, id, nkey string) {
 	t.Helper()
-	path := filepath.Join(dir, "sprouts", state, id)
-	if err := os.WriteFile(path, []byte(nkey), 0o644); err != nil {
-		t.Fatal(err)
+	if state != "accepted" {
+		t.Fatalf("addCmdTestSprout: unsupported state %q", state)
+	}
+	if err := pki.UnacceptNKey(pki.CurrentTenantID(), id, nkey); err != nil {
+		t.Fatalf("UnacceptNKey(%q): %v", id, err)
+	}
+	if err := pki.AcceptNKey(pki.CurrentTenantID(), id); err != nil {
+		t.Fatalf("AcceptNKey(%q): %v", id, err)
 	}
 }
 
@@ -60,9 +87,14 @@ func startCmdTestNATS(t *testing.T) (*nats.Conn, func()) {
 		ns.Shutdown()
 		t.Fatalf("connect to test NATS: %v", err)
 	}
-	icmd.RegisterNatsConn(conn)
+	// HCmdRun dispatches through cmd.FRun using pki.CurrentTenantID() (the
+	// HTTP admin API's documented ceiling — see
+	// docs/design/grlx-tenant-context-threading.md), so tests register the
+	// farmer-side connection under that same tenant.
+	tenantID := pki.CurrentTenantID()
+	icmd.RegisterFarmerNatsConn(tenantID, conn)
 	return conn, func() {
-		icmd.RegisterNatsConn(nil)
+		icmd.UnregisterFarmerNatsConn(tenantID)
 		conn.Close()
 		ns.Shutdown()
 	}

@@ -11,7 +11,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
-func handleTestPing(params json.RawMessage) (any, error) {
+func handleTestPing(tenantID string, params json.RawMessage) (any, error) {
 	var ta apitypes.TargetedAction
 	if err := json.Unmarshal(params, &ta); err != nil {
 		return nil, fmt.Errorf("invalid request: %w", err)
@@ -25,7 +25,7 @@ func handleTestPing(params json.RawMessage) (any, error) {
 		if !pki.IsValidSproutID(target.SproutID) || strings.Contains(target.SproutID, "_") {
 			return nil, fmt.Errorf("invalid sprout ID: %s", target.SproutID)
 		}
-		registered, _ := pki.NKeyExists(target.SproutID, "")
+		registered, _ := pki.NKeyExists(tenantID, target.SproutID, "")
 		if !registered {
 			return nil, fmt.Errorf("unknown sprout: %s", target.SproutID)
 		}
@@ -41,7 +41,7 @@ func handleTestPing(params json.RawMessage) (any, error) {
 		wg.Add(1)
 		go func(t pki.KeyManager) {
 			defer wg.Done()
-			pong, err := test.FPing(t, ping)
+			pong, err := test.FPing(tenantID, t, ping)
 			mu.Lock()
 			if err != nil {
 				results.Results[t.SproutID] = map[string]string{"error": err.Error()}

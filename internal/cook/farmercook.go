@@ -1,6 +1,7 @@
 package cook
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,10 +46,10 @@ func WithTargetStep(id StepID) CookOption {
 	}
 }
 
-func populateFuncMap(sproutID string) template.FuncMap {
+func populateFuncMap(tenantID, sproutID string) template.FuncMap {
 	v := template.FuncMap{}
-	v["props"] = props.GetStringPropFunc(sproutID)
-	v["hostname"] = props.GetHostnameFunc(sproutID)
+	v["props"] = props.GetStringPropFuncForTenant(tenantID, sproutID)
+	v["hostname"] = props.GetHostnameFuncForTenant(tenantID, sproutID)
 
 	// Environment variable access.
 	v["env"] = os.Getenv
@@ -93,9 +94,13 @@ func populateFuncMap(sproutID string) template.FuncMap {
 	return v
 }
 
-func SendCookEvent(sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
+// SendCookEvent triggers a recipe cook on sproutID, over tenantID's
+// dedicated NATS connection (see RegisterFarmerNatsConn) — the sprout's own
+// tenant, not necessarily whichever tenant happens to be "current" for the
+// process.
+func SendCookEvent(tenantID, sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
 	basepath := getBasePath()
-	includes, err := collectAllIncludes(sproutID, basepath, recipeID)
+	includes, err := collectAllIncludes(tenantID, sproutID, basepath, recipeID)
 	if err != nil {
 		return err
 	}
@@ -107,11 +112,11 @@ func SendCookEvent(sproutID string, recipeID RecipeName, JID string, test bool, 
 			log.Errorf("could not find include %s: %v", inc, err)
 			return errors.Join(ErrNoRecipe, fpErr)
 		}
-		f, fpErr := os.ReadFile(fp)
+		f, fpErr := store.Get(context.Background(), fp)
 		if fpErr != nil {
 			return fpErr
 		}
-		b, renderErr := renderRecipeTemplate(sproutID, fp, f)
+		b, renderErr := renderRecipeTemplate(tenantID, sproutID, fp, f)
 		if renderErr != nil {
 			return renderErr
 		}
@@ -174,8 +179,12 @@ func SendCookEvent(sproutID string, recipeID RecipeName, JID string, test bool, 
 	}
 	b, _ := json.Marshal(rEnvelope)
 	log.Noticef("cooking sprout %s: %s", sproutID, JID)
+	farmerConn := farmerConnFor(tenantID)
+	if farmerConn == nil {
+		return fmt.Errorf("cook: no NATS connection registered for tenant %s", tenantID)
+	}
 	var ack Ack
-	msg, err := conn.Request("grlx.sprouts."+sproutID+".cook", b, 30*time.Second)
+	msg, err := farmerConn.Request("grlx.sprouts."+sproutID+".cook", b, 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -196,7 +205,20 @@ func GenerateJobID() string {
 	return uuid.New().String()
 }
 
+// ResolveRecipeFilePath resolves a dot-notation RecipeName to an object
+// key under the object-storage backend (see store.go) recipes are read
+// from — basepath is the configured key prefix (config.RecipeDir /
+// GRLX_RECIPE_DIR, see getBasePath), not a local filesystem directory.
+// The resolution rules (dot-to-slash, try "<name>/init.grlx" before
+// "<name>.grlx") are unchanged from the local-disk version; only the
+// existence check moved from os.Stat to a bucket lookup. Object storage
+// has no directory concept, so the old "resolved path is a directory"
+// case (ErrRecipePathIsDirectory) can no longer happen and is gone.
 func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error) {
+	if store == nil {
+		return "", ErrNoRecipe
+	}
+	ctx := context.Background()
 	path := string(recipeID)
 	basepath = filepath.Clean(basepath)
 	path = filepath.Clean(path)
@@ -208,12 +230,12 @@ func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error)
 		path = strings.ReplaceAll(path, ".", string(filepath.Separator))
 		path = path + "." + config.GrlxExt
 
-		stat, err := os.Stat(path)
-		if os.IsNotExist(err) {
+		ok, err := store.Exists(ctx, path)
+		if err != nil {
 			return "", err
 		}
-		if stat.IsDir() {
-			return "", fmt.Errorf("%s: .grlx path is a directory: %w", path, ErrRecipePathIsDirectory)
+		if !ok {
+			return "", ErrNoRecipe
 		}
 		return path, nil
 	}
@@ -222,23 +244,20 @@ func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error)
 	path = strings.ReplaceAll(path, ".", string(filepath.Separator))
 	// check if path is a directory and contains init.grlx
 	initFile := filepath.Join(path, "init."+config.GrlxExt)
-	stat, err := os.Stat(initFile)
-	if err == nil {
-		if stat.IsDir() {
-			return "", fmt.Errorf("%s: init.grlx is a directory: %w", initFile, ErrRecipePathIsDirectory)
-		}
+	if ok, err := store.Exists(ctx, initFile); err != nil {
+		return "", err
+	} else if ok {
 		return initFile, nil
 	}
 
 	// check if path is a valid .grlx file
 	extPath := path + "." + config.GrlxExt
-	stat, err = os.Stat(extPath)
-	if err == nil {
-		if stat.IsDir() {
-			return "", fmt.Errorf("%s: resolved path is a directory: %w", extPath, ErrRecipePathIsDirectory)
-		}
-		return extPath, nil
-	} else {
+	ok, err := store.Exists(ctx, extPath)
+	if err != nil {
 		return "", err
 	}
+	if !ok {
+		return "", ErrNoRecipe
+	}
+	return extPath, nil
 }

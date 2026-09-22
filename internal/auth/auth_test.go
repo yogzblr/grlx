@@ -7,6 +7,7 @@ import (
 )
 
 func TestExtractStringSlice(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name  string
 		input any
@@ -35,6 +36,7 @@ func TestExtractStringSlice(t *testing.T) {
 }
 
 func TestContainsKey(t *testing.T) {
+	newTestDB(t)
 	slice := []string{"AKEY1", "AKEY2", "AKEY3"}
 	if !containsKey(slice, "AKEY2") {
 		t.Error("expected containsKey to find AKEY2")
@@ -48,12 +50,14 @@ func TestContainsKey(t *testing.T) {
 }
 
 func TestDangerouslyAllowRoot(t *testing.T) {
+	newTestDB(t)
 	if DangerouslyAllowRoot() {
 		t.Error("DangerouslyAllowRoot should default to false")
 	}
 }
 
 func TestDangerouslyAllowRootBypassesTokenHasAccess(t *testing.T) {
+	newTestDB(t)
 	// Without dangerously_allow_root, invalid tokens are rejected.
 	if TokenHasAccess("invalid-token", "GET") {
 		t.Error("expected TokenHasAccess to reject invalid token without bypass")
@@ -74,6 +78,7 @@ func TestDangerouslyAllowRootBypassesTokenHasAccess(t *testing.T) {
 }
 
 func TestWhoAmIInvalidToken(t *testing.T) {
+	newTestDB(t)
 	_, roleName, _, err := WhoAmI("invalid-token")
 	if err == nil {
 		t.Error("expected error for invalid token")
@@ -84,18 +89,21 @@ func TestWhoAmIInvalidToken(t *testing.T) {
 }
 
 func TestTokenHasRouteAccessInvalidToken(t *testing.T) {
+	newTestDB(t)
 	if TokenHasRouteAccess("bad-token", "Cook") {
 		t.Error("expected TokenHasRouteAccess to return false for invalid token")
 	}
 }
 
 func TestTokenHasScopedAccessInvalidToken(t *testing.T) {
+	newTestDB(t)
 	if TokenHasScopedAccess("bad-token", rbac.ActionCook, []string{"web-1"}, nil) {
 		t.Error("expected TokenHasScopedAccess to return false for invalid token")
 	}
 }
 
 func TestTokenScopeFilterInvalidToken(t *testing.T) {
+	newTestDB(t)
 	result := TokenScopeFilter("bad-token", rbac.ActionCook, []string{"web-1"}, nil)
 	if result != nil {
 		t.Errorf("expected nil for invalid token, got %v", result)
@@ -103,6 +111,7 @@ func TestTokenScopeFilterInvalidToken(t *testing.T) {
 }
 
 func TestLookupRoleNoPolicy(t *testing.T) {
+	newTestDB(t)
 	// With no policy loaded, lookupRole should return nil
 	role := lookupRole("ANONEXISTENTKEY")
 	if role != nil {
@@ -111,6 +120,7 @@ func TestLookupRoleNoPolicy(t *testing.T) {
 }
 
 func TestSetPolicyAndLookup(t *testing.T) {
+	newTestDB(t)
 	rs := rbac.NewRoleStore()
 	adminRole := &rbac.Role{
 		Name:  "test-admin",
@@ -145,6 +155,7 @@ func TestSetPolicyAndLookup(t *testing.T) {
 }
 
 func TestListAllUsersEmpty(t *testing.T) {
+	newTestDB(t)
 	SetPolicy(rbac.NewRoleStore(), rbac.NewUserRoleMap(), nil)
 	defer SetPolicy(nil, nil, nil)
 
@@ -155,6 +166,7 @@ func TestListAllUsersEmpty(t *testing.T) {
 }
 
 func TestListRolesEmpty(t *testing.T) {
+	newTestDB(t)
 	SetPolicy(rbac.NewRoleStore(), rbac.NewUserRoleMap(), nil)
 	defer SetPolicy(nil, nil, nil)
 
@@ -165,6 +177,7 @@ func TestListRolesEmpty(t *testing.T) {
 }
 
 func TestGetRoleNotFound(t *testing.T) {
+	newTestDB(t)
 	SetPolicy(rbac.NewRoleStore(), rbac.NewUserRoleMap(), nil)
 	defer SetPolicy(nil, nil, nil)
 
@@ -175,6 +188,7 @@ func TestGetRoleNotFound(t *testing.T) {
 }
 
 func TestBuiltinViewerRoleIntegration(t *testing.T) {
+	newTestDB(t)
 	// Set up policy with the built-in viewer role and a user assigned to it.
 	rs := rbac.NewRoleStore()
 	viewer := rbac.BuiltinViewerRole()
@@ -223,6 +237,7 @@ func TestBuiltinViewerRoleIntegration(t *testing.T) {
 }
 
 func TestViewerRoleVisibleInListRoles(t *testing.T) {
+	newTestDB(t)
 	rs := rbac.NewRoleStore()
 	if err := rs.Register(rbac.BuiltinViewerRole()); err != nil {
 		t.Fatalf("failed to register viewer: %v", err)
@@ -245,6 +260,7 @@ func TestViewerRoleVisibleInListRoles(t *testing.T) {
 }
 
 func TestGetBuiltinViewerRole(t *testing.T) {
+	newTestDB(t)
 	rs := rbac.NewRoleStore()
 	if err := rs.Register(rbac.BuiltinViewerRole()); err != nil {
 		t.Fatalf("failed to register viewer: %v", err)

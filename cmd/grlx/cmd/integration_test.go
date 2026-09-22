@@ -2,12 +2,19 @@ package cmd
 
 import (
 	"encoding/json"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
+	"github.com/taigrr/jety"
 
 	"github.com/gogrlx/grlx/v2/internal/api/client"
 	apitypes "github.com/gogrlx/grlx/v2/internal/api/types"
@@ -538,20 +545,64 @@ func TestVersionCommand_JSON(t *testing.T) {
 
 // --- Recipes commands ---
 
-func TestRecipesListCommand_Text(t *testing.T) {
-	conn, cleanup := setupTestNATS(t)
-	defer cleanup()
+// setupTestRecipeFarmer stands in for the farmer's dedicated recipe HTTP
+// endpoint (internal/api/handlers/recipes.go) that cmd/grlx/cmd/recipes.go
+// now calls directly over HTTPS via internal/api/client, instead of the
+// grlx.api.recipes.list/recipes.get NATS methods these tests used to mock
+// — see docs/design/grlx-fork-roadmap.md workstream I. It trusts the test
+// server's certificate as config.GrlxRootCA and provisions a signing key
+// for the auth token internal/api/client attaches.
+func setupTestRecipeFarmer(t *testing.T, handler http.HandlerFunc) {
+	t.Helper()
+	ts := httptest.NewTLSServer(handler)
+	t.Cleanup(ts.Close)
 
-	conn.Subscribe("grlx.api.recipes.list", func(msg *nats.Msg) {
-		result := struct {
-			Recipes []RecipeInfo `json:"recipes"`
-		}{
-			Recipes: []RecipeInfo{
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw})
+	caFile := filepath.Join(t.TempDir(), "rootca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, port, ok := strings.Cut(strings.TrimPrefix(ts.URL, "https://"), ":")
+	if !ok {
+		t.Fatalf("unexpected test server URL: %s", ts.URL)
+	}
+
+	origRootCA, origIface, origPort := config.GrlxRootCA, config.FarmerInterface, config.FarmerAPIPort
+	config.GrlxRootCA = caFile
+	config.FarmerInterface = host
+	config.FarmerAPIPort = port
+	t.Cleanup(func() {
+		config.GrlxRootCA = origRootCA
+		config.FarmerInterface = origIface
+		config.FarmerAPIPort = origPort
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("# test config\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jety.SetConfigType("toml")
+	jety.SetConfigFile(configPath)
+	kp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := kp.Seed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jety.Set("privkey", string(seed))
+	t.Cleanup(func() { jety.Set("privkey", "") })
+}
+
+func TestRecipesListCommand_Text(t *testing.T) {
+	setupTestRecipeFarmer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string][]RecipeInfo{
+			"recipes": {
 				{Name: "base.packages", Path: "/srv/recipes/base/packages.grlx", Size: 1024},
 				{Name: "webserver.nginx", Path: "/srv/recipes/webserver/nginx.grlx", Size: 2048},
 			},
-		}
-		natsRespond(msg, result)
+		})
 	})
 
 	oldMode := outputMode
@@ -574,14 +625,8 @@ func TestRecipesListCommand_Text(t *testing.T) {
 }
 
 func TestRecipesListCommand_Empty(t *testing.T) {
-	conn, cleanup := setupTestNATS(t)
-	defer cleanup()
-
-	conn.Subscribe("grlx.api.recipes.list", func(msg *nats.Msg) {
-		result := struct {
-			Recipes []RecipeInfo `json:"recipes"`
-		}{}
-		natsRespond(msg, result)
+	setupTestRecipeFarmer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string][]RecipeInfo{"recipes": {}})
 	})
 
 	oldMode := outputMode
@@ -598,17 +643,13 @@ func TestRecipesListCommand_Empty(t *testing.T) {
 }
 
 func TestRecipesShowCommand_Text(t *testing.T) {
-	conn, cleanup := setupTestNATS(t)
-	defer cleanup()
-
-	conn.Subscribe("grlx.api.recipes.get", func(msg *nats.Msg) {
-		result := RecipeContent{
+	setupTestRecipeFarmer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(RecipeContent{
 			Name:    "base.packages",
 			Path:    "/srv/recipes/base/packages.grlx",
 			Content: "pkg.installed:\n  - name: nginx",
 			Size:    42,
-		}
-		natsRespond(msg, result)
+		})
 	})
 
 	oldMode := outputMode
@@ -1735,17 +1776,13 @@ func TestUsersRemoveCommand_JSON(t *testing.T) {
 // --- Recipes show JSON ---
 
 func TestRecipesShowCommand_JSON(t *testing.T) {
-	conn, cleanup := setupTestNATS(t)
-	defer cleanup()
-
-	conn.Subscribe("grlx.api.recipes.get", func(msg *nats.Msg) {
-		result := RecipeContent{
+	setupTestRecipeFarmer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(RecipeContent{
 			Name:    "base.packages",
 			Path:    "/srv/recipes/base/packages.grlx",
 			Content: "pkg.installed:\n  - name: nginx",
 			Size:    42,
-		}
-		natsRespond(msg, result)
+		})
 	})
 
 	oldMode := outputMode

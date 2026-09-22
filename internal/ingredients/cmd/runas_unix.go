@@ -11,8 +11,13 @@ import (
 	"syscall"
 )
 
-// setRunAs configures the command to run as a different user on Unix systems.
+// setRunAs configures the command to run as a different user on Unix
+// systems, setting both the UID and primary GID from the named user's
+// passwd entry. It is a no-op when runAs is empty.
 func setRunAs(command *exec.Cmd, runAs string) error {
+	if runAs == "" {
+		return nil
+	}
 	u, err := user.Lookup(runAs)
 	if err != nil {
 		return err

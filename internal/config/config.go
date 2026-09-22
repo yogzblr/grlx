@@ -51,8 +51,14 @@ var (
 	// happens over the NATS bus.
 	FarmerAPIPort string
 
-	FarmerBusURL          string
-	FarmerBusPort         string
+	FarmerBusURL  string
+	FarmerBusPort string
+	// FarmerWSPort is the port for nats-server's websocket listener —
+	// what Envoy's jwt_authn-gated route proxies sprout wss:// connections
+	// to, per docs/design/grlx-envoy-enrollment-design.md. Distinct from
+	// FarmerBusPort (the plain TCP NATS listener grlx CLI/farmer-to-farmer
+	// connections still use).
+	FarmerWSPort          string
 	FarmerInterface       string
 	FarmerOrganization    string
 	FarmerPKI             string
@@ -74,6 +80,56 @@ var (
 	SproutID              string
 	SproutPKI             string
 	SproutRootCA          string
+
+	// GatewayJWTTTL bounds how long a minted gateway JWT
+	// (internal/gatewayjwt) stays valid. Short by design: Envoy's
+	// jwt_authn has no live revocation check of its own, so this expiry
+	// is what makes a revoked sprout's gateway JWT age out promptly —
+	// ongoing per-connection authorization is nats-server's Account/User
+	// JWT model's job, not Envoy's.
+	GatewayJWTTTL time.Duration
+
+	// GatewayTransitKeyName is the OpenBao Transit key name
+	// internal/gatewayjwt signs gateway JWTs with.
+	GatewayTransitKeyName string
+
+	// BoxKeyGraceDuration bounds how long a sprout's previous X25519 box
+	// public key stays valid after a sprout-initiated rotation
+	// (internal/pki/boxkeys.go), so payloads already in flight when a
+	// rotation happens still decrypt correctly. See
+	// docs/design/grlx-payload-encryption-design.md's "Key rotation".
+	BoxKeyGraceDuration time.Duration
+
+	// SproutBusURLs are the externally-reachable wss:// addresses (fronted
+	// by Envoy's jwt_authn-gated route — see
+	// docs/design/grlx-envoy-enrollment-design.md) an enrolling sprout is
+	// told to connect to, returned as nats_urls in the enrollment response
+	// (cloudxp-machine-manager-api-design.md §3.2). Comma-separated in
+	// config/env; empty by default, in which case the enrollment handler
+	// falls back to deriving a single-node URL from
+	// FarmerInterface/FarmerWSPort for local/dev use.
+	SproutBusURLs []string
+
+	// PXCDSN is the GORM MySQL DSN for the shared Percona XtraDB Cluster's
+	// `farmer` schema (PKI, props/facts, RBAC — see internal/pxc,
+	// internal/props/store.go, internal/pki/store.go,
+	// internal/rbac/store.go), e.g.
+	// "farmer_svc:pass@tcp(pxc-cluster:3306)/farmer?parseTime=true".
+	PXCDSN string
+
+	// ValkeyAddrs is the comma-separated list of Valkey node addresses
+	// (host:port) backing the connection-state heartbeat (see
+	// internal/heartbeat).
+	ValkeyAddrs string
+
+	// S3Endpoint/S3AccessKeyID/S3SecretAccessKey/S3UseSSL/S3Bucket
+	// configure the object-storage backend recipes are read from (see
+	// internal/objectstore, internal/cook/store.go).
+	S3Endpoint        string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3UseSSL          bool
+	S3Bucket          string
 )
 
 // Binary represents the type of grlx binary being configured.
@@ -150,6 +206,7 @@ func LoadConfig(binary string) {
 		jety.SetDefault("farmerinterface", "localhost")
 		jety.SetDefault("farmerapiport", "5405")
 		jety.SetDefault("farmerbusport", "5406")
+		jety.SetDefault("farmerwsport", "5407")
 		switch binary {
 		case "grlx":
 			dirname, err := os.UserHomeDir()
@@ -181,10 +238,60 @@ func LoadConfig(binary string) {
 			jety.SetDefault("rootca", filepath.Join(systemConfigRoot, "pki/farmer/tls-rootca.pem"))
 			jety.SetDefault("rootcapriv", filepath.Join(systemConfigRoot, "pki/farmer/tls-rootca-key.pem"))
 			jety.SetDefault("farmerorganization", "grlx farmer")
+			jety.SetDefault("gatewayjwtttl", 24*time.Hour)
+			jety.SetDefault("gatewaytransitkeyname", "grlx-gateway-jwt")
+			jety.SetDefault("boxkeygraceduration", 24*time.Hour)
+			jety.SetDefault("s3usessl", true)
 			JobLogDir = jety.GetString("joblogdir")
 			JobLogTTL = jety.GetDuration("joblogttl")
 			PropsDir = jety.GetString("propsdir")
 			CertHosts = jety.GetStringSlice("certhosts")
+
+			// PXC/Valkey/S3 connection settings are deployment secrets, not
+			// meaningful YAML defaults — like ADMIN_PUBKEYS/CERT_HOSTS below,
+			// they're read from the environment when the config file doesn't
+			// set them, rather than given a default value.
+			if jety.GetString("pxcdsn") == "" {
+				if v, found := os.LookupEnv("GRLX_PXC_DSN"); found {
+					jety.Set("pxcdsn", v)
+				}
+			}
+			if jety.GetString("valkeyaddrs") == "" {
+				if v, found := os.LookupEnv("GRLX_VALKEY_ADDRS"); found {
+					jety.Set("valkeyaddrs", v)
+				}
+			}
+			if jety.GetString("s3endpoint") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_ENDPOINT"); found {
+					jety.Set("s3endpoint", v)
+				}
+			}
+			if jety.GetString("s3accesskeyid") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_ACCESS_KEY_ID"); found {
+					jety.Set("s3accesskeyid", v)
+				}
+			}
+			if jety.GetString("s3secretaccesskey") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_SECRET_ACCESS_KEY"); found {
+					jety.Set("s3secretaccesskey", v)
+				}
+			}
+			if jety.GetString("s3bucket") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_BUCKET"); found {
+					jety.Set("s3bucket", v)
+				}
+			}
+			if len(jety.GetStringSlice("sproutbusurls")) == 0 {
+				if v, found := os.LookupEnv("GRLX_SPROUT_BUS_URLS"); found {
+					urls := []string{}
+					for _, u := range strings.Split(v, ",") {
+						if u != "" {
+							urls = append(urls, u)
+						}
+					}
+					jety.Set("sproutbusurls", urls)
+				}
+			}
 
 			AdminPubKeys := jety.GetStringMap("pubkeys")
 			if len(AdminPubKeys) == 0 {
@@ -288,6 +395,7 @@ func LoadConfig(binary string) {
 	FarmerAPIPort = jety.GetString("farmerapiport")
 	FarmerBusURL = jety.GetString("farmerinterface") + ":" + jety.GetString("farmerbusport")
 	FarmerBusPort = jety.GetString("farmerbusport")
+	FarmerWSPort = jety.GetString("farmerwsport")
 	FarmerInterface = jety.GetString("farmerinterface")
 	FarmerPKI = jety.GetString("farmerpki")
 	FarmerURL = "https://" + jety.GetString("farmerinterface") + ":" + jety.GetString("farmerapiport")
@@ -298,6 +406,9 @@ func LoadConfig(binary string) {
 	NKeySproutPrivFile = jety.GetString("nkeysproutprivfile")
 	NKeySproutPubFile = jety.GetString("nkeysproutpubfile")
 	FarmerOrganization = jety.GetString("farmerorganization")
+	GatewayJWTTTL = jety.GetDuration("gatewayjwtttl")
+	GatewayTransitKeyName = jety.GetString("gatewaytransitkeyname")
+	BoxKeyGraceDuration = jety.GetDuration("boxkeygraceduration")
 	RootCA = jety.GetString("rootca")
 	RootCAPriv = jety.GetString("rootcapriv")
 	SproutID = jety.GetString("sproutid")
@@ -307,6 +418,14 @@ func LoadConfig(binary string) {
 	if RecipeDir == "" {
 		RecipeDir = filepath.Join("/", "srv", "grlx", "recipes", "prod")
 	}
+	PXCDSN = jety.GetString("pxcdsn")
+	ValkeyAddrs = jety.GetString("valkeyaddrs")
+	S3Endpoint = jety.GetString("s3endpoint")
+	S3AccessKeyID = jety.GetString("s3accesskeyid")
+	S3SecretAccessKey = jety.GetString("s3secretaccesskey")
+	S3UseSSL = jety.GetBool("s3usessl")
+	S3Bucket = jety.GetString("s3bucket")
+	SproutBusURLs = jety.GetStringSlice("sproutbusurls")
 }
 
 // BasePathValid checks that the configured recipe directory exists.

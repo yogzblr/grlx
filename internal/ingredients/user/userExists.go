@@ -3,9 +3,16 @@ package user
 import (
 	"context"
 	"errors"
+	"os/user"
 
 	"github.com/gogrlx/grlx/v2/internal/cook"
 )
+
+// lookupUser is a test-overridable wrapper around user.Lookup. It is
+// implemented by the stdlib os/user package on every OS grlx targets, so
+// it is shared between the Unix and Windows providers rather than
+// reimplemented per platform.
+var lookupUser = user.Lookup
 
 func (u User) exists(ctx context.Context, test bool) (cook.Result, error) {
 	var result cook.Result

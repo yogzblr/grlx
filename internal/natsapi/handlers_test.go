@@ -26,7 +26,7 @@ func TestHandleVersion(t *testing.T) {
 	SetBuildVersion(want)
 	defer SetBuildVersion(config.Version{})
 
-	result, err := handleVersion(nil)
+	result, err := handleVersion(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleVersion: unexpected error: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestHandleVersion(t *testing.T) {
 func TestHandleVersionEmpty(t *testing.T) {
 	SetBuildVersion(config.Version{})
 
-	result, err := handleVersion(nil)
+	result, err := handleVersion(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleVersion: unexpected error: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestHandleJobsListEmpty(t *testing.T) {
 	_, cleanup := setupJobStore(t)
 	defer cleanup()
 
-	result, err := handleJobsList(nil)
+	result, err := handleJobsList(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleJobsList: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestHandleJobsListWithJobs(t *testing.T) {
 	writeTestJob(t, dir, "sprout-alpha", "jid-001", steps)
 	writeTestJob(t, dir, "sprout-beta", "jid-002", steps)
 
-	result, err := handleJobsList(nil)
+	result, err := handleJobsList(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleJobsList: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestHandleJobsListWithLimit(t *testing.T) {
 	writeTestJob(t, dir, "sprout-a", "jid-3", steps)
 
 	params := json.RawMessage(`{"limit":2}`)
-	result, err := handleJobsList(params)
+	result, err := handleJobsList(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsList: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestHandleJobsListFilterByUser(t *testing.T) {
 
 	// Filter by Alice — should get 2 jobs.
 	params := json.RawMessage(`{"user":"UALICE000"}`)
-	result, err := handleJobsList(params)
+	result, err := handleJobsList(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsList: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestHandleJobsListFilterByUser(t *testing.T) {
 
 	// Filter by Bob — should get 1 job.
 	params = json.RawMessage(`{"user":"UBOB00000"}`)
-	result, err = handleJobsList(params)
+	result, err = handleJobsList(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsList: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestHandleJobsListFilterByUser(t *testing.T) {
 
 	// Filter by unknown user — should get 0 jobs.
 	params = json.RawMessage(`{"user":"UNOBODY00"}`)
-	result, err = handleJobsList(params)
+	result, err = handleJobsList(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsList: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestHandleJobsGetMissing(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"jid":"nonexistent"}`)
-	_, err := handleJobsGet(params)
+	_, err := handleJobsGet(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent JID")
 	}
@@ -248,7 +248,7 @@ func TestHandleJobsGetFound(t *testing.T) {
 	writeTestJob(t, dir, "sprout-x", "jid-abc", steps)
 
 	params := json.RawMessage(`{"jid":"jid-abc"}`)
-	result, err := handleJobsGet(params)
+	result, err := handleJobsGet(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsGet: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestHandleJobsGetEmptyJID(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"jid":""}`)
-	_, err := handleJobsGet(params)
+	_, err := handleJobsGet(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty JID")
 	}
@@ -280,7 +280,7 @@ func TestHandleJobsGetInvalidJSON(t *testing.T) {
 	_, cleanup := setupJobStore(t)
 	defer cleanup()
 
-	_, err := handleJobsGet(json.RawMessage(`{invalid`))
+	_, err := handleJobsGet(props.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -296,12 +296,10 @@ func TestHandleJobsCancelNoNATS(t *testing.T) {
 	writeTestJob(t, dir, "sprout-c", "jid-cancel", steps)
 
 	// Ensure no NATS connection.
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn(props.CurrentTenantID())
 
 	params := json.RawMessage(`{"jid":"jid-cancel"}`)
-	_, err := handleJobsCancel(params)
+	_, err := handleJobsCancel(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error when NATS not available")
 	}
@@ -312,7 +310,7 @@ func TestHandleJobsCancelEmptyJID(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"jid":""}`)
-	_, err := handleJobsCancel(params)
+	_, err := handleJobsCancel(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty JID")
 	}
@@ -323,7 +321,7 @@ func TestHandleJobsCancelNonexistent(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"jid":"does-not-exist"}`)
-	_, err := handleJobsCancel(params)
+	_, err := handleJobsCancel(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent JID")
 	}
@@ -341,7 +339,7 @@ func TestHandleJobsListForSprout(t *testing.T) {
 	writeTestJob(t, dir, "sprout-other", "jid-c", steps)
 
 	params := json.RawMessage(`{"sprout_id":"sprout-target"}`)
-	result, err := handleJobsListForSprout(params)
+	result, err := handleJobsListForSprout(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsListForSprout: %v", err)
 	}
@@ -360,7 +358,7 @@ func TestHandleJobsListForSproutEmpty(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"sprout_id":""}`)
-	_, err := handleJobsListForSprout(params)
+	_, err := handleJobsListForSprout(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty sprout_id")
 	}
@@ -371,7 +369,7 @@ func TestHandleJobsListForSproutNoJobs(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"sprout_id":"no-such-sprout"}`)
-	_, err := handleJobsListForSprout(params)
+	_, err := handleJobsListForSprout(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for sprout with no jobs directory")
 	}
@@ -389,7 +387,7 @@ func TestHandleJobsDeleteSuccess(t *testing.T) {
 	writeTestJob(t, dir, "sprout-del", "del-jid", steps)
 
 	params := json.RawMessage(`{"jid":"del-jid"}`)
-	result, err := handleJobsDelete(params)
+	result, err := handleJobsDelete(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleJobsDelete: %v", err)
 	}
@@ -403,7 +401,7 @@ func TestHandleJobsDeleteSuccess(t *testing.T) {
 	}
 
 	// Verify job is gone.
-	_, err = handleJobsGet(json.RawMessage(`{"jid":"del-jid"}`))
+	_, err = handleJobsGet(props.CurrentTenantID(), json.RawMessage(`{"jid":"del-jid"}`))
 	if err == nil {
 		t.Fatal("expected error: job should be deleted")
 	}
@@ -414,7 +412,7 @@ func TestHandleJobsDeleteNotFound(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"jid":"nonexistent"}`)
-	_, err := handleJobsDelete(params)
+	_, err := handleJobsDelete(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent job")
 	}
@@ -425,7 +423,7 @@ func TestHandleJobsDeleteEmptyJID(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"jid":""}`)
-	_, err := handleJobsDelete(params)
+	_, err := handleJobsDelete(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty JID")
 	}
@@ -435,7 +433,7 @@ func TestHandleJobsDeleteInvalidJSON(t *testing.T) {
 	_, cleanup := setupJobStore(t)
 	defer cleanup()
 
-	_, err := handleJobsDelete(json.RawMessage(`{invalid`))
+	_, err := handleJobsDelete(props.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -446,7 +444,7 @@ func TestHandleJobsDeleteInvalidJSON(t *testing.T) {
 func TestHandlePropsSetAndGet(t *testing.T) {
 	// Props uses an in-memory cache, so we just set and get.
 	setParams := json.RawMessage(`{"sprout_id":"sprout-1","name":"os","value":"linux"}`)
-	result, err := handlePropsSet(setParams)
+	result, err := handlePropsSet(props.CurrentTenantID(), setParams)
 	if err != nil {
 		t.Fatalf("handlePropsSet: %v", err)
 	}
@@ -456,7 +454,7 @@ func TestHandlePropsSetAndGet(t *testing.T) {
 	}
 
 	getParams := json.RawMessage(`{"sprout_id":"sprout-1","name":"os"}`)
-	result, err = handlePropsGet(getParams)
+	result, err = handlePropsGet(props.CurrentTenantID(), getParams)
 	if err != nil {
 		t.Fatalf("handlePropsGet: %v", err)
 	}
@@ -475,15 +473,15 @@ func TestHandlePropsSetAndGet(t *testing.T) {
 
 func TestHandlePropsGetAll(t *testing.T) {
 	// Set multiple props.
-	handlePropsSet(json.RawMessage(`{"sprout_id":"sprout-2","name":"arch","value":"amd64"}`))
-	handlePropsSet(json.RawMessage(`{"sprout_id":"sprout-2","name":"os","value":"freebsd"}`))
+	handlePropsSet(props.CurrentTenantID(), json.RawMessage(`{"sprout_id":"sprout-2","name":"arch","value":"amd64"}`))
+	handlePropsSet(props.CurrentTenantID(), json.RawMessage(`{"sprout_id":"sprout-2","name":"os","value":"freebsd"}`))
 	defer func() {
 		props.DeleteProp("sprout-2", "arch")
 		props.DeleteProp("sprout-2", "os")
 	}()
 
 	params := json.RawMessage(`{"sprout_id":"sprout-2"}`)
-	result, err := handlePropsGetAll(params)
+	result, err := handlePropsGetAll(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePropsGetAll: %v", err)
 	}
@@ -499,7 +497,7 @@ func TestHandlePropsGetAll(t *testing.T) {
 
 func TestHandlePropsGetAllEmpty(t *testing.T) {
 	params := json.RawMessage(`{"sprout_id":"sprout-empty"}`)
-	result, err := handlePropsGetAll(params)
+	result, err := handlePropsGetAll(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePropsGetAll: %v", err)
 	}
@@ -515,7 +513,7 @@ func TestHandlePropsGetAllEmpty(t *testing.T) {
 
 func TestHandlePropsGetMissingSproutID(t *testing.T) {
 	params := json.RawMessage(`{"name":"foo"}`)
-	_, err := handlePropsGetAll(params)
+	_, err := handlePropsGetAll(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for missing sprout_id")
 	}
@@ -523,13 +521,13 @@ func TestHandlePropsGetMissingSproutID(t *testing.T) {
 
 func TestHandlePropsSetMissingFields(t *testing.T) {
 	// Missing name.
-	_, err := handlePropsSet(json.RawMessage(`{"sprout_id":"s1"}`))
+	_, err := handlePropsSet(props.CurrentTenantID(), json.RawMessage(`{"sprout_id":"s1"}`))
 	if err == nil {
 		t.Fatal("expected error for missing name")
 	}
 
 	// Missing sprout_id.
-	_, err = handlePropsSet(json.RawMessage(`{"name":"foo","value":"bar"}`))
+	_, err = handlePropsSet(props.CurrentTenantID(), json.RawMessage(`{"name":"foo","value":"bar"}`))
 	if err == nil {
 		t.Fatal("expected error for missing sprout_id")
 	}
@@ -537,10 +535,10 @@ func TestHandlePropsSetMissingFields(t *testing.T) {
 
 func TestHandlePropsDelete(t *testing.T) {
 	// Set a prop then delete it.
-	handlePropsSet(json.RawMessage(`{"sprout_id":"sprout-del","name":"temp","value":"123"}`))
+	handlePropsSet(props.CurrentTenantID(), json.RawMessage(`{"sprout_id":"sprout-del","name":"temp","value":"123"}`))
 
 	params := json.RawMessage(`{"sprout_id":"sprout-del","name":"temp"}`)
-	result, err := handlePropsDelete(params)
+	result, err := handlePropsDelete(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handlePropsDelete: %v", err)
 	}
@@ -551,7 +549,7 @@ func TestHandlePropsDelete(t *testing.T) {
 	}
 
 	// Verify it's gone.
-	getResult, err := handlePropsGet(json.RawMessage(`{"sprout_id":"sprout-del","name":"temp"}`))
+	getResult, err := handlePropsGet(props.CurrentTenantID(), json.RawMessage(`{"sprout_id":"sprout-del","name":"temp"}`))
 	if err != nil {
 		t.Fatalf("handlePropsGet after delete: %v", err)
 	}
@@ -562,34 +560,34 @@ func TestHandlePropsDelete(t *testing.T) {
 }
 
 func TestHandlePropsDeleteMissingFields(t *testing.T) {
-	_, err := handlePropsDelete(json.RawMessage(`{"sprout_id":"s1"}`))
+	_, err := handlePropsDelete(props.CurrentTenantID(), json.RawMessage(`{"sprout_id":"s1"}`))
 	if err == nil {
 		t.Fatal("expected error for missing name")
 	}
 
-	_, err = handlePropsDelete(json.RawMessage(`{"name":"foo"}`))
+	_, err = handlePropsDelete(props.CurrentTenantID(), json.RawMessage(`{"name":"foo"}`))
 	if err == nil {
 		t.Fatal("expected error for missing sprout_id")
 	}
 }
 
 func TestHandlePropsInvalidJSON(t *testing.T) {
-	_, err := handlePropsGet(json.RawMessage(`{invalid`))
+	_, err := handlePropsGet(props.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON in propsGet")
 	}
 
-	_, err = handlePropsSet(json.RawMessage(`{invalid`))
+	_, err = handlePropsSet(props.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON in propsSet")
 	}
 
-	_, err = handlePropsDelete(json.RawMessage(`{invalid`))
+	_, err = handlePropsDelete(props.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON in propsDelete")
 	}
 
-	_, err = handlePropsGetAll(json.RawMessage(`{invalid`))
+	_, err = handlePropsGetAll(props.CurrentTenantID(), json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON in propsGetAll")
 	}
@@ -597,19 +595,29 @@ func TestHandlePropsInvalidJSON(t *testing.T) {
 
 // --- Cohorts handler tests ---
 
+// setupCohortRegistry installs a fresh cohort registry for the test.
+// Registry no longer holds its own storage (cohort definitions live in
+// PXC, read-through — see internal/rbac/store.go), so a "fresh" registry
+// alone wouldn't isolate this test's cohorts from others sharing this
+// package's test-wide rbac db (see testmain_test.go); scoping to a
+// per-test tenant via config.FarmerOrganization does.
 func setupCohortRegistry(t *testing.T) func() {
 	t.Helper()
-	old := cohortRegistry
+	oldReg, oldOrg := cohortRegistry, config.FarmerOrganization
+	config.FarmerOrganization = t.Name()
 	reg := rbac.NewRegistry()
 	cohortRegistry = reg
-	return func() { cohortRegistry = old }
+	return func() {
+		cohortRegistry = oldReg
+		config.FarmerOrganization = oldOrg
+	}
 }
 
 func TestHandleCohortsListEmpty(t *testing.T) {
 	cleanup := setupCohortRegistry(t)
 	defer cleanup()
 
-	result, err := handleCohortsList(nil)
+	result, err := handleCohortsList(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsList: %v", err)
 	}
@@ -638,7 +646,7 @@ func TestHandleCohortsListWithCohorts(t *testing.T) {
 		Members: []string{"sprout-db-1"},
 	})
 
-	result, err := handleCohortsList(nil)
+	result, err := handleCohortsList(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsList: %v", err)
 	}
@@ -654,7 +662,7 @@ func TestHandleCohortsListNilRegistry(t *testing.T) {
 	cohortRegistry = nil
 	defer func() { cohortRegistry = old }()
 
-	result, err := handleCohortsList(nil)
+	result, err := handleCohortsList(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsList: %v", err)
 	}
@@ -679,7 +687,7 @@ func TestHandleCohortsGetFound(t *testing.T) {
 	})
 
 	params := json.RawMessage(`{"name":"workers"}`)
-	result, err := handleCohortsGet(params)
+	result, err := handleCohortsGet(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleCohortsGet: %v", err)
 	}
@@ -701,7 +709,7 @@ func TestHandleCohortsGetNotFound(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"name":"nonexistent"}`)
-	_, err := handleCohortsGet(params)
+	_, err := handleCohortsGet(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent cohort")
 	}
@@ -712,7 +720,7 @@ func TestHandleCohortsGetEmptyName(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"name":""}`)
-	_, err := handleCohortsGet(params)
+	_, err := handleCohortsGet(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty cohort name")
 	}
@@ -724,7 +732,7 @@ func TestHandleCohortsGetNilRegistry(t *testing.T) {
 	defer func() { cohortRegistry = old }()
 
 	params := json.RawMessage(`{"name":"anything"}`)
-	_, err := handleCohortsGet(params)
+	_, err := handleCohortsGet(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error when registry is nil")
 	}
@@ -741,7 +749,7 @@ func TestHandleCohortsResolveStatic(t *testing.T) {
 	})
 
 	params := json.RawMessage(`{"name":"apps"}`)
-	result, err := handleCohortsResolve(params)
+	result, err := handleCohortsResolve(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleCohortsResolve: %v", err)
 	}
@@ -764,7 +772,7 @@ func TestHandleCohortsResolveEmptyName(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"name":""}`)
-	_, err := handleCohortsResolve(params)
+	_, err := handleCohortsResolve(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for empty name")
 	}
@@ -776,7 +784,7 @@ func TestHandleCohortsResolveNilRegistry(t *testing.T) {
 	defer func() { cohortRegistry = old }()
 
 	params := json.RawMessage(`{"name":"test"}`)
-	_, err := handleCohortsResolve(params)
+	_, err := handleCohortsResolve(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error when registry is nil")
 	}
@@ -793,7 +801,7 @@ func TestHandleCohortsRefreshAll(t *testing.T) {
 	})
 
 	// Refresh all (empty name).
-	result, err := handleCohortsRefresh(nil)
+	result, err := handleCohortsRefresh(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsRefresh: %v", err)
 	}
@@ -818,7 +826,7 @@ func TestHandleCohortsRefreshSingle(t *testing.T) {
 	})
 
 	params := json.RawMessage(`{"name":"single-refresh"}`)
-	result, err := handleCohortsRefresh(params)
+	result, err := handleCohortsRefresh(props.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleCohortsRefresh single: %v", err)
 	}
@@ -834,7 +842,7 @@ func TestHandleCohortsRefreshNilRegistry(t *testing.T) {
 	cohortRegistry = nil
 	defer func() { cohortRegistry = old }()
 
-	_, err := handleCohortsRefresh(nil)
+	_, err := handleCohortsRefresh(props.CurrentTenantID(), nil)
 	if err == nil {
 		t.Fatal("expected error when registry is nil")
 	}
@@ -845,7 +853,7 @@ func TestHandleCohortsRefreshNonexistent(t *testing.T) {
 	defer cleanup()
 
 	params := json.RawMessage(`{"name":"does-not-exist"}`)
-	_, err := handleCohortsRefresh(params)
+	_, err := handleCohortsRefresh(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent cohort refresh")
 	}
@@ -857,7 +865,7 @@ func TestHandleCohortsValidateEmpty(t *testing.T) {
 	cleanup := setupCohortRegistry(t)
 	defer cleanup()
 
-	result, err := handleCohortsValidate(nil)
+	result, err := handleCohortsValidate(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsValidate: %v", err)
 	}
@@ -882,7 +890,7 @@ func TestHandleCohortsValidateWithValidCompound(t *testing.T) {
 		Compound: &rbac.CompoundExpr{Operator: rbac.OperatorOR, Operands: []string{"a", "b"}},
 	})
 
-	result, err := handleCohortsValidate(nil)
+	result, err := handleCohortsValidate(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsValidate: %v", err)
 	}
@@ -913,7 +921,7 @@ func TestHandleCohortsValidateWithMissingRef(t *testing.T) {
 		Name: "a", Type: rbac.CohortTypeStatic, Members: []string{"s1"},
 	})
 
-	result, err := handleCohortsValidate(nil)
+	result, err := handleCohortsValidate(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsValidate: %v", err)
 	}
@@ -930,7 +938,7 @@ func TestHandleCohortsValidateNilRegistry(t *testing.T) {
 	cohortRegistry = nil
 	defer func() { cohortRegistry = old }()
 
-	result, err := handleCohortsValidate(nil)
+	result, err := handleCohortsValidate(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleCohortsValidate: %v", err)
 	}
@@ -947,14 +955,14 @@ func TestHandleCohortsValidateNilRegistry(t *testing.T) {
 
 func TestHandleAuthWhoAmINoToken(t *testing.T) {
 	// Without dangerouslyAllowRoot, no token should fail.
-	_, err := handleAuthWhoAmI(json.RawMessage(`{}`))
+	_, err := handleAuthWhoAmI(props.CurrentTenantID(), json.RawMessage(`{}`))
 	if err == nil {
 		t.Fatal("expected error for empty token")
 	}
 }
 
 func TestHandleAuthWhoAmIEmptyParams(t *testing.T) {
-	_, err := handleAuthWhoAmI(nil)
+	_, err := handleAuthWhoAmI(props.CurrentTenantID(), nil)
 	if err == nil {
 		t.Fatal("expected error for nil params")
 	}
@@ -962,14 +970,14 @@ func TestHandleAuthWhoAmIEmptyParams(t *testing.T) {
 
 func TestHandleAuthWhoAmIInvalidToken(t *testing.T) {
 	params := json.RawMessage(`{"token":"invalid-garbage"}`)
-	_, err := handleAuthWhoAmI(params)
+	_, err := handleAuthWhoAmI(props.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid token")
 	}
 }
 
 func TestHandleAuthExplainNoToken(t *testing.T) {
-	_, err := handleAuthExplain(json.RawMessage(`{}`))
+	_, err := handleAuthExplain(props.CurrentTenantID(), json.RawMessage(`{}`))
 	if err == nil {
 		t.Fatal("expected error for empty token")
 	}
@@ -977,7 +985,7 @@ func TestHandleAuthExplainNoToken(t *testing.T) {
 
 func TestHandleAuthListUsers(t *testing.T) {
 	// Should not error even with no users configured.
-	result, err := handleAuthListUsers(nil)
+	result, err := handleAuthListUsers(props.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleAuthListUsers: %v", err)
 	}

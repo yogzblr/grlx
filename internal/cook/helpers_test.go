@@ -157,7 +157,7 @@ func TestExtractIncludes(t *testing.T) {
 				t.Error(err)
 			}
 			f, _ := os.ReadFile(fp)
-			r, err := extractIncludes(tc.sprout, tc.basepath, string(tc.recipe), f)
+			r, err := extractIncludes(testPropsTenantID, tc.sprout, tc.basepath, string(tc.recipe), f)
 			if err != nil {
 				t.Error(err)
 			}
@@ -200,7 +200,7 @@ func TestCollectAllIncludes(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.id, func(t *testing.T) {
-			recipes, err := collectAllIncludes(tc.sprout, getBasePath(), tc.recipe)
+			recipes, err := collectAllIncludes(testPropsTenantID, tc.sprout, getBasePath(), tc.recipe)
 			if err != nil {
 				t.Fatalf("collectAllIncludes(%q): %v", tc.recipe, err)
 			}
@@ -234,7 +234,7 @@ func TestRelativeRecipeToAbsolute(t *testing.T) {
 		id:              "file doesn't exist",
 		recipe:          "",
 		filepath:        "",
-		err:             os.ErrNotExist,
+		err:             ErrNoRecipe,
 		relatedFilepath: "",
 	}, {
 		id:              "valid missing recipe",

@@ -335,8 +335,8 @@ func TestMethods(t *testing.T) {
 	if prefix != "file" {
 		t.Errorf("expected prefix 'file', got %s", prefix)
 	}
-	if len(methods) != 12 {
-		t.Errorf("expected 12 methods, got %d", len(methods))
+	if len(methods) != 15 {
+		t.Errorf("expected 15 methods, got %d", len(methods))
 	}
 }
 

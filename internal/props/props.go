@@ -2,35 +2,30 @@ package props
 
 import (
 	"errors"
-	"fmt"
 	"os"
-	"sync"
 	"time"
 )
 
-// DefaultPropTTL is the default time-to-live for cached properties.
+// DefaultPropTTL is the default time-to-live for properties.
 const DefaultPropTTL = 5 * time.Minute
 
 // ErrInvalidPropKey is returned when a sproutID or property name is empty.
 var ErrInvalidPropKey = errors.New("sproutID and property name must not be empty")
 
-type expProp struct {
-	Value  interface{}
-	Expiry time.Time
-}
-
-var (
-	propCache     = make(map[string]map[string]expProp)
-	propCacheLock = sync.RWMutex{}
-)
-
-func init() {
-	propCache = make(map[string]map[string]expProp)
-}
-
 func GetStringPropFunc(sproutID string) func(string) string {
 	return func(name string) string {
-		return getStringProp(sproutID, name)
+		return getStringProp(tenantID(), sproutID, name)
+	}
+}
+
+// GetStringPropFuncForTenant is GetStringPropFunc scoped to an explicit
+// tenant instead of the package's current-tenant seam — used by
+// internal/rbac/cohort.go's dynamic-cohort resolution, which has a real
+// per-Registry tenant to pass. See
+// docs/design/grlx-tenant-context-threading.md.
+func GetStringPropFuncForTenant(tenantID, sproutID string) func(string) string {
+	return func(name string) string {
+		return getStringProp(tenantID, sproutID, name)
 	}
 }
 
@@ -38,147 +33,126 @@ func GetStringPropFunc(sproutID string) func(string) string {
 // Returns an empty string if the sprout or property does not exist, or if the
 // property has expired.
 func GetStringProp(sproutID, name string) string {
-	return getStringProp(sproutID, name)
+	return getStringProp(tenantID(), sproutID, name)
 }
 
-func getStringProp(sproutID, name string) string {
-	propCacheLock.RLock()
-	sproutProps, ok := propCache[sproutID]
-	if !ok || sproutProps == nil {
-		propCacheLock.RUnlock()
+// GetStringPropForTenant is GetStringProp scoped to an explicit tenant
+// instead of the package's current-tenant seam.
+func GetStringPropForTenant(tenantID, sproutID, name string) string {
+	return getStringProp(tenantID, sproutID, name)
+}
+
+func getStringProp(tenantID, sproutID, name string) string {
+	var row propRow
+	err := db.Where("tenant_id = ? AND sprout_id = ? AND name = ? AND expiry > ?",
+		tenantID, sproutID, name, time.Now()).First(&row).Error
+	if err != nil {
 		return ""
 	}
-	prop, ok := sproutProps[name]
-	if !ok {
-		propCacheLock.RUnlock()
-		return ""
-	}
-	if prop.Expiry.Before(time.Now()) {
-		propCacheLock.RUnlock()
-		propCacheLock.Lock()
-		// Re-check under the write lock: another writer may have refreshed
-		// this prop between releasing the read lock and acquiring the write
-		// lock, in which case we must not delete the fresh value.
-		if cur, ok := propCache[sproutID][name]; ok && cur.Expiry.Before(time.Now()) {
-			delete(propCache[sproutID], name)
-		}
-		propCacheLock.Unlock()
-		return ""
-	}
-	propCacheLock.RUnlock()
-	return fmt.Sprintf("%v", prop.Value)
+	return row.Value
 }
 
 func SetPropFunc(sproutID string) func(string, string) error {
 	return func(name, value string) error {
-		return setProp(sproutID, name, value)
+		return setProp(tenantID(), sproutID, name, value)
 	}
 }
 
 // SetProp sets a property for a sprout with the default TTL.
 func SetProp(sproutID, name, value string) error {
-	return setProp(sproutID, name, value)
+	return setProp(tenantID(), sproutID, name, value)
 }
 
-func setProp(sproutID, name, value string) error {
-	return setPropWithTTL(sproutID, name, value, DefaultPropTTL)
+// SetPropForTenant is SetProp scoped to an explicit tenant instead of the
+// package's current-tenant seam.
+func SetPropForTenant(tenantID, sproutID, name, value string) error {
+	return setProp(tenantID, sproutID, name, value)
 }
 
-func setPropWithTTL(sproutID, name, value string, ttl time.Duration) error {
+func setProp(tenantID, sproutID, name, value string) error {
+	return setPropWithTTL(tenantID, sproutID, name, value, DefaultPropTTL)
+}
+
+func setPropWithTTL(tenantID, sproutID, name, value string, ttl time.Duration) error {
 	if sproutID == "" || name == "" {
 		return ErrInvalidPropKey
 	}
-	propCacheLock.Lock()
-	if propCache[sproutID] == nil {
-		propCache[sproutID] = make(map[string]expProp)
-	}
-	propCache[sproutID][name] = expProp{
-		Value:  value,
-		Expiry: time.Now().Add(ttl),
-	}
-	propCacheLock.Unlock()
-	persistSprout(sproutID)
-	return nil
+	return upsertProp(propRow{
+		TenantID: tenantID,
+		SproutID: sproutID,
+		Name:     name,
+		Value:    value,
+		Expiry:   time.Now().Add(ttl),
+	})
 }
 
 func GetDeletePropFunc(sproutID string) func(string) error {
 	return func(name string) error {
-		return deleteProp(sproutID, name)
+		return deleteProp(tenantID(), sproutID, name)
 	}
 }
 
 // DeleteProp removes a property for a sprout. Returns nil if the property
 // does not exist.
 func DeleteProp(sproutID, name string) error {
-	return deleteProp(sproutID, name)
+	return deleteProp(tenantID(), sproutID, name)
 }
 
-func deleteProp(sproutID, name string) error {
+// DeletePropForTenant is DeleteProp scoped to an explicit tenant instead of
+// the package's current-tenant seam.
+func DeletePropForTenant(tenantID, sproutID, name string) error {
+	return deleteProp(tenantID, sproutID, name)
+}
+
+func deleteProp(tenantID, sproutID, name string) error {
 	if sproutID == "" || name == "" {
 		return ErrInvalidPropKey
 	}
-	propCacheLock.Lock()
-	sproutProps, ok := propCache[sproutID]
-	if !ok || sproutProps == nil {
-		propCacheLock.Unlock()
-		return nil
-	}
-	delete(sproutProps, name)
-	propCacheLock.Unlock()
-	persistSprout(sproutID)
-	return nil
+	return db.Where("tenant_id = ? AND sprout_id = ? AND name = ?",
+		tenantID, sproutID, name).Delete(&propRow{}).Error
 }
 
 func GetPropsFunc(sproutID string) func() map[string]interface{} {
 	return func() map[string]interface{} {
-		return getProps(sproutID)
+		return getProps(tenantID(), sproutID)
 	}
 }
 
 // GetProps returns all non-expired properties for a sprout. Returns nil if the
 // sprout has no properties.
 func GetProps(sproutID string) map[string]interface{} {
-	return getProps(sproutID)
+	return getProps(tenantID(), sproutID)
 }
 
-func getProps(sproutID string) map[string]interface{} {
-	propCacheLock.RLock()
-	sproutProps, ok := propCache[sproutID]
-	if !ok || sproutProps == nil {
-		propCacheLock.RUnlock()
-		// get from sprout
+// GetPropsForTenant is GetProps scoped to an explicit tenant instead of the
+// package's current-tenant seam.
+func GetPropsForTenant(tenantID, sproutID string) map[string]interface{} {
+	return getProps(tenantID, sproutID)
+}
+
+func getProps(tenantID, sproutID string) map[string]interface{} {
+	var rows []propRow
+	if err := db.Where("tenant_id = ? AND sprout_id = ? AND expiry > ?",
+		tenantID, sproutID, time.Now()).Find(&rows).Error; err != nil || len(rows) == 0 {
 		return nil
 	}
-	props := make(map[string]interface{})
-	var expired []string
-	now := time.Now()
-	for k, v := range sproutProps {
-		if v.Expiry.Before(now) {
-			expired = append(expired, k)
-			continue
-		}
-		props[k] = v.Value
+	result := make(map[string]interface{}, len(rows))
+	for _, r := range rows {
+		result[r.Name] = r.Value
 	}
-	propCacheLock.RUnlock()
-
-	if len(expired) > 0 {
-		propCacheLock.Lock()
-		if cur, ok := propCache[sproutID]; ok {
-			now := time.Now()
-			for _, k := range expired {
-				// Only delete entries that are still expired; a concurrent
-				// writer may have refreshed one after we released the read lock.
-				if v, ok := cur[k]; ok && v.Expiry.Before(now) {
-					delete(cur, k)
-				}
-			}
-		}
-		propCacheLock.Unlock()
-	}
-	return props
+	return result
 }
 
 func GetHostnameFunc(sproutID string) func() string {
+	return func() string {
+		return hostname(sproutID)
+	}
+}
+
+// GetHostnameFuncForTenant is GetHostnameFunc scoped to an explicit tenant
+// instead of the package's current-tenant seam — see
+// GetStringPropFuncForTenant.
+func GetHostnameFuncForTenant(tenantID, sproutID string) func() string {
 	return func() string {
 		return hostname(sproutID)
 	}

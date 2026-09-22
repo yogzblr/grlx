@@ -2,8 +2,6 @@ package natsapi
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/gogrlx/grlx/v2/internal/pki"
@@ -17,7 +15,7 @@ func TestHandleSproutsList_Empty(t *testing.T) {
 	setupNatsAPIPKI(t)
 	setDangerouslyAllowRoot(t, true)
 
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: unexpected error: %v", err)
 	}
@@ -36,12 +34,12 @@ func TestHandleSproutsList_AcceptedSprouts(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	setDangerouslyAllowRoot(t, true)
 	// Ensure natsConn is nil so probeSprout is skipped.
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	nkey := generateTestNKey(t)
 	writeTestSproutKey(t, pkiDir, "accepted", "web-01", nkey)
 
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
 	}
@@ -68,14 +66,14 @@ func TestHandleSproutsList_AcceptedSprouts(t *testing.T) {
 func TestHandleSproutsList_MixedStates(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	setDangerouslyAllowRoot(t, true)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	writeTestSproutKey(t, pkiDir, "accepted", "prod-01", generateTestNKey(t))
 	writeTestSproutKey(t, pkiDir, "unaccepted", "staging-01", generateTestNKey(t))
 	writeTestSproutKey(t, pkiDir, "denied", "bad-actor", generateTestNKey(t))
 	writeTestSproutKey(t, pkiDir, "rejected", "old-key", generateTestNKey(t))
 
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
 	}
@@ -100,13 +98,13 @@ func TestHandleSproutsList_MixedStates(t *testing.T) {
 func TestHandleSproutsList_MultipleSameState(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	setDangerouslyAllowRoot(t, true)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	writeTestSproutKey(t, pkiDir, "accepted", "web-01", generateTestNKey(t))
 	writeTestSproutKey(t, pkiDir, "accepted", "web-02", generateTestNKey(t))
 	writeTestSproutKey(t, pkiDir, "accepted", "web-03", generateTestNKey(t))
 
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(pki.CurrentTenantID(), nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
 	}
@@ -122,13 +120,13 @@ func TestHandleSproutsList_MultipleSameState(t *testing.T) {
 
 func TestHandleSproutsGet_Found(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	nkey := generateTestNKey(t)
 	writeTestSproutKey(t, pkiDir, "accepted", "db-01", nkey)
 
 	params, _ := json.Marshal(pki.KeyManager{SproutID: "db-01"})
-	result, err := handleSproutsGet(params)
+	result, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleSproutsGet: %v", err)
 	}
@@ -150,10 +148,10 @@ func TestHandleSproutsGet_Found(t *testing.T) {
 
 func TestHandleSproutsGet_NotFound(t *testing.T) {
 	setupNatsAPIPKI(t)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	params, _ := json.Marshal(pki.KeyManager{SproutID: "nonexistent"})
-	_, err := handleSproutsGet(params)
+	_, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for nonexistent sprout")
 	}
@@ -164,10 +162,10 @@ func TestHandleSproutsGet_NotFound(t *testing.T) {
 
 func TestHandleSproutsGet_InvalidID(t *testing.T) {
 	setupNatsAPIPKI(t)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	params, _ := json.Marshal(pki.KeyManager{SproutID: "INVALID-CAPS"})
-	_, err := handleSproutsGet(params)
+	_, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err == nil {
 		t.Fatal("expected error for invalid sprout ID")
 	}
@@ -179,7 +177,7 @@ func TestHandleSproutsGet_InvalidID(t *testing.T) {
 func TestHandleSproutsGet_InvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleSproutsGet(json.RawMessage(`{bad json`))
+	_, err := handleSproutsGet(pki.CurrentTenantID(), json.RawMessage(`{bad json`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -187,9 +185,9 @@ func TestHandleSproutsGet_InvalidJSON(t *testing.T) {
 
 func TestHandleSproutsGet_EmptyParams(t *testing.T) {
 	setupNatsAPIPKI(t)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
-	_, err := handleSproutsGet(nil)
+	_, err := handleSproutsGet(pki.CurrentTenantID(), nil)
 	if err == nil {
 		t.Fatal("expected error for nil params")
 	}
@@ -197,13 +195,13 @@ func TestHandleSproutsGet_EmptyParams(t *testing.T) {
 
 func TestHandleSproutsGet_UnacceptedSprout(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
 	nkey := generateTestNKey(t)
 	writeTestSproutKey(t, pkiDir, "unaccepted", "pending-01", nkey)
 
 	params, _ := json.Marshal(pki.KeyManager{SproutID: "pending-01"})
-	result, err := handleSproutsGet(params)
+	result, err := handleSproutsGet(pki.CurrentTenantID(), params)
 	if err != nil {
 		t.Fatalf("handleSproutsGet: %v", err)
 	}
@@ -238,7 +236,7 @@ func TestResolveKeyState_AllStates(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.state, func(t *testing.T) {
-			got := resolveKeyState(tt.id)
+			got := resolveKeyState(pki.CurrentTenantID(), tt.id)
 			if got != tt.state {
 				t.Errorf("resolveKeyState(%q) = %q, want %q", tt.id, got, tt.state)
 			}
@@ -249,7 +247,7 @@ func TestResolveKeyState_AllStates(t *testing.T) {
 func TestResolveKeyState_Unknown(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	got := resolveKeyState("no-such-sprout")
+	got := resolveKeyState(pki.CurrentTenantID(), "no-such-sprout")
 	if got != "unknown" {
 		t.Errorf("resolveKeyState for missing sprout = %q, want %q", got, "unknown")
 	}
@@ -258,24 +256,21 @@ func TestResolveKeyState_Unknown(t *testing.T) {
 // --- probeSprout tests ---
 
 func TestProbeSprout_NilConn(t *testing.T) {
-	SetNatsConn(nil)
+	ClearNatsConn(pki.CurrentTenantID())
 
-	if probeSprout("any-sprout") {
+	if probeSprout("acme", "any-sprout") {
 		t.Error("expected false when natsConn is nil")
 	}
 }
 
 // --- Test helpers ---
 
+// writeTestSproutKey registers id at the given lifecycle state via the
+// pki package's own lifecycle functions — see writeNKey in
+// pki_handlers_test.go, which this delegates to.
 func writeTestSproutKey(t *testing.T, pkiDir, state, id, nkey string) {
 	t.Helper()
-	dir := filepath.Join(pkiDir, "sprouts", state)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir %s: %v", dir, err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, id), []byte(nkey), 0o644); err != nil {
-		t.Fatalf("write sprout key %s/%s: %v", state, id, err)
-	}
+	writeNKey(t, pkiDir, state, id, nkey)
 }
 
 func generateTestNKey(t *testing.T) string {

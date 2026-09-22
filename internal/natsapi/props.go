@@ -14,7 +14,7 @@ type PropsParams struct {
 	Value    string `json:"value,omitempty"`
 }
 
-func handlePropsGetAll(params json.RawMessage) (any, error) {
+func handlePropsGetAll(tenantID string, params json.RawMessage) (any, error) {
 	var p PropsParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -22,14 +22,14 @@ func handlePropsGetAll(params json.RawMessage) (any, error) {
 	if p.SproutID == "" {
 		return nil, fmt.Errorf("sprout_id is required")
 	}
-	allProps := props.GetProps(p.SproutID)
+	allProps := props.GetPropsForTenant(tenantID, p.SproutID)
 	if allProps == nil {
 		allProps = make(map[string]interface{})
 	}
 	return allProps, nil
 }
 
-func handlePropsGet(params json.RawMessage) (any, error) {
+func handlePropsGet(tenantID string, params json.RawMessage) (any, error) {
 	var p PropsParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -37,7 +37,7 @@ func handlePropsGet(params json.RawMessage) (any, error) {
 	if p.SproutID == "" || p.Name == "" {
 		return nil, fmt.Errorf("sprout_id and name are required")
 	}
-	value := props.GetStringProp(p.SproutID, p.Name)
+	value := props.GetStringPropForTenant(tenantID, p.SproutID, p.Name)
 	return map[string]string{
 		"sprout_id": p.SproutID,
 		"name":      p.Name,
@@ -45,7 +45,7 @@ func handlePropsGet(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handlePropsSet(params json.RawMessage) (any, error) {
+func handlePropsSet(tenantID string, params json.RawMessage) (any, error) {
 	var p PropsParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -53,13 +53,13 @@ func handlePropsSet(params json.RawMessage) (any, error) {
 	if p.SproutID == "" || p.Name == "" {
 		return nil, fmt.Errorf("sprout_id and name are required")
 	}
-	if err := props.SetProp(p.SproutID, p.Name, p.Value); err != nil {
+	if err := props.SetPropForTenant(tenantID, p.SproutID, p.Name, p.Value); err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil
 }
 
-func handlePropsDelete(params json.RawMessage) (any, error) {
+func handlePropsDelete(tenantID string, params json.RawMessage) (any, error) {
 	var p PropsParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -67,7 +67,7 @@ func handlePropsDelete(params json.RawMessage) (any, error) {
 	if p.SproutID == "" || p.Name == "" {
 		return nil, fmt.Errorf("sprout_id and name are required")
 	}
-	if err := props.DeleteProp(p.SproutID, p.Name); err != nil {
+	if err := props.DeletePropForTenant(tenantID, p.SproutID, p.Name); err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil

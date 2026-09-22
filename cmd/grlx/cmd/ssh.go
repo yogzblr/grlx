@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -149,23 +147,10 @@ func connectSSH(sproutID string) error {
 	}
 	defer doneSub.Unsubscribe()
 
-	// Handle terminal resize (SIGWINCH).
-	sigWinch := make(chan os.Signal, 1)
-	signal.Notify(sigWinch, syscall.SIGWINCH)
-	go func() {
-		for {
-			select {
-			case <-sigWinch:
-				if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
-					resize := shell.ResizeMessage{Cols: w, Rows: h}
-					data, _ := json.Marshal(resize)
-					nc.Publish(session.ResizeSubject, data)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	// Handle terminal resize. This is Unix-only (see ssh_resize_unix.go /
+	// ssh_resize_windows.go) since Windows consoles have no SIGWINCH
+	// equivalent.
+	watchTerminalResize(nc, session.ResizeSubject, done)
 
 	// Read stdin → publish to sprout input subject.
 	go func() {

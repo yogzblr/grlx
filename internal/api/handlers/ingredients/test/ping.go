@@ -39,7 +39,7 @@ func HTestPing(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		registered, _ := pki.NKeyExists(target.SproutID, "")
+		registered, _ := pki.NKeyExists(pki.CurrentTenantID(), target.SproutID, "")
 		if !registered {
 			var results apitypes.TargetedResults
 			results.Results = nil
@@ -63,7 +63,7 @@ func HTestPing(w http.ResponseWriter, r *http.Request) {
 
 		go func(target pki.KeyManager) {
 			defer wg.Done()
-			pong, err := test.FPing(target, ping)
+			pong, err := test.FPing(pki.CurrentTenantID(), target, ping)
 			if err != nil {
 				log.Tracef("Error pinging the Sprout: %v", err)
 			}

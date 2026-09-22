@@ -43,6 +43,14 @@ const (
 	MethodPKIUnaccept = "pki.unaccept"
 	MethodPKIDelete   = "pki.delete"
 
+	// MethodPKIRotateBoxKey asks a sprout to rotate its payload-encryption
+	// X25519 keypair (docs/design/grlx-payload-encryption-design.md). Per
+	// the design doc, this only ever carries an instruction — the sprout
+	// generates its own new keypair and reports back the new public key
+	// on SproutBoxKeySubmit; farmer never generates or holds a sprout's
+	// private key.
+	MethodPKIRotateBoxKey = "pki.rotatebox"
+
 	// Sprouts
 	MethodSproutsList = "sprouts.list"
 	MethodSproutsGet  = "sprouts.get"
@@ -87,10 +95,6 @@ const (
 	// Shell
 	MethodShellStart = "shell.start"
 
-	// Recipes
-	MethodRecipesList = "recipes.list"
-	MethodRecipesGet  = "recipes.get"
-
 	// Audit
 	MethodAuditDates = "audit.dates"
 	MethodAuditQuery = "audit.query"
@@ -124,6 +128,20 @@ const (
 	// SproutCookTrigger is the prefix for cook trigger responses.
 	// Full subject: grlx.farmer.cook.trigger.<jid>
 	SproutCookTriggerPrefix = "grlx.farmer.cook.trigger."
+
+	// SproutBoxKeyRotateCmd is the suffix for farmer's rotate-trigger
+	// instruction to a sprout (MethodPKIRotateBoxKey's handler publishes
+	// here). Carries no key material — see MethodPKIRotateBoxKey's doc
+	// comment.
+	SproutBoxKeyRotateCmd = "boxkey.rotate"
+
+	// SproutBoxKeySubmitPattern is the wildcard subject farmer subscribes
+	// on to receive a sprout's new payload-encryption public key, whether
+	// self-initiated or in response to SproutBoxKeyRotateCmd. Trust model
+	// matches internal/facts's listener: the subject's embedded sprout ID
+	// is taken from the connection's own authenticated identity, not from
+	// the message body.
+	SproutBoxKeySubmitPattern = SproutSubjectPrefix + "*.boxkey.pub"
 )
 
 // ──────────────────────────────────────────────
@@ -250,14 +268,6 @@ type CohortsValidateResponse = CohortValidateResponse
 // ShellStartResponse contains session subjects for the CLI to use.
 type ShellStartResponse = shell.StartResponse
 
-// RecipesListResponse wraps the recipe list.
-type RecipesListResponse struct {
-	Recipes []RecipeInfo `json:"recipes"`
-}
-
-// RecipesGetResponse is the full content of a recipe.
-type RecipesGetResponse = RecipeContent
-
 // AuditDatesResponse is a list of dates with audit entries.
 type AuditDatesResponse = []string
 
@@ -279,7 +289,7 @@ func AllMethods() []string {
 		MethodHealth,
 		MethodVersion,
 		MethodPKIList, MethodPKIAccept, MethodPKIReject,
-		MethodPKIDeny, MethodPKIUnaccept, MethodPKIDelete,
+		MethodPKIDeny, MethodPKIUnaccept, MethodPKIDelete, MethodPKIRotateBoxKey,
 		MethodSproutsList, MethodSproutsGet,
 		MethodTestPing,
 		MethodCmdRun,
@@ -289,7 +299,6 @@ func AllMethods() []string {
 		MethodCohortsList, MethodCohortsGet, MethodCohortsResolve, MethodCohortsRefresh, MethodCohortsValidate,
 		MethodAuthLogin, MethodAuthWhoAmI, MethodAuthListUsers, MethodAuthAddUser, MethodAuthRemoveUser, MethodAuthExplain,
 		MethodShellStart,
-		MethodRecipesList, MethodRecipesGet,
 		MethodAuditDates, MethodAuditQuery,
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/taigrr/jety"
 )
@@ -18,47 +17,57 @@ var ErrDuplicatePubkey = errors.New("duplicate pubkey assignment")
 // same username in the users config section.
 var ErrDuplicateUsername = errors.New("duplicate username")
 
-// RoleStore holds all custom role definitions loaded from config.
+// RoleStore reads and writes role definitions straight through to PXC
+// (see store.go) — it holds no state of its own beyond the tenant it was
+// constructed for, so every method call reflects every replica's writes.
+//
+// tenantID is fixed at construction — see Registry's identical doc comment
+// (cohort.go) for the same current-tenant-by-default convention.
 type RoleStore struct {
-	mu    sync.RWMutex
-	roles map[string]*Role
+	tenantID string
 }
 
-// NewRoleStore creates an empty role store.
+// NewRoleStore returns a RoleStore scoped to the current tenant (see
+// tenantID in store.go).
 func NewRoleStore() *RoleStore {
-	return &RoleStore{roles: make(map[string]*Role)}
+	return NewRoleStoreForTenant(tenantID())
+}
+
+// NewRoleStoreForTenant returns a RoleStore scoped explicitly to tenantID.
+// See Registry.NewRegistryForTenant's doc comment (cohort.go) — same
+// workstream E groundwork, not yet wired into any production call site.
+func NewRoleStoreForTenant(tenantID string) *RoleStore {
+	return &RoleStore{tenantID: tenantID}
 }
 
 // Register adds a role to the store, replacing any existing role with
 // the same name. Validates the role before registration.
 func (rs *RoleStore) Register(r *Role) error {
+	if r.TenantID == "" {
+		r.TenantID = rs.tenantID
+	}
 	if err := r.Validate(); err != nil {
 		return err
 	}
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	rs.roles[r.Name] = r
-	return nil
+	return upsertRoleRow(roleRowFrom(r))
 }
 
 // Get retrieves a role by name.
 func (rs *RoleStore) Get(name string) (*Role, error) {
-	rs.mu.RLock()
-	defer rs.mu.RUnlock()
-	r, ok := rs.roles[name]
-	if !ok {
+	var row roleRow
+	if err := db.Where("tenant_id = ? AND name = ?", rs.tenantID, name).First(&row).Error; err != nil {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownRole, name)
 	}
-	return r, nil
+	return row.toRole(), nil
 }
 
 // List returns all role names.
 func (rs *RoleStore) List() []string {
-	rs.mu.RLock()
-	defer rs.mu.RUnlock()
-	names := make([]string, 0, len(rs.roles))
-	for name := range rs.roles {
-		names = append(names, name)
+	var rows []roleRow
+	db.Where("tenant_id = ?", rs.tenantID).Find(&rows)
+	names := make([]string, 0, len(rows))
+	for _, row := range rows {
+		names = append(names, row.Name)
 	}
 	return names
 }
@@ -123,6 +132,12 @@ func BuiltinOperatorRole() *Role {
 func LoadRolesFromConfig() (*RoleStore, error) {
 	store := NewRoleStore()
 
+	// Config is the authoritative snapshot: clear any previously persisted
+	// roles for this tenant first, so a role removed from config doesn't
+	// linger in PXC across a reload the way it never could in the old
+	// in-memory map (each reload built a fresh one from scratch).
+	db.Where("tenant_id = ?", store.tenantID).Delete(&roleRow{})
+
 	// Register built-in roles first. Config-defined roles with the same
 	// name will override these below.
 	builtins := []*Role{BuiltinViewerRole(), BuiltinOperatorRole()}
@@ -181,68 +196,70 @@ func parseRoleEntry(name string, raw any) (*Role, error) {
 	return role, nil
 }
 
-// UserRoleMap maps public keys to role names and optional usernames.
-// Loaded from the "users" section of the farmer config.
+// UserRoleMap reads and writes pubkey -> role/username assignments
+// straight through to PXC (see store.go), the same read-through shape as
+// RoleStore above.
+//
+// tenantID is fixed at construction — see RoleStore's identical doc
+// comment above.
 type UserRoleMap struct {
-	mu           sync.RWMutex
-	pubkeyToRole map[string]string
-	pubkeyToName map[string]string
+	tenantID string
 }
 
-// NewUserRoleMap creates an empty map.
+// NewUserRoleMap returns a UserRoleMap scoped to the current tenant.
 func NewUserRoleMap() *UserRoleMap {
-	return &UserRoleMap{
-		pubkeyToRole: make(map[string]string),
-		pubkeyToName: make(map[string]string),
-	}
+	return NewUserRoleMapForTenant(tenantID())
+}
+
+// NewUserRoleMapForTenant returns a UserRoleMap scoped explicitly to
+// tenantID. See RoleStore.NewRoleStoreForTenant's doc comment — same
+// workstream E groundwork.
+func NewUserRoleMapForTenant(tenantID string) *UserRoleMap {
+	return &UserRoleMap{tenantID: tenantID}
 }
 
 // Set assigns a role to a pubkey.
 func (m *UserRoleMap) Set(pubkey, roleName string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pubkeyToRole[pubkey] = roleName
+	upsertUserRoleRow(userRoleRow{TenantID: m.tenantID, Pubkey: pubkey, RoleName: roleName, Username: m.Username(pubkey)})
 }
 
 // SetUsername assigns a human-readable username to a pubkey.
 func (m *UserRoleMap) SetUsername(pubkey, username string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pubkeyToName[pubkey] = username
+	upsertUserRoleRow(userRoleRow{TenantID: m.tenantID, Pubkey: pubkey, RoleName: m.RoleName(pubkey), Username: username})
 }
 
 // Delete removes a pubkey from the map. Returns true if the key existed.
 func (m *UserRoleMap) Delete(pubkey string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_, existed := m.pubkeyToRole[pubkey]
-	delete(m.pubkeyToRole, pubkey)
-	delete(m.pubkeyToName, pubkey)
-	return existed
+	res := db.Where("tenant_id = ? AND pubkey = ?", m.tenantID, pubkey).Delete(&userRoleRow{})
+	return res.Error == nil && res.RowsAffected > 0
 }
 
 // RoleName returns the role name for a pubkey, or empty string if not found.
 func (m *UserRoleMap) RoleName(pubkey string) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.pubkeyToRole[pubkey]
+	var row userRoleRow
+	if err := db.Where("tenant_id = ? AND pubkey = ?", m.tenantID, pubkey).First(&row).Error; err != nil {
+		return ""
+	}
+	return row.RoleName
 }
 
 // Username returns the human-readable username for a pubkey, or empty
 // string if no username is configured.
 func (m *UserRoleMap) Username(pubkey string) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.pubkeyToName[pubkey]
+	var row userRoleRow
+	if err := db.Where("tenant_id = ? AND pubkey = ?", m.tenantID, pubkey).First(&row).Error; err != nil {
+		return ""
+	}
+	return row.Username
 }
 
 // All returns the full map of pubkey → role name.
 func (m *UserRoleMap) All() map[string]string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make(map[string]string, len(m.pubkeyToRole))
-	for k, v := range m.pubkeyToRole {
-		result[k] = v
+	var rows []userRoleRow
+	db.Where("tenant_id = ?", m.tenantID).Find(&rows)
+	result := make(map[string]string, len(rows))
+	for _, row := range rows {
+		result[row.Pubkey] = row.RoleName
 	}
 	return result
 }
@@ -250,13 +267,11 @@ func (m *UserRoleMap) All() map[string]string {
 // AllWithUsernames returns a map of pubkey → username for all users
 // that have a username configured.
 func (m *UserRoleMap) AllWithUsernames() map[string]string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make(map[string]string, len(m.pubkeyToName))
-	for k, v := range m.pubkeyToName {
-		if v != "" {
-			result[k] = v
-		}
+	var rows []userRoleRow
+	db.Where("tenant_id = ? AND username != ''", m.tenantID).Find(&rows)
+	result := make(map[string]string, len(rows))
+	for _, row := range rows {
+		result[row.Pubkey] = row.Username
 	}
 	return result
 }
@@ -300,6 +315,10 @@ func (m *UserRoleMap) AllWithUsernames() map[string]string {
 // role definition exists (backward compatibility).
 func LoadUsersFromConfig() *UserRoleMap {
 	m := NewUserRoleMap()
+
+	// Config is the authoritative snapshot for this tenant; see
+	// LoadRolesFromConfig's identical clear-before-reload comment.
+	db.Where("tenant_id = ?", m.tenantID).Delete(&userRoleRow{})
 
 	// New format: users.<role> = [pubkeys or {pubkey, username} maps...]
 	usersMap := jety.GetStringMap("users")
@@ -461,6 +480,12 @@ func ValidateUsernameUniqueness() error {
 // empty or missing cohorts section — it simply returns an empty registry.
 func LoadCohortsFromConfig() (*Registry, error) {
 	registry := NewRegistry()
+
+	// Config is the authoritative snapshot for this tenant; see
+	// LoadRolesFromConfig's identical clear-before-reload comment. The
+	// membership cache is separate from stored definitions (see cohort.go)
+	// and is left untouched here.
+	db.Where("tenant_id = ?", registry.tenantID).Delete(&cohortRow{})
 
 	raw := jety.GetStringMap("cohorts")
 	if len(raw) == 0 {

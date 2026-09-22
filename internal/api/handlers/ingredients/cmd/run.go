@@ -39,7 +39,7 @@ func HCmdRun(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		registered, _ := pki.NKeyExists(target.SproutID, "")
+		registered, _ := pki.NKeyExists(pki.CurrentTenantID(), target.SproutID, "")
 		if !registered {
 			var results apitypes.TargetedResults
 			results.Results = nil
@@ -60,7 +60,7 @@ func HCmdRun(w http.ResponseWriter, r *http.Request) {
 
 		go func(target pki.KeyManager) {
 			defer wg.Done()
-			result, err := cmd.FRun(target, command)
+			result, err := cmd.FRun(pki.CurrentTenantID(), target, command)
 			if err != nil {
 				log.Tracef("Error running command on the Sprout: %v", err)
 			}

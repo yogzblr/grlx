@@ -129,6 +129,15 @@ func TestSystemFactsJSONOmitEmptySproutID(t *testing.T) {
 	}
 }
 
+// testTenantID is the tenant used by tests that aren't specifically about
+// tenant isolation (see TestStoreFacts_TenantIsolation for those) — it
+// matches props' bare, legacy-tenant-scoped functions' implicit tenant
+// (tenantID() in internal/props/store.go, "default" here since
+// config.FarmerOrganization is never set in this package's tests), so
+// GetStringProp/GetProps (used to assert on stored facts below) still see
+// what storeFacts wrote via the *ForTenant variants.
+const testTenantID = "default"
+
 func TestStoreFacts(t *testing.T) {
 	sf := SystemFacts{
 		OS:          "linux",
@@ -141,7 +150,7 @@ func TestStoreFacts(t *testing.T) {
 		SproutID:    "sprout-test-store",
 	}
 
-	storeFacts(sf)
+	storeFacts(testTenantID, sf)
 
 	// Verify each fact was written to the props store.
 	checks := map[string]string{
@@ -180,7 +189,7 @@ func TestStoreFactsNoIPs(t *testing.T) {
 		SproutID:    "sprout-no-ips",
 	}
 
-	storeFacts(sf)
+	storeFacts(testTenantID, sf)
 
 	// Core facts should still be stored.
 	got := props.GetStringProp(sf.SproutID, "os")
@@ -206,7 +215,7 @@ func TestStoreFactsOverwrite(t *testing.T) {
 		NumCPU:   4,
 		SproutID: sproutID,
 	}
-	storeFacts(sf1)
+	storeFacts(testTenantID, sf1)
 
 	if got := props.GetStringProp(sproutID, "hostname"); got != "host-v1" {
 		t.Fatalf("initial hostname: expected host-v1, got %q", got)
@@ -220,7 +229,7 @@ func TestStoreFactsOverwrite(t *testing.T) {
 		NumCPU:   8,
 		SproutID: sproutID,
 	}
-	storeFacts(sf2)
+	storeFacts(testTenantID, sf2)
 
 	if got := props.GetStringProp(sproutID, "hostname"); got != "host-v2" {
 		t.Errorf("updated hostname: expected host-v2, got %q", got)

@@ -99,6 +99,12 @@ func (f File) Test(ctx context.Context) (cook.Result, error) {
 		return f.managed(ctx, true)
 	case "symlink":
 		return f.symlink(ctx, true)
+	case "line":
+		return f.line(ctx, true)
+	case "copy":
+		return f.copy(ctx, true)
+	case "sync":
+		return f.sync(ctx, true)
 	default:
 		return cook.Result{
 			Succeeded: false, Failed: true,
@@ -174,6 +180,12 @@ func (f File) Apply(ctx context.Context) (cook.Result, error) {
 		return f.managed(ctx, false)
 	case "symlink":
 		return f.symlink(ctx, false)
+	case "line":
+		return f.line(ctx, false)
+	case "copy":
+		return f.copy(ctx, false)
+	case "sync":
+		return f.sync(ctx, false)
 	default:
 		return cook.Result{
 			Succeeded: false, Failed: true,
@@ -256,6 +268,32 @@ func (f File) PropertiesForMethod(method string) (map[string]string, error) {
 		return ingredients.MethodPropsSet{
 			ingredients.MethodProps{Key: "name", Type: "string", IsReq: true},
 		}.ToMap(), nil
+	case "line":
+		return ingredients.MethodPropsSet{
+			ingredients.MethodProps{Key: "name", Type: "string", IsReq: true, Description: "the file to edit"},
+			ingredients.MethodProps{Key: "mode", Type: "string", IsReq: true, Description: "one of ensure, replace, delete, insert"},
+			ingredients.MethodProps{Key: "match", Type: "string", IsReq: false, Description: "regex identifying the target line(s); required for replace/delete"},
+			ingredients.MethodProps{Key: "content", Type: "string", IsReq: false, Description: "line content for ensure/replace/insert"},
+			ingredients.MethodProps{Key: "location", Type: "string", IsReq: false, Description: "insert mode only: before/after a match, or start/end when match is absent"},
+		}.ToMap(), nil
+	case "copy":
+		return ingredients.MethodPropsSet{
+			ingredients.MethodProps{Key: "name", Type: "string", IsReq: true, Description: "push: destination; pull: source"},
+			ingredients.MethodProps{Key: "source", Type: "string", IsReq: true, Description: "push: source; pull: destination"},
+			ingredients.MethodProps{Key: "direction", Type: "string", IsReq: false, Description: "push (default) or pull"},
+			ingredients.MethodProps{Key: "glob", Type: "string", IsReq: false, Description: "select files within a directory source by glob"},
+			ingredients.MethodProps{Key: "exclude", Type: "[]string", IsReq: false, Description: "glob patterns to exclude"},
+			ingredients.MethodProps{Key: "mkdir", Type: "bool", IsReq: false, Description: "create missing destination directories"},
+			ingredients.MethodProps{Key: "chmod_x", Type: "bool", IsReq: false, Description: "mark copied files executable"},
+		}.ToMap(), nil
+	case "sync":
+		return ingredients.MethodPropsSet{
+			ingredients.MethodProps{Key: "name", Type: "string", IsReq: true, Description: "destination directory"},
+			ingredients.MethodProps{Key: "source", Type: "string", IsReq: true, Description: "source directory"},
+			ingredients.MethodProps{Key: "delete", Type: "bool", IsReq: false, Description: "remove destination files with no source counterpart"},
+			ingredients.MethodProps{Key: "exclude", Type: "[]string", IsReq: false, Description: "glob patterns to exclude from sync"},
+			ingredients.MethodProps{Key: "mkdir", Type: "bool", IsReq: false, Description: "create the destination directory if missing"},
+		}.ToMap(), nil
 	case "prepend":
 		return ingredients.MethodPropsSet{
 			ingredients.MethodProps{Key: "name", Type: "string", IsReq: true},
@@ -299,12 +337,15 @@ func (f File) Methods() (string, []string) {
 		"cached",
 		"contains",
 		"content",
+		"copy",
 		"directory",
+		"line",
 		"managed",
 		"missing",
 		"prepend",
 		"exists",
 		"symlink",
+		"sync",
 		"touch",
 	}
 }

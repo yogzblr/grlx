@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -17,19 +18,64 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
+// nc is the single connection a sprout process registers via
+// RegisterNatsConn — used only by SRun (below) to stream a running
+// command's output back over the bus. Sprout is inherently single-tenant
+// (one process, one connection), so this stays a bare package var.
 var nc *nats.Conn
 
 func RegisterNatsConn(conn *nats.Conn) {
 	nc = conn
 }
 
+// farmerConns holds farmer's own per-tenant NATS connections — the
+// counterpart to nc above, but keyed by tenant since a single farmer
+// process now holds one connection per tenant (see
+// docs/design/grlx-tenant-context-threading.md's Option A). Only FRun
+// (farmer's outbound leg) reads this; sprout never calls
+// RegisterFarmerNatsConn.
+var (
+	farmerConnMu sync.RWMutex
+	farmerConns  = map[string]*nats.Conn{}
+)
+
+// RegisterFarmerNatsConn installs tenantID's NATS connection for FRun to
+// dispatch commands through. Called once per tenant connection by
+// cmd/farmer/main.go.
+func RegisterFarmerNatsConn(tenantID string, conn *nats.Conn) {
+	farmerConnMu.Lock()
+	defer farmerConnMu.Unlock()
+	farmerConns[tenantID] = conn
+}
+
+// UnregisterFarmerNatsConn removes tenantID's connection — called when
+// that tenant is deprovisioned and its connection closed.
+func UnregisterFarmerNatsConn(tenantID string) {
+	farmerConnMu.Lock()
+	defer farmerConnMu.Unlock()
+	delete(farmerConns, tenantID)
+}
+
+func farmerConnFor(tenantID string) *nats.Conn {
+	farmerConnMu.RLock()
+	defer farmerConnMu.RUnlock()
+	return farmerConns[tenantID]
+}
+
 var envMutex sync.Mutex
 
-func FRun(target pki.KeyManager, cmdRun apitypes.CmdRun) (apitypes.CmdRun, error) {
-	topic := "grlx.sprouts." + target.SproutID + ".cmd.run"
+// FRun runs a command on target's sprout, over tenantID's dedicated NATS
+// connection (see RegisterFarmerNatsConn) — the sprout's own tenant, not
+// necessarily whichever tenant happens to be "current" for the process.
+func FRun(tenantID string, target pki.KeyManager, cmdRun apitypes.CmdRun) (apitypes.CmdRun, error) {
 	var results apitypes.CmdRun
+	conn := farmerConnFor(tenantID)
+	if conn == nil {
+		return results, fmt.Errorf("cmd: no NATS connection registered for tenant %s", tenantID)
+	}
+	topic := "grlx.sprouts." + target.SproutID + ".cmd.run"
 	b, _ := json.Marshal(cmdRun)
-	msg, err := nc.Request(topic, b, time.Second*15+cmdRun.Timeout)
+	msg, err := conn.Request(topic, b, time.Second*15+cmdRun.Timeout)
 	if err != nil {
 		return results, err
 	}

@@ -1,0 +1,252 @@
+# Envoy DMZ gateway — docs/design/grlx-envoy-enrollment-design.md
+# (workstream H, docs/design/grlx-fork-roadmap.md).
+#
+# FLAG FOR SECURITY REVIEW per the task brief that produced this file —
+# this is the literal front door of the trust chain. Everything downstream
+# (nats-server's own decentralized-JWT auth, every later workstream) trusts
+# whatever this config lets through.
+#
+# Three routes, per the design doc's "Two gates, checking different
+# things, not redundant with each other":
+#
+#   1. /v1/enroll        — NOT jwt_authn-gated (a sprout enrolling has no
+#                           JWT yet). Rate-limited instead, since it's the
+#                           one DMZ-facing route without a JWT gate
+#                           (design doc's open item, cloudxp-machine-
+#                           manager-api-design.md §3.2). Proxies straight
+#                           to farmer's existing HTTPS API
+#                           (internal/api/handlers/enroll.go).
+#   2. /v1/recipes/*      — jwt_authn-gated, proxied unmodified (no
+#                           prefix_rewrite — the path matches farmer's own
+#                           route exactly) to farmer's dedicated recipe
+#                           HTTP endpoint (internal/api/handlers/
+#                           recipes.go's ListRecipes/GetRecipe, registered
+#                           in internal/api/routers.go), which reads
+#                           through object storage rather than local disk
+#                           — workstream I ("Recipe storage migration"),
+#                           replacing the old NATS-based
+#                           internal/natsapi/recipes.go. See the
+#                           recipe_service cluster below.
+#   3. everything else    — the sprout's wss:// NATS connection, jwt_authn-
+#                           gated, proxied to nats-server's websocket
+#                           listener (internal/pki/nats.go's
+#                           NatsConfig.Websocket, config.FarmerWSPort).
+#
+# JWT: NOT the native NATS User JWT. That token's JOSE header is
+# "alg":"ed25519-nkey" (github.com/nats-io/jwt/v2's AlgorithmNkey) — a
+# NATS-specific value no standard JOSE library, Envoy's jwt_authn
+# included, recognizes, and relabeling it after signing isn't possible
+# (the JWS signature covers the header bytes). Envoy instead validates a
+# separate "gateway JWT" (internal/gatewayjwt): same subject/tenant/
+# sprout claims, same underlying trust chain's sprout identity, but a
+# genuinely standard alg:EdDSA JWS, signed by a single platform-wide
+# OpenBao Transit key (never a tenant Account key — see
+# internal/gatewayjwt's package doc for why that split is deliberate).
+# nats-server's own decentralized-JWT auth is entirely unaffected: it
+# keeps validating the native NATS User JWT exactly as workstream B built
+# it, over the same wss:// connection this config merely proxies (the
+# "two gates, checking different things" design).
+#
+# Verify EdDSA support in the Envoy build being deployed — jwt_authn
+# added Ed25519/EdDSA support in a relatively recent Envoy release; pin a
+# version known to have it.
+
+static_resources:
+  listeners:
+    - name: dmz_gateway
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: "/etc/envoy/tls/dmz-cert.pem" }
+                    private_key: { filename: "/etc/envoy/tls/dmz-key.pem" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: dmz_gateway
+                upgrade_configs:
+                  - upgrade_type: websocket
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: grlx_dmz
+                      domains: ["*"]
+                      routes:
+                        # Route 1: enrollment. No JWT gate (design doc
+                        # §3.2/"Why this is safe" — only public keys
+                        # transit the bus at this stage). Per-route
+                        # local_ratelimit stands in for the JWT gate every
+                        # other route gets, since this is otherwise the
+                        # one unauthenticated DMZ-facing surface.
+                        - match: { prefix: "/v1/enroll" }
+                          route:
+                            cluster: farmer_api
+                            timeout: 30s
+                          typed_per_filter_config:
+                            envoy.filters.http.jwt_authn:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.PerRouteConfig
+                              disabled: true
+                            envoy.filters.http.local_ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                              stat_prefix: enroll_rate_limiter
+                              token_bucket:
+                                # Sized for a bulk-onboarding Ansible run
+                                # against a single Envoy worker, not a
+                                # steady-state rate — this is a coarse,
+                                # per-worker local bound (design doc's
+                                # open item: "Rate-limiting the enrollment
+                                # endpoint itself"), not a substitute for a
+                                # shared/global rate limit service in front
+                                # of many Envoy replicas.
+                                max_tokens: 20
+                                tokens_per_fill: 20
+                                fill_interval: 60s
+                              filter_enabled:
+                                runtime_key: enroll_rate_limit_enabled
+                                default_value: { numerator: 100, denominator: HUNDRED }
+                              filter_enforced:
+                                runtime_key: enroll_rate_limit_enforced
+                                default_value: { numerator: 100, denominator: HUNDRED }
+
+                        # Route 2: authenticated recipe download. Passed
+                        # through unmodified to farmer's own /v1/recipes
+                        # endpoint — see the recipe_service cluster below.
+                        - match: { prefix: "/v1/recipes" }
+                          route:
+                            cluster: recipe_service
+                            timeout: 60s
+                          typed_per_filter_config:
+                            envoy.filters.http.jwt_authn:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.PerRouteConfig
+                              requirement_name: sprout_jwt
+
+                        # Route 3 (default): the sprout's wss:// NATS
+                        # connection.
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: nats_websocket
+                            timeout: 0s # long-lived websocket connection
+                            upgrade_configs:
+                              - upgrade_type: websocket
+                          typed_per_filter_config:
+                            envoy.filters.http.jwt_authn:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.PerRouteConfig
+                              requirement_name: sprout_jwt
+                http_filters:
+                  - name: envoy.filters.http.jwt_authn
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                      providers:
+                        sprout_jwt:
+                          # Must match internal/gatewayjwt's
+                          # GatewayIssuer constant ("grlx-gateway") — a
+                          # fixed, platform-wide value, never a tenant
+                          # identifier (see that package's doc comment).
+                          issuer: grlx-gateway
+                          # Served by internal/api/handlers/jwks.go via
+                          # internal/gatewayjwt.JWKSHandler — the gateway
+                          # Transit key's public half(ves), RFC 7517/8037
+                          # shaped (kty: OKP, crv: Ed25519).
+                          remote_jwks:
+                            http_uri:
+                              uri: "https://farmer.internal:5405/v1/.well-known/jwks.json"
+                              cluster: farmer_api
+                              timeout: 5s
+                            cache_duration: 300s
+                          forward: true
+                          # The gateway JWT's `sub` claim is the sprout's
+                          # NKey public key — same identity the native
+                          # NATS User JWT names (see
+                          # internal/gatewayjwt/mint.go's GatewayClaims)
+                          # — forwarded as a header so the upstream
+                          # (nats-server, or the recipe service) can see
+                          # it without re-parsing the token.
+                          claim_to_headers:
+                            - header_name: x-grlx-sprout-nkey
+                              claim_name: sub
+                      rules:
+                        - match: { prefix: "/v1/recipes" }
+                          requires: { provider_name: sprout_jwt }
+                        - match: { prefix: "/" }
+                          requires: { provider_name: sprout_jwt }
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: http_local_rate_limiter
+                      # Disabled globally; only the /v1/enroll route above
+                      # (typed_per_filter_config) turns this on.
+                      filter_enabled:
+                        runtime_key: local_rate_limit_enabled
+                        default_value: { numerator: 0, denominator: HUNDRED }
+                      filter_enforced:
+                        runtime_key: local_rate_limit_enforced
+                        default_value: { numerator: 0, denominator: HUNDRED }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # farmer's existing HTTPS API (internal/api, cmd/farmer/main.go's
+    # StartAPIServer) — backs both /v1/enroll and the JWKS fetch above.
+    - name: farmer_api
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: farmer_api
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: farmer.internal, port_value: 5405 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+
+    # nats-server's websocket listener (internal/pki/nats.go's
+    # NatsConfig.Websocket, config.FarmerWSPort — 5407 by default).
+    - name: nats_websocket
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: nats_websocket
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: farmer.internal, port_value: 5407 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+
+    # Points at farmer's dedicated recipe HTTP endpoint (GET /v1/recipes,
+    # GET /v1/recipes/{name...} — internal/api/handlers/recipes.go,
+    # internal/api/routers.go), the "small, self-contained service"
+    # docs/design/grlx-fork-roadmap.md workstream I describes, built
+    # directly into farmer's existing HTTPS API rather than as a separate
+    # deployable.
+    - name: recipe_service
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: recipe_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: farmer.internal, port_value: 5405 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }

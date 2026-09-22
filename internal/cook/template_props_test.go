@@ -26,7 +26,7 @@ func TestRenderRecipeTemplateWithProps(t *testing.T) {
       - group: {{ props "app_group" }}
 `)
 
-	out, err := renderRecipeTemplate(sproutID, "test-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, sproutID, "test-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestRenderRecipeTemplateConditionalBlock(t *testing.T) {
 {{- end }}
 `)
 
-	out, err := renderRecipeTemplate(sproutID, "conditional-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, sproutID, "conditional-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestRenderRecipeTemplateConditionalBlockMissing(t *testing.T) {
 {{- end }}
 `)
 
-	out, err := renderRecipeTemplate(sproutID, "conditional-missing-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, sproutID, "conditional-missing-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestRenderRecipeTemplateHostname(t *testing.T) {
       - text: "Managed by grlx - {{ hostname }}"
 `)
 
-	out, err := renderRecipeTemplate(sproutID, "hostname-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, sproutID, "hostname-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestRenderRecipeTemplateMissingPropRendersEmpty(t *testing.T) {
       - user: "{{ props "nonexistent_prop" }}"
 `)
 
-	out, err := renderRecipeTemplate(sproutID, "missing-prop-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, sproutID, "missing-prop-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate should not error on missing prop: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestPropsTemplatingEndToEnd(t *testing.T) {
 `)
 
 	// Step 1: Render the template.
-	rendered, err := renderRecipeTemplate(sproutID, "e2e-recipe", recipe)
+	rendered, err := renderRecipeTemplate(testPropsTenantID, sproutID, "e2e-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestPropsTemplatingConditionalEndToEnd(t *testing.T) {
 {{- end }}
 `)
 
-	rendered, err := renderRecipeTemplate(sproutID, "e2e-conditional", recipe)
+	rendered, err := renderRecipeTemplate(testPropsTenantID, sproutID, "e2e-conditional", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestPropsTemplatingConditionalExcludedEndToEnd(t *testing.T) {
 {{- end }}
 `)
 
-	rendered, err := renderRecipeTemplate(sproutID, "e2e-conditional-excluded", recipe)
+	rendered, err := renderRecipeTemplate(testPropsTenantID, sproutID, "e2e-conditional-excluded", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestRenderRecipeTemplateInvalidSyntax(t *testing.T) {
       - name: {{ props "unclosed
 `)
 
-	_, err := renderRecipeTemplate(sproutID, "invalid-recipe", recipe)
+	_, err := renderRecipeTemplate(testPropsTenantID, sproutID, "invalid-recipe", recipe)
 	if err == nil {
 		t.Error("expected error for invalid template syntax, got nil")
 	}
@@ -337,7 +337,7 @@ func TestRenderRecipeTemplateUndefinedFunction(t *testing.T) {
       - name: {{ nonexistent "arg" }}
 `)
 
-	_, err := renderRecipeTemplate(sproutID, "undef-func-recipe", recipe)
+	_, err := renderRecipeTemplate(testPropsTenantID, sproutID, "undef-func-recipe", recipe)
 	if err == nil {
 		t.Error("expected error for undefined template function, got nil")
 	}
@@ -347,7 +347,7 @@ func TestTemplateFuncEnv(t *testing.T) {
 	t.Setenv("GRLX_TEST_VAR", "hello_world")
 
 	recipe := []byte(`value: {{ env "GRLX_TEST_VAR" }}`)
-	out, err := renderRecipeTemplate("test-sprout", "env-test", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "test-sprout", "env-test", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate error: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestTemplateFuncStringHelpers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := renderRecipeTemplate("test-sprout", tt.name, []byte(tt.template))
+			out, err := renderRecipeTemplate(testPropsTenantID, "test-sprout", tt.name, []byte(tt.template))
 			if err != nil {
 				t.Fatalf("render error: %v", err)
 			}
@@ -399,7 +399,7 @@ func TestTemplateFuncPathHelpers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := renderRecipeTemplate("test-sprout", tt.name, []byte(tt.template))
+			out, err := renderRecipeTemplate(testPropsTenantID, "test-sprout", tt.name, []byte(tt.template))
 			if err != nil {
 				t.Fatalf("render error: %v", err)
 			}
@@ -426,7 +426,7 @@ func TestTemplateFuncDefault(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := renderRecipeTemplate("test-sprout", tt.name, []byte(tt.template))
+			out, err := renderRecipeTemplate(testPropsTenantID, "test-sprout", tt.name, []byte(tt.template))
 			if err != nil {
 				t.Fatalf("render error: %v", err)
 			}
@@ -438,7 +438,7 @@ func TestTemplateFuncDefault(t *testing.T) {
 }
 
 func TestTemplateFuncSproutID(t *testing.T) {
-	out, err := renderRecipeTemplate("my-sprout-123", "sprout-test", []byte(`id: {{ sproutID }}`))
+	out, err := renderRecipeTemplate(testPropsTenantID, "my-sprout-123", "sprout-test", []byte(`id: {{ sproutID }}`))
 	if err != nil {
 		t.Fatalf("render error: %v", err)
 	}
@@ -458,7 +458,7 @@ func TestTemplateFuncTernary(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := renderRecipeTemplate("test-sprout", tt.name, []byte(tt.template))
+			out, err := renderRecipeTemplate(testPropsTenantID, "test-sprout", tt.name, []byte(tt.template))
 			if err != nil {
 				t.Fatalf("render error: %v", err)
 			}
@@ -495,7 +495,7 @@ func TestStaticPropsInTemplate(t *testing.T) {
           port: {{ props "db_port" }}
 `)
 
-	out, err := renderRecipeTemplate("static-template-sprout", "static-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "static-template-sprout", "static-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestMixedStaticAndDynamicPropsInTemplate(t *testing.T) {
       - name: "cloud tag --region={{ props "region" }} --id={{ props "instance_id" }}"
 `)
 
-	out, err := renderRecipeTemplate("mixed-sprout", "mixed-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "mixed-sprout", "mixed-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestDynamicPropOverridesStaticInTemplate(t *testing.T) {
 	}
 
 	recipe := []byte(`level: {{ props "log_level" }}`)
-	out, err := renderRecipeTemplate("override-sprout", "override-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "override-sprout", "override-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -591,11 +591,11 @@ func TestMultiSproutIsolation(t *testing.T) {
 
 	recipe := []byte(`role: {{ props "role" }}`)
 
-	outA, err := renderRecipeTemplate("sprout-a", "iso-a", recipe)
+	outA, err := renderRecipeTemplate(testPropsTenantID, "sprout-a", "iso-a", recipe)
 	if err != nil {
 		t.Fatalf("render sprout-a: %v", err)
 	}
-	outB, err := renderRecipeTemplate("sprout-b", "iso-b", recipe)
+	outB, err := renderRecipeTemplate(testPropsTenantID, "sprout-b", "iso-b", recipe)
 	if err != nil {
 		t.Fatalf("render sprout-b: %v", err)
 	}
@@ -605,6 +605,55 @@ func TestMultiSproutIsolation(t *testing.T) {
 	}
 	if strings.TrimSpace(string(outB)) != "role: database" {
 		t.Errorf("sprout-b expected 'role: database', got %q", strings.TrimSpace(string(outB)))
+	}
+}
+
+// TestRenderRecipeTemplate_TenantIsolation is the cook-side counterpart to
+// internal/props/tenant_isolation_test.go's coverage: it proves
+// renderRecipeTemplate's props/hostname template functions actually read
+// through the tenantID threaded in from SendCookEvent (via populateFuncMap
+// -> props.GetStringPropFuncForTenant), not the bare, legacy-tenant-scoped
+// seam — the same sprout ID under two different tenants, and under the
+// legacy tenant, must each see only their own props.
+func TestRenderRecipeTemplate_TenantIsolation(t *testing.T) {
+	const tenantA = "t_cook_a"
+	const tenantB = "t_cook_b"
+	const sharedSproutID = "shared-sprout-id"
+
+	if err := props.SetPropForTenant(tenantA, sharedSproutID, "role", "webserver-a"); err != nil {
+		t.Fatalf("SetPropForTenant(%s): %v", tenantA, err)
+	}
+	if err := props.SetPropForTenant(tenantB, sharedSproutID, "role", "webserver-b"); err != nil {
+		t.Fatalf("SetPropForTenant(%s): %v", tenantB, err)
+	}
+	if err := props.SetProp(sharedSproutID, "role", "legacy-tenant-role"); err != nil {
+		t.Fatalf("SetProp (legacy tenant): %v", err)
+	}
+
+	recipe := []byte(`role: {{ props "role" }}`)
+
+	outA, err := renderRecipeTemplate(tenantA, sharedSproutID, "tenant-iso-a", recipe)
+	if err != nil {
+		t.Fatalf("render tenant A: %v", err)
+	}
+	if got := strings.TrimSpace(string(outA)); got != "role: webserver-a" {
+		t.Errorf("tenant A: expected 'role: webserver-a', got %q", got)
+	}
+
+	outB, err := renderRecipeTemplate(tenantB, sharedSproutID, "tenant-iso-b", recipe)
+	if err != nil {
+		t.Fatalf("render tenant B: %v", err)
+	}
+	if got := strings.TrimSpace(string(outB)); got != "role: webserver-b" {
+		t.Errorf("tenant B: expected 'role: webserver-b', got %q", got)
+	}
+
+	outLegacy, err := renderRecipeTemplate(testPropsTenantID, sharedSproutID, "tenant-iso-legacy", recipe)
+	if err != nil {
+		t.Fatalf("render legacy tenant: %v", err)
+	}
+	if got := strings.TrimSpace(string(outLegacy)); got != "role: legacy-tenant-role" {
+		t.Errorf("legacy tenant: expected 'role: legacy-tenant-role', got %q", got)
 	}
 }
 
@@ -637,7 +686,7 @@ func TestStaticPropsEndToEndPipeline(t *testing.T) {
 `)
 
 	// Step 1: Render.
-	rendered, err := renderRecipeTemplate("e2e-static-sprout", "e2e-static", recipe)
+	rendered, err := renderRecipeTemplate(testPropsTenantID, "e2e-static-sprout", "e2e-static", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -717,7 +766,7 @@ func TestStaticPropsClearedBetweenReloads(t *testing.T) {
 	props.LoadStaticProps(cfg1)
 
 	recipe := []byte(`v: {{ props "version" }}`)
-	out, err := renderRecipeTemplate("reload-sprout", "reload-1", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "reload-sprout", "reload-1", recipe)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -735,7 +784,7 @@ func TestStaticPropsClearedBetweenReloads(t *testing.T) {
 	props.LoadStaticProps(cfg2)
 	t.Cleanup(props.ClearStaticProps)
 
-	out, err = renderRecipeTemplate("reload-sprout", "reload-2", recipe)
+	out, err = renderRecipeTemplate(testPropsTenantID, "reload-sprout", "reload-2", recipe)
 	if err != nil {
 		t.Fatalf("render after reload: %v", err)
 	}
@@ -763,7 +812,7 @@ func TestStaticPropsNestedTemplateExpressions(t *testing.T) {
       - name: "deploy {{ upper (props "app_name") }} to {{ props "app_env" }}"
 `)
 
-	out, err := renderRecipeTemplate("nested-sprout", "nested-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "nested-sprout", "nested-recipe", recipe)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
 	}
@@ -788,7 +837,7 @@ func TestStaticPropsWithDefaultFallback(t *testing.T) {
 	recipe := []byte(`port: {{ default "8080" (props "port") }}
 host: {{ default "localhost" (props "missing_host") }}`)
 
-	out, err := renderRecipeTemplate("default-sprout", "default-recipe", recipe)
+	out, err := renderRecipeTemplate(testPropsTenantID, "default-sprout", "default-recipe", recipe)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}

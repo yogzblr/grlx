@@ -117,6 +117,12 @@ func (u User) PropertiesForMethod(method string) (map[string]string, error) {
 			ingredients.MethodProps{Key: "createhome", Type: "bool", IsReq: false},
 			ingredients.MethodProps{Key: "system", Type: "bool", IsReq: false},
 			ingredients.MethodProps{Key: "password_hash", Type: "string", IsReq: false},
+			// password is Windows-only: Windows local accounts require a
+			// cleartext password at creation time (there is no crypt(3)
+			// hash concept), so it has no effect on Unix targets, and
+			// password_hash has no effect on Windows targets. See
+			// userPresent_windows.go.
+			ingredients.MethodProps{Key: "password", Type: "string", IsReq: false},
 		}.ToMap(), nil
 	default:
 		return nil, fmt.Errorf("method %s undefined", method)

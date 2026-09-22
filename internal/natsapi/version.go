@@ -13,6 +13,6 @@ func SetBuildVersion(v config.Version) {
 	buildVersion = v
 }
 
-func handleVersion(_ json.RawMessage) (any, error) {
+func handleVersion(_ string, _ json.RawMessage) (any, error) {
 	return buildVersion, nil
 }

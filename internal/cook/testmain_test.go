@@ -1,18 +1,92 @@
 package cook
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+
 	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
+	"github.com/gogrlx/grlx/v2/internal/objectstore/objectstoretest"
+	"github.com/gogrlx/grlx/v2/internal/props"
 )
+
+// testPropsTenantID is the tenant used by this package's existing
+// props/template tests that aren't specifically about tenant isolation
+// (see TestRenderRecipeTemplate_TenantIsolation in template_props_test.go
+// for that one) — it matches props' bare, legacy-tenant-scoped functions'
+// implicit tenant (tenantID() in internal/props/store.go, "default" here
+// since config.FarmerOrganization is never set in this package's tests),
+// so prop fixtures written via the existing bare props.SetProp calls stay
+// visible once tenantID is threaded through the render chain. Distinct
+// from cook_coverage_test.go's own testTenantID ("t_test"), which scopes
+// SendCookEvent's farmerConnFor NATS connection lookup instead — an
+// unrelated concern that predates this constant.
+const testPropsTenantID = "default"
 
 func TestMain(m *testing.M) {
 	// Set RecipeDir to the test fixtures directory
 	_, filename, _, _ := runtime.Caller(0)
 	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(filename)))
 	config.RecipeDir = filepath.Join(projectRoot, "testing", "recipes")
-	os.Exit(m.Run())
+
+	// This package's props.* templating tests need props' PXC-backed store
+	// wired up (see internal/props/store.go) — a single shared in-memory
+	// db for the whole binary run is fine since every test below uses its
+	// own distinct sprout ID.
+	gdb, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		fmt.Println("opening props test db:", err)
+		os.Exit(1)
+	}
+	if err := gdb.AutoMigrate(props.Models()...); err != nil {
+		fmt.Println("migrating props test db:", err)
+		os.Exit(1)
+	}
+	props.SetDB(gdb)
+
+	// Recipes now read through internal/objectstore (see store.go) instead
+	// of local disk — seed a fake S3 backend with the same testing/recipes
+	// fixture tree the old local-disk store read directly, keyed exactly
+	// the way ResolveRecipeFilePath computes them (config.RecipeDir joined
+	// with each fixture's path relative to it), so every existing test's
+	// recipe names resolve identically.
+	store, closeStore, err := objectstoretest.NewStoreForBinary()
+	if err != nil {
+		fmt.Println("opening recipe test store:", err)
+		os.Exit(1)
+	}
+	if err := seedRecipeFixtures(store, config.RecipeDir); err != nil {
+		fmt.Println("seeding recipe test store:", err)
+		os.Exit(1)
+	}
+	SetStore(store)
+
+	// os.Exit below skips defers, so close the fake store's HTTP server
+	// explicitly rather than deferring it.
+	code := m.Run()
+	closeStore()
+	os.Exit(code)
+}
+
+func seedRecipeFixtures(store *objectstore.Store, dir string) error {
+	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		return store.Put(context.Background(), path, data)
+	})
 }

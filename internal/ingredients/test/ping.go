@@ -14,13 +14,17 @@ import (
 // client's ResolveTargets, which fans a selector out into a TargetedAction
 // with one KeyManager per matched sprout; this function is the per-sprout leg
 // invoked once for each of those targets.
-func FPing(target pki.KeyManager, ping apitypes.PingPong) (apitypes.PingPong, error) {
+func FPing(tenantID string, target pki.KeyManager, ping apitypes.PingPong) (apitypes.PingPong, error) {
+	var pong apitypes.PingPong
+	conn := farmerConnFor(tenantID)
+	if conn == nil {
+		return pong, fmt.Errorf("test: no NATS connection registered for tenant %s", tenantID)
+	}
 	topic := "grlx.sprouts." + target.SproutID + ".test.ping"
 	ping.Ping = true
 	ping.Pong = false
-	var pong apitypes.PingPong
 	b, _ := json.Marshal(ping)
-	msg, err := nc.Request(topic, b, time.Second*15)
+	msg, err := conn.Request(topic, b, time.Second*15)
 	if err != nil {
 		return pong, fmt.Errorf("ping request failed: %w", err)
 	}

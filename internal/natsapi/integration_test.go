@@ -53,10 +53,10 @@ func TestSubscribeRegistersAllRoutes(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -90,14 +90,14 @@ func TestSubscribeTestPingRoute(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
 	setupNatsAPIPKI(t)
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -123,8 +123,8 @@ func TestSubscribeJobsListRoute(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
 	_, jobCleanup := setupJobStore(t)
 	defer jobCleanup()
@@ -132,7 +132,7 @@ func TestSubscribeJobsListRoute(t *testing.T) {
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -152,13 +152,13 @@ func TestSubscribePropsSetGetRoute(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -205,8 +205,8 @@ func TestSubscribeHandlerError(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
 	_, jobCleanup := setupJobStore(t)
 	defer jobCleanup()
@@ -214,7 +214,7 @@ func TestSubscribeHandlerError(t *testing.T) {
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -236,8 +236,8 @@ func TestSubscribeWithAuditLogging(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
 	dir := t.TempDir()
 	logger, err := audit.NewLogger(dir)
@@ -251,7 +251,7 @@ func TestSubscribeWithAuditLogging(t *testing.T) {
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -272,80 +272,29 @@ func TestSubscribeWithAuditLogging(t *testing.T) {
 }
 
 // --- probeSprout integration test ---
+//
+// probeSprout used to be a synchronous NATS request/reply ping to the
+// sprout itself; it now reads a Valkey heartbeat key maintained by
+// internal/heartbeat's $SYS.ACCOUNT.*.CONNECT/DISCONNECT listener (see
+// docs/design/grlx-master-plan.md Phase 1), so a live NATS connection to a
+// mock sprout no longer drives it either way. internal/heartbeat's own
+// test suite covers the event-to-sprout-ID mapping logic; a genuine
+// online/offline round trip needs a live Valkey backend, which this
+// package's test suite doesn't have (see internal/heartbeat's tests for
+// why a fake isn't feasible without one).
 
-func TestProbeSproutSuccess(t *testing.T) {
+func TestProbeSproutNoHeartbeatClient(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
-	// Subscribe a mock sprout that responds to ping.
-	_, err := nc.Subscribe("grlx.sprouts.test-sprout.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: true})
-		msg.Respond(resp)
-	})
-	if err != nil {
-		t.Fatalf("subscribe mock sprout: %v", err)
-	}
-	nc.Flush()
-
-	if !probeSprout("test-sprout") {
-		t.Error("expected probeSprout to return true for responding sprout")
-	}
-}
-
-func TestProbeSproutTimeout(t *testing.T) {
-	nc, cleanup := startEmbeddedNATS(t)
-	defer cleanup()
-
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// No subscriber for this sprout — should timeout and return false.
-	if probeSprout("nonexistent-sprout") {
-		t.Error("expected probeSprout to return false for unresponsive sprout")
-	}
-}
-
-func TestProbeSproutBadResponse(t *testing.T) {
-	nc, cleanup := startEmbeddedNATS(t)
-	defer cleanup()
-
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// Subscribe a mock sprout that returns invalid JSON.
-	nc.Subscribe("grlx.sprouts.bad-json-sprout.test.ping", func(msg *nats.Msg) {
-		msg.Respond([]byte(`{invalid json`))
-	})
-	nc.Flush()
-
-	if probeSprout("bad-json-sprout") {
-		t.Error("expected probeSprout to return false for bad JSON response")
-	}
-}
-
-func TestProbeSproutNoPong(t *testing.T) {
-	nc, cleanup := startEmbeddedNATS(t)
-	defer cleanup()
-
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// Responds with valid JSON but Pong=false.
-	nc.Subscribe("grlx.sprouts.no-pong.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: false})
-		msg.Respond(resp)
-	})
-	nc.Flush()
-
-	if probeSprout("no-pong") {
-		t.Error("expected probeSprout to return false when Pong is false")
+	// No Valkey client configured anywhere in this test binary — every
+	// sprout must read as offline regardless of NATS connectivity.
+	if probeSprout("acme", "test-sprout") {
+		t.Error("expected probeSprout to return false with no heartbeat client configured")
 	}
 }
 
@@ -358,9 +307,9 @@ func TestHandleCookSuccessWithNATS(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-cook-int", "UKEY_COOK_INT")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -370,7 +319,7 @@ func TestHandleCookSuccessWithNATS(t *testing.T) {
 		"action": map[string]string{"recipe": "test.recipe"},
 	})
 
-	result, err := handleCook(params)
+	result, err := handleCook(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleCook: %v", err)
 	}
@@ -395,9 +344,9 @@ func TestHandleCookWithTokenInvoker(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-cook-tk", "UKEY_COOK_TK")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	token, authCleanup := setupAuthWithToken(t, "operator", []rbac.Rule{
 		{Action: rbac.ActionCook, Scope: "*"},
@@ -410,7 +359,7 @@ func TestHandleCookWithTokenInvoker(t *testing.T) {
 		"action": map[string]string{"recipe": "deploy.recipe"},
 	})
 
-	result, err := handleCook(params)
+	result, err := handleCook(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleCook: %v", err)
 	}
@@ -429,9 +378,9 @@ func TestHandleCookMultipleTargets(t *testing.T) {
 	writeNKey(t, pkiDir, "accepted", "sprout-multi-1", "UKEY_M1")
 	writeNKey(t, pkiDir, "accepted", "sprout-multi-2", "UKEY_M2")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -444,7 +393,7 @@ func TestHandleCookMultipleTargets(t *testing.T) {
 		"action": map[string]string{"recipe": "multi.recipe"},
 	})
 
-	result, err := handleCook(params)
+	result, err := handleCook(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleCook: %v", err)
 	}
@@ -462,9 +411,9 @@ func TestHandleCookTestMode(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-test-mode", "UKEY_TM")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -474,7 +423,7 @@ func TestHandleCookTestMode(t *testing.T) {
 		"action": map[string]interface{}{"recipe": "dry-run.recipe", "test": true},
 	})
 
-	result, err := handleCook(params)
+	result, err := handleCook(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleCook: %v", err)
 	}
@@ -491,16 +440,16 @@ func TestHandleCookUnregisteredSprout(t *testing.T) {
 
 	setupNatsAPIPKI(t)
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	params, _ := json.Marshal(map[string]interface{}{
 		"target": []map[string]string{{"id": "unregistered-sprout"}},
 		"action": map[string]string{"recipe": "test.recipe"},
 	})
 
-	_, err := handleCook(params)
+	_, err := handleCook(tenantID, params)
 	if err == nil {
 		t.Fatal("expected error for unregistered sprout")
 	}
@@ -510,11 +459,11 @@ func TestHandleCookInvalidJSONWithNATS(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
-	_, err := handleCook(json.RawMessage(`{invalid`))
+	_, err := handleCook(tenantID, json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -529,9 +478,9 @@ func TestHandleShellStartSuccess(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-shell-int", "UKEY_SHELL_INT")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -558,7 +507,7 @@ func TestHandleShellStartSuccess(t *testing.T) {
 		Rows:     24,
 	})
 
-	result, err := handleShellStart(params)
+	result, err := handleShellStart(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleShellStart: %v", err)
 	}
@@ -599,9 +548,9 @@ func TestHandleShellStartSproutError(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-shell-err", "UKEY_SHELL_ERR")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -619,7 +568,7 @@ func TestHandleShellStartSproutError(t *testing.T) {
 		Rows:     24,
 	})
 
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(tenantID, params)
 	if err == nil {
 		t.Fatal("expected error when sprout returns error")
 	}
@@ -629,9 +578,9 @@ func TestHandleShellStartEmptySproutID(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	params, _ := json.Marshal(shell.CLIStartRequest{
 		SproutID: "",
@@ -639,7 +588,7 @@ func TestHandleShellStartEmptySproutID(t *testing.T) {
 		Rows:     24,
 	})
 
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(tenantID, params)
 	if err == nil {
 		t.Fatal("expected error for empty sprout_id")
 	}
@@ -649,11 +598,11 @@ func TestHandleShellStartInvalidJSONWithNATS(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
-	_, err := handleShellStart(json.RawMessage(`{invalid`))
+	_, err := handleShellStart(tenantID, json.RawMessage(`{invalid`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -666,9 +615,9 @@ func TestHandleShellStartTimeout(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-shell-timeout", "UKEY_SHELL_TO")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -680,7 +629,7 @@ func TestHandleShellStartTimeout(t *testing.T) {
 		Rows:     24,
 	})
 
-	_, err := handleShellStart(params)
+	_, err := handleShellStart(tenantID, params)
 	if err == nil {
 		t.Fatal("expected error for sprout timeout")
 	}
@@ -692,9 +641,9 @@ func TestSubscribeSessionDoneReceivesMessage(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	// Set up audit logger.
 	dir := t.TempDir()
@@ -717,7 +666,7 @@ func TestSubscribeSessionDoneReceivesMessage(t *testing.T) {
 	}
 	sessionTracker.Add(info)
 
-	subscribeSessionDone(info)
+	subscribeSessionDone(nc, info)
 
 	// Publish done message.
 	doneMsg := shell.DoneMessage{
@@ -742,9 +691,9 @@ func TestSubscribeSessionDoneWithError(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	dir := t.TempDir()
 	logger, err := audit.NewLogger(dir)
@@ -765,7 +714,7 @@ func TestSubscribeSessionDoneWithError(t *testing.T) {
 	}
 	sessionTracker.Add(info)
 
-	subscribeSessionDone(info)
+	subscribeSessionDone(nc, info)
 
 	doneMsg := shell.DoneMessage{
 		ExitCode: 1,
@@ -784,6 +733,12 @@ func TestSubscribeSessionDoneWithError(t *testing.T) {
 
 // --- handleSproutsList with NATS (probeSprout path) ---
 
+// TestHandleSproutsListWithConnectedSprout used to mock a sprout
+// responding to a ping and assert Connected=true; Connected now reflects
+// a Valkey heartbeat key (see internal/heartbeat) instead of a live NATS
+// round trip, so with no Valkey client configured in this test binary
+// every accepted sprout reads as offline regardless of NATS connectivity
+// — see the comment above TestProbeSproutNoHeartbeatClient.
 func TestHandleSproutsListWithConnectedSprout(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
@@ -791,21 +746,14 @@ func TestHandleSproutsListWithConnectedSprout(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-connected", "UKEY_CONN")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
-	// Subscribe mock sprout to respond to ping.
-	nc.Subscribe("grlx.sprouts.sprout-connected.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: true})
-		msg.Respond(resp)
-	})
-	nc.Flush()
-
-	result, err := handleSproutsList(nil)
+	result, err := handleSproutsList(tenantID, nil)
 	if err != nil {
 		t.Fatalf("handleSproutsList: %v", err)
 	}
@@ -815,8 +763,8 @@ func TestHandleSproutsListWithConnectedSprout(t *testing.T) {
 	for _, s := range m["sprouts"] {
 		if s.ID == "sprout-connected" {
 			found = true
-			if !s.Connected {
-				t.Error("expected Connected=true for responding sprout")
+			if s.Connected {
+				t.Error("expected Connected=false with no heartbeat client configured")
 			}
 			break
 		}
@@ -833,19 +781,12 @@ func TestHandleSproutsGetWithNATS(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-get-int", "UKEY_GET_INT")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
-
-	// Mock sprout responds to ping.
-	nc.Subscribe("grlx.sprouts.sprout-get-int.test.ping", func(msg *nats.Msg) {
-		resp, _ := json.Marshal(apitypes.PingPong{Pong: true})
-		msg.Respond(resp)
-	})
-	nc.Flush()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	params, _ := json.Marshal(pki.KeyManager{SproutID: "sprout-get-int"})
-	result, err := handleSproutsGet(params)
+	result, err := handleSproutsGet(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleSproutsGet: %v", err)
 	}
@@ -854,8 +795,8 @@ func TestHandleSproutsGetWithNATS(t *testing.T) {
 	if info.ID != "sprout-get-int" {
 		t.Errorf("ID = %q, want %q", info.ID, "sprout-get-int")
 	}
-	if !info.Connected {
-		t.Error("expected Connected=true")
+	if info.Connected {
+		t.Error("expected Connected=false with no heartbeat client configured")
 	}
 	if info.KeyState != "accepted" {
 		t.Errorf("KeyState = %q, want %q", info.KeyState, "accepted")
@@ -871,9 +812,9 @@ func TestHandleJobsCancelWithNATS(t *testing.T) {
 	dir, jobCleanup := setupJobStore(t)
 	defer jobCleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
@@ -892,7 +833,7 @@ func TestHandleJobsCancelWithNATS(t *testing.T) {
 	nc.Flush()
 
 	params, _ := json.Marshal(JobsGetParams{JID: "jid-cancel-int"})
-	result, err := handleJobsCancel(params)
+	result, err := handleJobsCancel(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleJobsCancel: %v", err)
 	}
@@ -923,15 +864,15 @@ func TestHandleCookTriggerAndSendEvents(t *testing.T) {
 	pkiDir := setupNatsAPIPKI(t)
 	writeNKey(t, pkiDir, "accepted", "sprout-cook-trigger", "UKEY_COOK_TRIGGER")
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
 	defer jetyCleanup()
 
 	params := json.RawMessage(`{"target":[{"id":"sprout-cook-trigger"}],"action":{"recipe":"deploy.app"}}`)
-	result, err := handleCook(params)
+	result, err := handleCook(tenantID, params)
 	if err != nil {
 		t.Fatalf("handleCook: %v", err)
 	}
@@ -963,9 +904,9 @@ func TestSubscribeSessionDoneUntrackedSession(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	defer ClearNatsConn(tenantID)
 
 	info := &shell.SessionInfo{
 		SessionID:   "test-done-untracked",
@@ -974,7 +915,7 @@ func TestSubscribeSessionDoneUntrackedSession(t *testing.T) {
 	}
 	// Do NOT add to tracker — simulates an already-removed session.
 
-	subscribeSessionDone(info)
+	subscribeSessionDone(nc, info)
 
 	// Publish done — the callback should handle the nil tracker result gracefully.
 	done := shell.DoneMessage{ExitCode: 0}
@@ -988,7 +929,7 @@ func TestSubscribeSessionDoneUntrackedSession(t *testing.T) {
 func TestHandleShellStartSproutIDWithUnderscoreIntegration(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	_, err := handleShellStart(json.RawMessage(`{"sprout_id":"sprout_bad","cols":80,"rows":24}`))
+	_, err := handleShellStart(pki.CurrentTenantID(), json.RawMessage(`{"sprout_id":"sprout_bad","cols":80,"rows":24}`))
 	if err == nil {
 		t.Fatal("expected error for sprout ID with underscore")
 	}

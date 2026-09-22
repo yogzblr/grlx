@@ -19,9 +19,12 @@ import (
 	log "github.com/gogrlx/grlx/v2/internal/log"
 )
 
-// handler is a function that processes a NATS API request.
-// It receives the raw JSON params and returns a result or error.
-type handler func(params json.RawMessage) (any, error)
+// handler is a function that processes a NATS API request. It receives the
+// tenant ID of the connection the request arrived on — connection-level
+// metadata captured by Subscribe's closure, per
+// docs/design/grlx-tenant-context-threading.md's Option A — and the raw
+// JSON params, and returns a result or error.
+type handler func(tenantID string, params json.RawMessage) (any, error)
 
 // response is the envelope returned to the caller.
 type response struct {
@@ -38,12 +41,13 @@ var routes = map[string]handler{
 	MethodVersion: handleVersion,
 
 	// PKI management
-	MethodPKIList:     handlePKIList,
-	MethodPKIAccept:   handlePKIAccept,
-	MethodPKIReject:   handlePKIReject,
-	MethodPKIDeny:     handlePKIDeny,
-	MethodPKIUnaccept: handlePKIUnaccept,
-	MethodPKIDelete:   handlePKIDelete,
+	MethodPKIList:         handlePKIList,
+	MethodPKIAccept:       handlePKIAccept,
+	MethodPKIReject:       handlePKIReject,
+	MethodPKIDeny:         handlePKIDeny,
+	MethodPKIUnaccept:     handlePKIUnaccept,
+	MethodPKIDelete:       handlePKIDelete,
+	MethodPKIRotateBoxKey: handlePKIRotateBoxKey,
 
 	// Sprouts
 	MethodSproutsList: handleSproutsList,
@@ -89,28 +93,36 @@ var routes = map[string]handler{
 	// Shell (interactive SSH-like sessions)
 	MethodShellStart: handleShellStart,
 
-	// Recipes
-	MethodRecipesList: handleRecipesList,
-	MethodRecipesGet:  handleRecipesGet,
-
 	// Audit
 	MethodAuditDates: handleAuditList,
 	MethodAuditQuery: handleAuditQuery,
 }
 
-// Subscribe registers all NATS API handlers on the given connection.
-// It subscribes to "grlx.api.>" and dispatches based on subject suffix.
-// Each handler is wrapped with RBAC enforcement middleware that checks
-// the caller's token before dispatching.
-func Subscribe(nc *nats.Conn) error {
-	SetNatsConn(nc)
+// natsCoreQueueGroup is the NATS queue group shared by all farmer replicas
+// for grlx.api.> request handling. Queue-subscribing (rather than plain
+// Subscribe) ensures that when multiple farmer replicas run behind the same
+// NATS subject, exactly one replica processes each API request instead of
+// every replica processing it and racing to reply / duplicating side
+// effects (e.g. running a cmd twice, deleting a job twice).
+const natsCoreQueueGroup = "grlx-core"
+
+// Subscribe registers all NATS API handlers on the given connection,
+// scoped to tenantID — the connection's own tenant identity, per
+// docs/design/grlx-tenant-context-threading.md's Option A. It subscribes
+// to "grlx.api.>" and dispatches based on subject suffix. Each handler is
+// wrapped with RBAC enforcement middleware that checks the caller's token
+// before dispatching. Called once per tenant connection: farmer opens one
+// NATS connection per tenant (cmd/farmer/main.go's ConnectFarmer), and
+// every one of them gets its own full set of registrations.
+func Subscribe(nc *nats.Conn, tenantID string) error {
+	SetNatsConn(tenantID, nc)
 
 	for method, h := range routes {
 		subject := Subject(method)
 		handler := authMiddleware(method, h) // wrap with RBAC enforcement
 		action := method                     // capture for audit
-		_, err := nc.Subscribe(subject, func(msg *nats.Msg) {
-			result, err := handler(msg.Data)
+		_, err := nc.QueueSubscribe(subject, natsCoreQueueGroup, func(msg *nats.Msg) {
+			result, err := handler(tenantID, msg.Data)
 
 			// Audit log: record actions based on configured audit level.
 			if audit.ShouldLog(action) {
@@ -138,7 +150,11 @@ func Subscribe(nc *nats.Conn) error {
 		if err != nil {
 			return fmt.Errorf("natsapi: failed to subscribe to %s: %w", subject, err)
 		}
-		log.Tracef("natsapi: registered handler for %s", subject)
+		log.Tracef("natsapi: registered handler for %s (tenant %s)", subject, tenantID)
+	}
+
+	if err := registerBoxKeySubmitListener(nc, tenantID); err != nil {
+		return err
 	}
 
 	return nil

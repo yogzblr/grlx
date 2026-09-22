@@ -9,6 +9,7 @@ import (
 )
 
 func TestCohortValidate(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		name    string
 		cohort  Cohort
@@ -92,6 +93,7 @@ func TestCohortValidate(t *testing.T) {
 }
 
 func TestRegistryRegisterAndGet(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 
 	c := &Cohort{Name: "web", Type: CohortTypeStatic, Members: []string{"s1"}}
@@ -114,6 +116,7 @@ func TestRegistryRegisterAndGet(t *testing.T) {
 }
 
 func TestRegistryList(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "a", Type: CohortTypeStatic})
 	_ = reg.Register(&Cohort{Name: "b", Type: CohortTypeStatic})
@@ -132,6 +135,7 @@ func TestRegistryList(t *testing.T) {
 }
 
 func TestResolveStatic(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{
 		Name: "web", Type: CohortTypeStatic,
@@ -153,6 +157,7 @@ func TestResolveStatic(t *testing.T) {
 }
 
 func TestResolveDynamic(t *testing.T) {
+	newTestDB(t)
 	// Set up props for test sprouts.
 	setProp := props.SetPropFunc("sprout-linux-1")
 	_ = setProp("os", "linux")
@@ -181,6 +186,7 @@ func TestResolveDynamic(t *testing.T) {
 }
 
 func TestResolveDynamicWildcard(t *testing.T) {
+	newTestDB(t)
 	setProp := props.SetPropFunc("sprout-a")
 	_ = setProp("role", "web-frontend")
 	setProp = props.SetPropFunc("sprout-b")
@@ -208,6 +214,7 @@ func TestResolveDynamicWildcard(t *testing.T) {
 }
 
 func TestResolveCompoundAND(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{
 		Name: "group-a", Type: CohortTypeStatic,
@@ -238,6 +245,7 @@ func TestResolveCompoundAND(t *testing.T) {
 }
 
 func TestResolveCompoundOR(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{
 		Name: "group-a", Type: CohortTypeStatic,
@@ -265,6 +273,7 @@ func TestResolveCompoundOR(t *testing.T) {
 }
 
 func TestResolveCompoundEXCEPT(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{
 		Name: "all", Type: CohortTypeStatic,
@@ -295,6 +304,7 @@ func TestResolveCompoundEXCEPT(t *testing.T) {
 }
 
 func TestResolveCompoundNested(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{
 		Name: "a", Type: CohortTypeStatic,
@@ -329,6 +339,7 @@ func TestResolveCompoundNested(t *testing.T) {
 }
 
 func TestResolveCircularReference(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	// Create a circular reference: x references y, y references x.
 	_ = reg.Register(&Cohort{
@@ -347,6 +358,7 @@ func TestResolveCircularReference(t *testing.T) {
 }
 
 func TestResolveNotFound(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_, err := reg.Resolve("nope", nil)
 	if err == nil {
@@ -355,6 +367,7 @@ func TestResolveNotFound(t *testing.T) {
 }
 
 func TestMatchesPropValue(t *testing.T) {
+	newTestDB(t)
 	tests := []struct {
 		actual   string
 		expected string
@@ -384,6 +397,7 @@ func TestMatchesPropValue(t *testing.T) {
 }
 
 func TestRefreshSingleCohort(t *testing.T) {
+	newTestDB(t)
 	// Set up props for test sprouts.
 	setProp := props.SetPropFunc("refresh-s1")
 	_ = setProp("env", "prod")
@@ -424,6 +438,7 @@ func TestRefreshSingleCohort(t *testing.T) {
 }
 
 func TestRefreshAllCohorts(t *testing.T) {
+	newTestDB(t)
 	setProp := props.SetPropFunc("rall-s1")
 	_ = setProp("os", "linux")
 	setProp = props.SetPropFunc("rall-s2")
@@ -458,6 +473,7 @@ func TestRefreshAllCohorts(t *testing.T) {
 }
 
 func TestRefreshNotFound(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_, err := reg.Refresh("nonexistent", nil)
 	if err == nil {
@@ -466,6 +482,7 @@ func TestRefreshNotFound(t *testing.T) {
 }
 
 func TestRefreshInvalidatesCacheOnRegister(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{
 		Name: "group", Type: CohortTypeStatic,
@@ -496,6 +513,7 @@ func TestRefreshInvalidatesCacheOnRegister(t *testing.T) {
 }
 
 func TestRegisterSelfReference(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	err := reg.Register(&Cohort{
 		Name: "self", Type: CohortTypeCompound,
@@ -510,6 +528,7 @@ func TestRegisterSelfReference(t *testing.T) {
 }
 
 func TestValidateReferences(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "a", Type: CohortTypeStatic, Members: []string{"s1"}})
 	_ = reg.Register(&Cohort{
@@ -527,6 +546,7 @@ func TestValidateReferences(t *testing.T) {
 }
 
 func TestValidateReferencesAllPresent(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "a", Type: CohortTypeStatic, Members: []string{"s1"}})
 	_ = reg.Register(&Cohort{Name: "b", Type: CohortTypeStatic, Members: []string{"s2"}})
@@ -542,16 +562,17 @@ func TestValidateReferencesAllPresent(t *testing.T) {
 }
 
 func TestValidateReferencesCircular(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	// Manually set up circular references (bypassing Register's self-ref check).
-	reg.cohorts["x"] = &Cohort{
+	putCohortRaw(&Cohort{
 		Name: "x", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorAND, Operands: []string{"y", "y"}},
-	}
-	reg.cohorts["y"] = &Cohort{
+	})
+	putCohortRaw(&Cohort{
 		Name: "y", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorAND, Operands: []string{"x", "x"}},
-	}
+	})
 
 	err := reg.ValidateReferences()
 	if err == nil {
@@ -560,6 +581,7 @@ func TestValidateReferencesCircular(t *testing.T) {
 }
 
 func TestResolveMaxDepthExceeded(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	// Build a chain deeper than MaxNestingDepth.
 	_ = reg.Register(&Cohort{Name: "leaf", Type: CohortTypeStatic, Members: []string{"s1"}})
@@ -568,10 +590,10 @@ func TestResolveMaxDepthExceeded(t *testing.T) {
 	_ = reg.Register(&Cohort{Name: "leaf2", Type: CohortTypeStatic, Members: []string{"s2"}})
 	for i := range MaxNestingDepth + 2 {
 		name := fmt.Sprintf("level-%d", i)
-		reg.cohorts[name] = &Cohort{
+		putCohortRaw(&Cohort{
 			Name: name, Type: CohortTypeCompound,
 			Compound: &CompoundExpr{Operator: OperatorOR, Operands: []string{prev, "leaf2"}},
-		}
+		})
 		prev = name
 	}
 
@@ -585,6 +607,7 @@ func TestResolveMaxDepthExceeded(t *testing.T) {
 }
 
 func TestResolveDeeplyNestedOK(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "leaf", Type: CohortTypeStatic, Members: []string{"s1"}})
 	_ = reg.Register(&Cohort{Name: "leaf2", Type: CohortTypeStatic, Members: []string{"s2"}})
@@ -592,10 +615,10 @@ func TestResolveDeeplyNestedOK(t *testing.T) {
 	// Build a chain at exactly MaxNestingDepth - should still work.
 	for i := range MaxNestingDepth - 1 {
 		name := fmt.Sprintf("deep-%d", i)
-		reg.cohorts[name] = &Cohort{
+		putCohortRaw(&Cohort{
 			Name: name, Type: CohortTypeCompound,
 			Compound: &CompoundExpr{Operator: OperatorOR, Operands: []string{prev, "leaf2"}},
-		}
+		})
 		prev = name
 	}
 
@@ -609,6 +632,7 @@ func TestResolveDeeplyNestedOK(t *testing.T) {
 }
 
 func TestResolveSharedOperandNotCircular(t *testing.T) {
+	newTestDB(t)
 	// Two compound cohorts sharing a common operand should not trigger circular ref.
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "shared", Type: CohortTypeStatic, Members: []string{"s1"}})
@@ -637,6 +661,7 @@ func TestResolveSharedOperandNotCircular(t *testing.T) {
 }
 
 func TestResolveMultiOperandAND(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "a", Type: CohortTypeStatic, Members: []string{"s1", "s2", "s3"}})
 	_ = reg.Register(&Cohort{Name: "b", Type: CohortTypeStatic, Members: []string{"s1", "s2", "s4"}})
@@ -656,17 +681,18 @@ func TestResolveMultiOperandAND(t *testing.T) {
 }
 
 func TestValidateReferencesAllMultipleErrors(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "a", Type: CohortTypeStatic, Members: []string{"s1"}})
 	// Two compound cohorts each referencing a missing operand.
-	reg.cohorts["bad1"] = &Cohort{
+	putCohortRaw(&Cohort{
 		Name: "bad1", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorAND, Operands: []string{"a", "ghost1"}},
-	}
-	reg.cohorts["bad2"] = &Cohort{
+	})
+	putCohortRaw(&Cohort{
 		Name: "bad2", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorOR, Operands: []string{"a", "ghost2"}},
-	}
+	})
 
 	errs := reg.ValidateReferencesAll()
 	if len(errs) < 2 {
@@ -681,6 +707,7 @@ func TestValidateReferencesAllMultipleErrors(t *testing.T) {
 }
 
 func TestValidateReferencesAllNoErrors(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "a", Type: CohortTypeStatic, Members: []string{"s1"}})
 	_ = reg.Register(&Cohort{Name: "b", Type: CohortTypeStatic, Members: []string{"s2"}})
@@ -696,22 +723,23 @@ func TestValidateReferencesAllNoErrors(t *testing.T) {
 }
 
 func TestValidateReferencesAllCircularAndMissing(t *testing.T) {
+	newTestDB(t)
 	reg := NewRegistry()
 	_ = reg.Register(&Cohort{Name: "leaf", Type: CohortTypeStatic, Members: []string{"s1"}})
 	// Circular: x -> y -> x
-	reg.cohorts["x"] = &Cohort{
+	putCohortRaw(&Cohort{
 		Name: "x", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorAND, Operands: []string{"y", "leaf"}},
-	}
-	reg.cohorts["y"] = &Cohort{
+	})
+	putCohortRaw(&Cohort{
 		Name: "y", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorAND, Operands: []string{"x", "leaf"}},
-	}
+	})
 	// Missing reference
-	reg.cohorts["z"] = &Cohort{
+	putCohortRaw(&Cohort{
 		Name: "z", Type: CohortTypeCompound,
 		Compound: &CompoundExpr{Operator: OperatorOR, Operands: []string{"leaf", "nonexistent"}},
-	}
+	})
 
 	errs := reg.ValidateReferencesAll()
 	if len(errs) == 0 {

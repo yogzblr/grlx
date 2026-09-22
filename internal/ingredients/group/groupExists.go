@@ -3,9 +3,22 @@ package group
 import (
 	"context"
 	"errors"
+	"os/user"
 
 	"github.com/gogrlx/grlx/v2/internal/cook"
 )
+
+// lookupGroup is a test-overridable wrapper around user.LookupGroup. It is
+// implemented by the stdlib os/user package on every OS grlx targets, so
+// it is shared between the Unix and Windows providers rather than
+// reimplemented per platform.
+var lookupGroup = user.LookupGroup
+
+// groupExistsBy reports whether a local group with the given name exists.
+var groupExistsBy = func(name string) bool {
+	_, err := lookupGroup(name)
+	return err == nil
+}
 
 func (g Group) exists(ctx context.Context, test bool) (cook.Result, error) {
 	var result cook.Result

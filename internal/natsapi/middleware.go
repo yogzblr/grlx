@@ -38,12 +38,13 @@ var natsActionMap = map[string]rbac.Action{
 	MethodJobsDelete:  rbac.ActionJobAdmin,
 
 	// Global: PKI
-	MethodPKIList:     rbac.ActionPKI,
-	MethodPKIAccept:   rbac.ActionPKI,
-	MethodPKIReject:   rbac.ActionPKI,
-	MethodPKIDeny:     rbac.ActionPKI,
-	MethodPKIUnaccept: rbac.ActionPKI,
-	MethodPKIDelete:   rbac.ActionPKI,
+	MethodPKIList:         rbac.ActionPKI,
+	MethodPKIAccept:       rbac.ActionPKI,
+	MethodPKIReject:       rbac.ActionPKI,
+	MethodPKIDeny:         rbac.ActionPKI,
+	MethodPKIUnaccept:     rbac.ActionPKI,
+	MethodPKIDelete:       rbac.ActionPKI,
+	MethodPKIRotateBoxKey: rbac.ActionPKI,
 
 	// Auth
 	MethodAuthLogin:      rbac.ActionUserRead,
@@ -52,10 +53,6 @@ var natsActionMap = map[string]rbac.Action{
 	MethodAuthAddUser:    rbac.ActionAdmin,
 	MethodAuthRemoveUser: rbac.ActionAdmin,
 	MethodAuthExplain:    rbac.ActionUserRead,
-
-	// Recipes (read-only)
-	MethodRecipesList: rbac.ActionView,
-	MethodRecipesGet:  rbac.ActionView,
 
 	// Audit
 	MethodAuditDates: rbac.ActionAdmin,
@@ -101,11 +98,11 @@ func authMiddleware(method string, next handler) handler {
 	requiredAction := NATSMethodAction(method)
 	extractor := scopeExtractors[method]
 
-	return func(params json.RawMessage) (any, error) {
+	return func(tenantID string, params json.RawMessage) (any, error) {
 		// dangerously_allow_root bypasses all auth checks.
 		if intauth.DangerouslyAllowRoot() {
 			log.Warnf("dangerously_allow_root: bypassing auth for NATS method %s", method)
-			return next(params)
+			return next(tenantID, params)
 		}
 
 		// Extract token from params.
@@ -128,13 +125,13 @@ func authMiddleware(method string, next handler) handler {
 			if err != nil {
 				// Extraction errors are not auth failures — let the
 				// handler validate params and return a proper error.
-				return next(params)
+				return next(tenantID, params)
 			}
-			if err := checkScopedAccess(tp.Token, requiredAction, sproutIDs); err != nil {
+			if err := checkScopedAccess(tenantID, tp.Token, requiredAction, sproutIDs); err != nil {
 				return nil, rbac.ErrAccessDenied
 			}
 		}
 
-		return next(params)
+		return next(tenantID, params)
 	}
 }

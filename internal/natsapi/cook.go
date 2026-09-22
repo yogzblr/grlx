@@ -16,7 +16,7 @@ import (
 	nats "github.com/nats-io/nats.go"
 )
 
-func handleCook(params json.RawMessage) (any, error) {
+func handleCook(tenantID string, params json.RawMessage) (any, error) {
 	var ta apitypes.TargetedAction
 	if err := json.Unmarshal(params, &ta); err != nil {
 		return nil, fmt.Errorf("invalid request: %w", err)
@@ -32,12 +32,13 @@ func handleCook(params json.RawMessage) (any, error) {
 		if !pki.IsValidSproutID(target.SproutID) || strings.Contains(target.SproutID, "_") {
 			return nil, fmt.Errorf("invalid sprout ID: %s", target.SproutID)
 		}
-		registered, _ := pki.NKeyExists(target.SproutID, "")
+		registered, _ := pki.NKeyExists(tenantID, target.SproutID, "")
 		if !registered {
 			return nil, fmt.Errorf("unknown sprout: %s", target.SproutID)
 		}
 	}
 
+	natsConn := natsConnFor(tenantID)
 	if natsConn == nil {
 		return nil, fmt.Errorf("NATS connection not available")
 	}
@@ -92,7 +93,7 @@ func handleCook(params json.RawMessage) (any, error) {
 				if command.State != "" {
 					cookOpts = append(cookOpts, cook.WithTargetStep(cook.StepID(command.State)))
 				}
-				err := cook.SendCookEvent(t.SproutID, command.Recipe, jid, command.Test, cookOpts...)
+				err := cook.SendCookEvent(tenantID, t.SproutID, command.Recipe, jid, command.Test, cookOpts...)
 				if err != nil {
 					mu.Lock()
 					errs[t.SproutID] = err

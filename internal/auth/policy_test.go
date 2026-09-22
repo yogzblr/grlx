@@ -23,6 +23,7 @@ func makeValidToken(t *testing.T) (string, string) {
 }
 
 func TestTokenHasAccessWithValidAdminToken(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -44,6 +45,7 @@ func TestTokenHasAccessWithValidAdminToken(t *testing.T) {
 }
 
 func TestTokenHasAccessWithUnknownPubkey(t *testing.T) {
+	newTestDB(t)
 	token, _ := makeValidToken(t)
 
 	// Set up a policy but don't add the token's pubkey.
@@ -61,6 +63,7 @@ func TestTokenHasAccessWithUnknownPubkey(t *testing.T) {
 }
 
 func TestTokenHasRouteAccessWithValidToken(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -85,6 +88,7 @@ func TestTokenHasRouteAccessWithValidToken(t *testing.T) {
 }
 
 func TestTokenHasRouteAccessViewerRestrictions(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -108,6 +112,7 @@ func TestTokenHasRouteAccessViewerRestrictions(t *testing.T) {
 }
 
 func TestTokenHasActionWithValidToken(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -138,6 +143,7 @@ func TestTokenHasActionWithValidToken(t *testing.T) {
 }
 
 func TestTokenHasScopedAccessWithCohort(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -177,6 +183,7 @@ func TestTokenHasScopedAccessWithCohort(t *testing.T) {
 }
 
 func TestTokenScopeFilterWithCohort(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -215,6 +222,7 @@ func TestTokenScopeFilterWithCohort(t *testing.T) {
 }
 
 func TestTokenScopeFilterWildcard(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -238,6 +246,7 @@ func TestTokenScopeFilterWildcard(t *testing.T) {
 }
 
 func TestWhoAmIWithValidToken(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -265,6 +274,7 @@ func TestWhoAmIWithValidToken(t *testing.T) {
 }
 
 func TestWhoAmIUnknownUser(t *testing.T) {
+	newTestDB(t)
 	token, _ := makeValidToken(t)
 
 	SetPolicy(rbac.NewRoleStore(), rbac.NewUserRoleMap(), nil)
@@ -280,6 +290,7 @@ func TestWhoAmIUnknownUser(t *testing.T) {
 }
 
 func TestWhoAmIWithUsername(t *testing.T) {
+	newTestDB(t)
 	token, pk := makeValidToken(t)
 
 	rs := rbac.NewRoleStore()
@@ -308,6 +319,7 @@ func TestWhoAmIWithUsername(t *testing.T) {
 }
 
 func TestCurrentPolicy(t *testing.T) {
+	newTestDB(t)
 	rs := rbac.NewRoleStore()
 	urm := rbac.NewUserRoleMap()
 
@@ -327,6 +339,7 @@ func TestCurrentPolicy(t *testing.T) {
 }
 
 func TestCohortResolverNilRegistry(t *testing.T) {
+	newTestDB(t)
 	SetPolicy(rbac.NewRoleStore(), rbac.NewUserRoleMap(), nil)
 	defer SetPolicy(nil, nil, nil)
 
@@ -337,6 +350,7 @@ func TestCohortResolverNilRegistry(t *testing.T) {
 }
 
 func TestCohortResolverWithRegistry(t *testing.T) {
+	newTestDB(t)
 	reg := rbac.NewRegistry()
 	reg.Register(&rbac.Cohort{
 		Name:    "test-group",
@@ -365,6 +379,7 @@ func TestCohortResolverWithRegistry(t *testing.T) {
 }
 
 func TestListAllUsersWithPolicy(t *testing.T) {
+	newTestDB(t)
 	rs := rbac.NewRoleStore()
 	rs.Register(&rbac.Role{
 		Name:  "admin",
