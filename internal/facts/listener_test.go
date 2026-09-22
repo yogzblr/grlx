@@ -41,7 +41,7 @@ func TestRegisterFarmerListener_ValidFacts(t *testing.T) {
 	nc, cleanup := startTestNATS(t)
 	defer cleanup()
 
-	RegisterFarmerListener(nc)
+	RegisterFarmerListener("t_test", nc)
 	nc.Flush()
 
 	sf := SystemFacts{
@@ -80,7 +80,7 @@ func TestRegisterFarmerListener_EmptySproutID(t *testing.T) {
 	nc, cleanup := startTestNATS(t)
 	defer cleanup()
 
-	RegisterFarmerListener(nc)
+	RegisterFarmerListener("t_test", nc)
 	nc.Flush()
 
 	sf := SystemFacts{
@@ -111,7 +111,7 @@ func TestRegisterFarmerListener_InvalidJSON(t *testing.T) {
 	nc, cleanup := startTestNATS(t)
 	defer cleanup()
 
-	RegisterFarmerListener(nc)
+	RegisterFarmerListener("t_test", nc)
 	nc.Flush()
 
 	// Publish invalid JSON — should not panic.
@@ -142,7 +142,7 @@ func TestRegisterFarmerListener_UsesQueueGroup(t *testing.T) {
 	nc, cleanup := startTestNATS(t)
 	defer cleanup()
 
-	RegisterFarmerListener(nc)
+	RegisterFarmerListener("t_test", nc)
 	nc.Flush()
 
 	// Simulate a second farmer replica subscribing to the same subject in
@@ -200,7 +200,7 @@ func TestRegisterFarmerListener_MultipleSprouts(t *testing.T) {
 	nc, cleanup := startTestNATS(t)
 	defer cleanup()
 
-	RegisterFarmerListener(nc)
+	RegisterFarmerListener("t_test", nc)
 	nc.Flush()
 
 	for _, sprout := range []struct {

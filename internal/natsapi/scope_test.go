@@ -199,14 +199,14 @@ func TestAuthMiddleware_ScopeEnforcement(t *testing.T) {
 	// When dangerously_allow_root is off and token is invalid,
 	// scope-checked methods should still be denied at the token stage.
 	called := false
-	inner := func(params json.RawMessage) (any, error) {
+	inner := func(_ string, params json.RawMessage) (any, error) {
 		called = true
 		return "ok", nil
 	}
 
 	wrapped := authMiddleware("cook", inner)
 	params := json.RawMessage(`{"target":[{"sprout_id":"web-1"}],"action":{},"token":"invalid"}`)
-	_, err := wrapped(params)
+	_, err := wrapped("t_test", params)
 	if err == nil {
 		t.Fatal("expected error for invalid token")
 	}

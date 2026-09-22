@@ -136,7 +136,7 @@ func TestRegisterNatsConn_ReadOnlyDir(t *testing.T) {
 	_, conn := startTestNATSServer(t)
 
 	// Should not panic — error is logged.
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 }
 
 // --- logJobs edge cases ---
@@ -148,7 +148,7 @@ func TestLogJobs_ShortSubject(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Subscribe to a subject that will produce short components.
 	// Publish directly to the callback won't work via NATS wildcard,
@@ -169,7 +169,7 @@ func TestLogJobCreation_ShortSubject(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// We can't easily trigger the < 4 components path via NATS subscription
 	// since the wildcard pattern guarantees 4 parts. But verify that
@@ -206,7 +206,7 @@ func TestLogJobs_ConcurrentSteps(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Publish many steps concurrently.
 	const stepCount = 20
@@ -704,7 +704,7 @@ func TestLogJobCreation_ManySteps(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Create envelope with many steps.
 	steps := make([]cook.Step, 50)
@@ -829,7 +829,7 @@ func TestLogJobs_WriteToReadOnlyDir(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Create sprout dir and make it read-only.
 	sproutDir := filepath.Join(dir, "sprout-ro")
@@ -862,7 +862,7 @@ func TestLogJobs_ExistingFileAppend(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Pre-create the sprout dir and an existing job file.
 	sproutDir := filepath.Join(dir, "sprout-existing")
@@ -909,7 +909,7 @@ func TestLogJobs_NewSproutDir(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	step := cook.StepCompletion{
 		ID:               "s1",
@@ -952,7 +952,7 @@ func TestLogJobCreation_ReadOnlyDir(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Make dir read-only so MkdirAll for sprout dir fails.
 	os.Chmod(dir, 0o555)
@@ -1010,7 +1010,7 @@ func TestRegisterNatsConn_ClosedConn(t *testing.T) {
 	conn.Close()
 
 	// Should not panic — subscribe errors are logged.
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 }
 
 // --- RecordJobStart: WriteFile meta error (simulate by filling disk — skip)
@@ -1111,7 +1111,7 @@ func TestLogJobCreation_CreateFileError(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Pre-create the sprout dir but put a FILE where the job file should be.
 	sproutDir := filepath.Join(dir, "sprout-filecollision")
@@ -1145,7 +1145,7 @@ func TestLogJobs_ReadOnlyExistingFile(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Create a read-only existing job file.
 	sproutDir := filepath.Join(dir, "sprout-readonly-file")

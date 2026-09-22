@@ -110,10 +110,12 @@ func extractSproutsGetID(params json.RawMessage) ([]string, error) {
 	return []string{p.SproutID}, nil
 }
 
-// allAcceptedSproutIDs returns all accepted sprout IDs from the PKI store.
-// This is used by the cohort resolver to evaluate dynamic cohorts.
-func allAcceptedSproutIDs() []string {
-	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
+// allAcceptedSproutIDs returns all accepted sprout IDs from the PKI store,
+// within tenantID — the connection's own tenant (see docs/design/
+// grlx-tenant-context-threading.md). This is used by the cohort resolver
+// to evaluate dynamic cohorts.
+func allAcceptedSproutIDs(tenantID string) []string {
+	allKeys := pki.ListNKeysByType(tenantID)
 	ids := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		ids = append(ids, km.SproutID)
@@ -122,10 +124,10 @@ func allAcceptedSproutIDs() []string {
 }
 
 // checkScopedAccess verifies that the token's role permits the given
-// action on the specified sprout IDs. Returns nil if access is granted,
-// ErrAccessDenied otherwise.
-func checkScopedAccess(token string, action rbac.Action, sproutIDs []string) error {
-	allIDs := allAcceptedSproutIDs()
+// action on the specified sprout IDs, within tenantID. Returns nil if
+// access is granted, ErrAccessDenied otherwise.
+func checkScopedAccess(tenantID, token string, action rbac.Action, sproutIDs []string) error {
+	allIDs := allAcceptedSproutIDs(tenantID)
 	if !intauth.TokenHasScopedAccess(token, action, sproutIDs, allIDs) {
 		return rbac.ErrAccessDenied
 	}
@@ -133,8 +135,8 @@ func checkScopedAccess(token string, action rbac.Action, sproutIDs []string) err
 }
 
 // filterSproutsByScope returns the subset of sproutIDs the token's role
-// permits for the given action.
-func filterSproutsByScope(token string, action rbac.Action, sproutIDs []string) []string {
-	allIDs := allAcceptedSproutIDs()
+// permits for the given action, within tenantID.
+func filterSproutsByScope(tenantID, token string, action rbac.Action, sproutIDs []string) []string {
+	allIDs := allAcceptedSproutIDs(tenantID)
 	return intauth.TokenScopeFilter(token, action, sproutIDs, allIDs)
 }

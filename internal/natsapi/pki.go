@@ -6,64 +6,64 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
-func handlePKIList(_ json.RawMessage) (any, error) {
-	return pki.ListNKeysByType(pki.CurrentTenantID()), nil
+func handlePKIList(tenantID string, _ json.RawMessage) (any, error) {
+	return pki.ListNKeysByType(tenantID), nil
 }
 
-func handlePKIAccept(params json.RawMessage) (any, error) {
+func handlePKIAccept(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.AcceptNKey(pki.CurrentTenantID(), km.SproutID)
+	err := pki.AcceptNKey(tenantID, km.SproutID)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil
 }
 
-func handlePKIReject(params json.RawMessage) (any, error) {
+func handlePKIReject(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.RejectNKey(pki.CurrentTenantID(), km.SproutID, "")
+	err := pki.RejectNKey(tenantID, km.SproutID, "")
 	if err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil
 }
 
-func handlePKIDeny(params json.RawMessage) (any, error) {
+func handlePKIDeny(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.DenyNKey(pki.CurrentTenantID(), km.SproutID)
+	err := pki.DenyNKey(tenantID, km.SproutID)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil
 }
 
-func handlePKIUnaccept(params json.RawMessage) (any, error) {
+func handlePKIUnaccept(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.UnacceptNKey(pki.CurrentTenantID(), km.SproutID, "")
+	err := pki.UnacceptNKey(tenantID, km.SproutID, "")
 	if err != nil {
 		return nil, err
 	}
 	return map[string]bool{"success": true}, nil
 }
 
-func handlePKIDelete(params json.RawMessage) (any, error) {
+func handlePKIDelete(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
 	}
-	err := pki.DeleteNKey(pki.CurrentTenantID(), km.SproutID)
+	err := pki.DeleteNKey(tenantID, km.SproutID)
 	if err != nil {
 		return nil, err
 	}

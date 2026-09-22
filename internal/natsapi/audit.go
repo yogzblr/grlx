@@ -6,7 +6,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/audit"
 )
 
-func handleAuditList(params json.RawMessage) (any, error) {
+func handleAuditList(_ string, params json.RawMessage) (any, error) {
 	l := audit.Global()
 	if l == nil {
 		return nil, errAuditNotConfigured
@@ -18,7 +18,7 @@ func handleAuditList(params json.RawMessage) (any, error) {
 	return dates, nil
 }
 
-func handleAuditQuery(params json.RawMessage) (any, error) {
+func handleAuditQuery(_ string, params json.RawMessage) (any, error) {
 	l := audit.Global()
 	if l == nil {
 		return nil, errAuditNotConfigured

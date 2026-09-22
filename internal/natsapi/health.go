@@ -19,9 +19,10 @@ type HealthResponse struct {
 	NATSReady bool   `json:"nats_ready"`
 }
 
-func handleHealth(_ json.RawMessage) (any, error) {
+func handleHealth(tenantID string, _ json.RawMessage) (any, error) {
 	uptime := time.Since(farmerStartTime)
-	natsReady := natsConn != nil && natsConn.IsConnected()
+	nc := natsConnFor(tenantID)
+	natsReady := nc != nil && nc.IsConnected()
 
 	status := "ok"
 	if !natsReady {

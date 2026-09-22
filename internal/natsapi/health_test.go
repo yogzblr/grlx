@@ -12,11 +12,9 @@ func TestHandleHealth(t *testing.T) {
 	defer func() { farmerStartTime = origStart }()
 
 	// No NATS connection — should report degraded.
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn("")
 
-	result, err := handleHealth(nil)
+	result, err := handleHealth("", nil)
 	if err != nil {
 		t.Fatalf("handleHealth: unexpected error: %v", err)
 	}
@@ -48,11 +46,10 @@ func TestHandleHealthOK(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	natsConn = nc
-	defer func() { natsConn = old }()
+	SetNatsConn("", nc)
+	defer ClearNatsConn("")
 
-	result, err := handleHealth(nil)
+	result, err := handleHealth("", nil)
 	if err != nil {
 		t.Fatalf("handleHealth: unexpected error: %v", err)
 	}
@@ -71,11 +68,9 @@ func TestHandleHealthUptime(t *testing.T) {
 	farmerStartTime = time.Now().Add(-30 * time.Second)
 	defer func() { farmerStartTime = origStart }()
 
-	old := natsConn
-	natsConn = nil
-	defer func() { natsConn = old }()
+	ClearNatsConn("")
 
-	result, err := handleHealth(nil)
+	result, err := handleHealth("", nil)
 	if err != nil {
 		t.Fatalf("handleHealth: %v", err)
 	}

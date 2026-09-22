@@ -8,6 +8,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
 // TestSubscribe_UsesQueueGroup verifies that Subscribe registers its route
@@ -26,10 +27,10 @@ func TestSubscribe_UsesQueueGroup(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -82,10 +83,10 @@ func TestSubscribe_QueueGroupIsSharedAcrossRoutes(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	old := natsConn
-	defer func() { natsConn = old }()
+	tenantID := pki.CurrentTenantID()
+	defer ClearNatsConn(tenantID)
 
-	if err := Subscribe(nc); err != nil {
+	if err := Subscribe(nc, tenantID); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 

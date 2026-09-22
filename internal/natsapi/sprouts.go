@@ -20,8 +20,7 @@ type SproutInfo struct {
 	NKey      string `json:"nkey,omitempty"`
 }
 
-func handleSproutsList(params json.RawMessage) (any, error) {
-	tenantID := pki.CurrentTenantID()
+func handleSproutsList(tenantID string, params json.RawMessage) (any, error) {
 	allKeys := pki.ListNKeysByType(tenantID)
 	var sprouts []SproutInfo
 
@@ -52,7 +51,7 @@ func handleSproutsList(params json.RawMessage) (any, error) {
 		if err == nil {
 			info.NKey = nkey
 		}
-		if e.state == "accepted" && natsConn != nil {
+		if e.state == "accepted" && natsConnFor(tenantID) != nil {
 			info.Connected = probeSprout(tenantID, e.id)
 		}
 		sprouts = append(sprouts, info)
@@ -74,7 +73,7 @@ func handleSproutsList(params json.RawMessage) (any, error) {
 			for i, s := range sprouts {
 				allIDs[i] = s.ID
 			}
-			allowed := filterSproutsByScope(tp.Token, rbac.ActionView, allIDs)
+			allowed := filterSproutsByScope(tenantID, tp.Token, rbac.ActionView, allIDs)
 			if allowed != nil {
 				allowedSet := make(map[string]bool, len(allowed))
 				for _, id := range allowed {
@@ -94,7 +93,7 @@ func handleSproutsList(params json.RawMessage) (any, error) {
 	return map[string][]SproutInfo{"sprouts": sprouts}, nil
 }
 
-func handleSproutsGet(params json.RawMessage) (any, error) {
+func handleSproutsGet(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
@@ -103,7 +102,6 @@ func handleSproutsGet(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("invalid sprout ID")
 	}
 
-	tenantID := pki.CurrentTenantID()
 	nkey, err := pki.GetNKey(tenantID, km.SproutID)
 	if err != nil {
 		return nil, fmt.Errorf("sprout not found")
@@ -116,7 +114,7 @@ func handleSproutsGet(params json.RawMessage) (any, error) {
 		NKey:     nkey,
 	}
 
-	if keyState == "accepted" && natsConn != nil {
+	if keyState == "accepted" && natsConnFor(tenantID) != nil {
 		info.Connected = probeSprout(tenantID, km.SproutID)
 	}
 
@@ -132,7 +130,7 @@ func handleSproutsGet(params json.RawMessage) (any, error) {
 // instead of a round trip to the sprout. See
 // docs/design/grlx-master-plan.md Phase 1.
 func probeSprout(tenantID, sproutID string) bool {
-	if natsConn == nil {
+	if natsConnFor(tenantID) == nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

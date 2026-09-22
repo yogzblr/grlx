@@ -29,7 +29,7 @@ import (
 // header comment and the design doc's explicit rejection of an earlier,
 // unsafe framing that would have had farmer generate/hold a sprout's
 // private key.
-func handlePKIRotateBoxKey(params json.RawMessage) (any, error) {
+func handlePKIRotateBoxKey(tenantID string, params json.RawMessage) (any, error) {
 	var km pki.KeyManager
 	if err := json.Unmarshal(params, &km); err != nil {
 		return nil, err
@@ -37,14 +37,15 @@ func handlePKIRotateBoxKey(params json.RawMessage) (any, error) {
 	if km.SproutID == "" {
 		return nil, fmt.Errorf("id is required")
 	}
-	registered, _ := pki.NKeyExists(pki.CurrentTenantID(), km.SproutID, "")
+	registered, _ := pki.NKeyExists(tenantID, km.SproutID, "")
 	if !registered {
 		return nil, fmt.Errorf("unknown sprout: %s", km.SproutID)
 	}
-	if natsConn == nil {
+	nc := natsConnFor(tenantID)
+	if nc == nil {
 		return nil, fmt.Errorf("NATS connection not available")
 	}
-	if err := natsConn.Publish(SproutSubject(km.SproutID, SproutBoxKeyRotateCmd), nil); err != nil {
+	if err := nc.Publish(SproutSubject(km.SproutID, SproutBoxKeyRotateCmd), nil); err != nil {
 		return nil, fmt.Errorf("failed to publish rotate instruction: %w", err)
 	}
 	return map[string]bool{"success": true}, nil
@@ -63,7 +64,7 @@ type boxKeySubmitRequest struct {
 // authenticated identity, enforced by NATS permissions on which subjects
 // a given sprout connection may publish to, not by anything checked
 // here).
-func handleBoxKeySubmit(msg *nats.Msg) {
+func handleBoxKeySubmit(tenantID string, msg *nats.Msg) {
 	parts := strings.Split(msg.Subject, ".")
 	if len(parts) < 4 {
 		log.Errorf("boxkeys: unexpected subject format: %s", msg.Subject)
@@ -80,7 +81,7 @@ func handleBoxKeySubmit(msg *nats.Msg) {
 		log.Errorf("boxkeys: empty pub in submission from %s", sproutID)
 		return
 	}
-	if err := pki.RotateSproutBoxKey(pki.CurrentTenantID(), sproutID, req.Pub, config.BoxKeyGraceDuration); err != nil {
+	if err := pki.RotateSproutBoxKey(tenantID, sproutID, req.Pub, config.BoxKeyGraceDuration); err != nil {
 		log.Errorf("boxkeys: failed to record new box key for %s: %v", sproutID, err)
 		return
 	}
@@ -88,13 +89,20 @@ func handleBoxKeySubmit(msg *nats.Msg) {
 }
 
 // registerBoxKeySubmitListener subscribes to sprout key-rotation
-// submissions. QueueSubscribe under the shared natsCoreQueueGroup (see
-// router.go's Subscribe): every replica reads the same PXC-backed
-// pki_sprout_box_keys table (internal/pki/boxkeys.go), so exactly one
-// replica should process a given submission — the same reasoning
-// internal/facts's listener applies to sprout facts events.
-func registerBoxKeySubmitListener(nc *nats.Conn) error {
-	_, err := nc.QueueSubscribe(SproutBoxKeySubmitPattern, natsCoreQueueGroup, handleBoxKeySubmit)
+// submissions on nc, scoped to tenantID (nc's own tenant — see
+// docs/design/grlx-tenant-context-threading.md). handleBoxKeySubmit is a
+// plain nats.MsgHandler, not a `handler`-shaped route, so tenantID is
+// captured directly in the subscription closure below rather than threaded
+// through the routes map/authMiddleware machinery. QueueSubscribe under the
+// shared natsCoreQueueGroup (see router.go's Subscribe): every replica
+// reads the same PXC-backed pki_sprout_box_keys table
+// (internal/pki/boxkeys.go), so exactly one replica should process a given
+// submission — the same reasoning internal/facts's listener applies to
+// sprout facts events.
+func registerBoxKeySubmitListener(nc *nats.Conn, tenantID string) error {
+	_, err := nc.QueueSubscribe(SproutBoxKeySubmitPattern, natsCoreQueueGroup, func(msg *nats.Msg) {
+		handleBoxKeySubmit(tenantID, msg)
+	})
 	if err != nil {
 		return fmt.Errorf("natsapi: failed to subscribe to %s: %w", SproutBoxKeySubmitPattern, err)
 	}

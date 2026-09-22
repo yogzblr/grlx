@@ -31,7 +31,7 @@ type JobsForSproutParams struct {
 	SproutID string `json:"sprout_id"`
 }
 
-func handleJobsList(params json.RawMessage) (any, error) {
+func handleJobsList(tenantID string, params json.RawMessage) (any, error) {
 	var p JobsListParams
 	if len(params) > 0 {
 		json.Unmarshal(params, &p)
@@ -64,7 +64,7 @@ func handleJobsList(params json.RawMessage) (any, error) {
 					seen[s.SproutID] = true
 				}
 			}
-			allowed := filterSproutsByScope(tp.Token, rbac.ActionView, sproutIDs)
+			allowed := filterSproutsByScope(tenantID, tp.Token, rbac.ActionView, sproutIDs)
 			if allowed != nil {
 				allowedSet := make(map[string]bool, len(allowed))
 				for _, id := range allowed {
@@ -95,7 +95,7 @@ func handleJobsList(params json.RawMessage) (any, error) {
 	return summaries, nil
 }
 
-func handleJobsGet(params json.RawMessage) (any, error) {
+func handleJobsGet(_ string, params json.RawMessage) (any, error) {
 	var p JobsGetParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -115,7 +115,7 @@ type JobsDeleteParams struct {
 	JID string `json:"jid"`
 }
 
-func handleJobsDelete(params json.RawMessage) (any, error) {
+func handleJobsDelete(tenantID string, params json.RawMessage) (any, error) {
 	var p JobsDeleteParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -137,7 +137,7 @@ func handleJobsDelete(params json.RawMessage) (any, error) {
 			json.Unmarshal(params, &tp)
 		}
 		if tp.Token != "" && summary.SproutID != "" {
-			if err := checkScopedAccess(tp.Token, rbac.ActionJobAdmin, []string{summary.SproutID}); err != nil {
+			if err := checkScopedAccess(tenantID, tp.Token, rbac.ActionJobAdmin, []string{summary.SproutID}); err != nil {
 				return nil, rbac.ErrAccessDenied
 			}
 		}
@@ -153,7 +153,7 @@ func handleJobsDelete(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handleJobsCancel(params json.RawMessage) (any, error) {
+func handleJobsCancel(tenantID string, params json.RawMessage) (any, error) {
 	var p JobsGetParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -177,7 +177,7 @@ func handleJobsCancel(params json.RawMessage) (any, error) {
 			json.Unmarshal(params, &tp)
 		}
 		if tp.Token != "" && summary.SproutID != "" {
-			if err := checkScopedAccess(tp.Token, rbac.ActionJobAdmin, []string{summary.SproutID}); err != nil {
+			if err := checkScopedAccess(tenantID, tp.Token, rbac.ActionJobAdmin, []string{summary.SproutID}); err != nil {
 				return nil, rbac.ErrAccessDenied
 			}
 		}
@@ -190,11 +190,12 @@ func handleJobsCancel(params json.RawMessage) (any, error) {
 	subject := SproutSubject(summary.SproutID, SproutCancel)
 	cancelMsg, _ := json.Marshal(map[string]string{"jid": p.JID})
 
-	if natsConn == nil {
+	nc := natsConnFor(tenantID)
+	if nc == nil {
 		return nil, fmt.Errorf("NATS connection not available")
 	}
 
-	if err := natsConn.Publish(subject, cancelMsg); err != nil {
+	if err := nc.Publish(subject, cancelMsg); err != nil {
 		return nil, fmt.Errorf("failed to publish cancel: %w", err)
 	}
 
@@ -205,7 +206,7 @@ func handleJobsCancel(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handleJobsListForSprout(params json.RawMessage) (any, error) {
+func handleJobsListForSprout(_ string, params json.RawMessage) (any, error) {
 	var p JobsForSproutParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err

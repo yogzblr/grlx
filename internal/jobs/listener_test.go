@@ -24,7 +24,7 @@ func TestRegisterNatsConn(t *testing.T) {
 	_, conn := startTestNATSServer(t)
 
 	// Should create the jobs directory.
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	if _, err := os.Stat(config.JobLogDir); err != nil {
 		t.Errorf("expected job log dir to be created: %v", err)
@@ -40,7 +40,7 @@ func TestRegisterNatsConn_ExistingDir(t *testing.T) {
 	_, conn := startTestNATSServer(t)
 
 	// Should not error when dir already exists.
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 }
 
 func TestLogJobs_StepCompletion(t *testing.T) {
@@ -50,7 +50,7 @@ func TestLogJobs_StepCompletion(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	step := cook.StepCompletion{
 		ID:               "step-1",
@@ -89,7 +89,7 @@ func TestLogJobs_AppendToExisting(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Publish two steps.
 	for i := range 2 {
@@ -125,7 +125,7 @@ func TestLogJobs_InvalidJSON(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Publish invalid JSON — should not panic.
 	if err := conn.Publish("grlx.cook.sprout-bad.job-bad", []byte("invalid json")); err != nil {
@@ -148,7 +148,7 @@ func TestLogJobCreation(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	envelope := cook.RecipeEnvelope{
 		JobID:     "creation-job-1",
@@ -204,7 +204,7 @@ func TestLogJobCreation_EmptyJobID(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Envelope with empty JobID should be ignored.
 	envelope := cook.RecipeEnvelope{
@@ -234,7 +234,7 @@ func TestLogJobCreation_NoInvokedBy(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	envelope := cook.RecipeEnvelope{
 		JobID: "no-invoker-job",
@@ -266,7 +266,7 @@ func TestLogJobs_JobFileIsDirectory(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Pre-create a directory where the job file should be — triggers the "is a directory" path.
 	sproutDir := filepath.Join(dir, "sprout-dirjob")
@@ -295,7 +295,7 @@ func TestLogJobCreation_DuplicateJobID(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	envelope := cook.RecipeEnvelope{
 		JobID: "dup-job",
@@ -342,7 +342,7 @@ func TestRegisterNatsConn_FanOutNotQueueGrouped(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	// Simulate a second farmer replica subscribed to the same subject
 	// under a queue group. If logJobs/logJobCreation were queue-grouped
@@ -397,7 +397,7 @@ func TestLogJobCreation_InvalidJSON(t *testing.T) {
 	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
 
 	_, conn := startTestNATSServer(t)
-	RegisterNatsConn(conn)
+	RegisterNatsConn("t_test", conn)
 
 	if err := conn.Publish("grlx.sprouts.sprout-badjson.cook", []byte("not json")); err != nil {
 		t.Fatal(err)

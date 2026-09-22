@@ -145,9 +145,7 @@ func TestPublishEncryptedTo_NoConnection(t *testing.T) {
 		t.Fatalf("seeding sprout box key: %v", err)
 	}
 
-	old := natsConn
-	natsConn = nil
-	t.Cleanup(func() { natsConn = old })
+	ClearNatsConn(pki.CurrentTenantID())
 
 	type payload struct {
 		Msg string `json:"msg"`

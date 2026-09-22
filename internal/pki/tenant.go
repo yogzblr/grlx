@@ -82,6 +82,20 @@ func tenantAccountSigningKeyPath(id string) string {
 func tenantAccountJWTPath(id string) string { return filepath.Join(tenantAuthDir(id), "account.jwt") }
 func tenantSproutJWTDir(id string) string   { return filepath.Join(tenantAuthDir(id), "sprouts") }
 
+// farmerUserJWTPathForTenant is farmerUserJWTPath (jwtauth.go) re-keyed by
+// tenant — farmer's own connection identity under tenantID's Account, one
+// per dynamically-provisioned tenant, the counterpart to
+// sproutJWTPathForTenant above. See FarmerUserJWTForTenant and
+// docs/design/grlx-tenant-context-threading.md's Option A: farmer opens one
+// NATS connection per tenant, each authenticated with its own User JWT
+// minted under that tenant's own Account (same underlying farmer NKey
+// identity, reused across every tenant — see mintOrReuseUserJWT's doc
+// comment on why one NKey can hold distinct User JWTs under many Accounts
+// simultaneously).
+func farmerUserJWTPathForTenant(id string) string {
+	return filepath.Join(tenantAuthDir(id), "farmer.jwt")
+}
+
 // sproutJWTPathForTenant is sproutJWTPath (jwtauth.go) re-keyed by tenant —
 // see this file's package doc comment. Two different tenants may each have
 // a sprout named "web-01"; each gets its own file under its own tenant's
@@ -223,8 +237,49 @@ func ensureTenantAccount(tenantID, nameHint string) (mat *natsAuthMaterial, tam 
 	if err != nil {
 		return nil, nil, false, err
 	}
+	// Notify cmd/farmer/main.go's ConnectFarmer that this tenant is newly
+	// live, so it can open a dedicated NATS connection and boot that
+	// tenant's registrations at runtime (see OnTenantProvisioned's doc
+	// comment and docs/design/grlx-tenant-context-threading.md's Option A).
+	// Fired outside tenantAuthMu (already released above) and in its own
+	// goroutine: the hook dials the bus over the network, which must never
+	// block an enrollment request or an explicit ProvisionTenant call
+	// waiting on it.
+	if provisioned && tenantProvisionedHook != nil {
+		go tenantProvisionedHook(tenantID)
+	}
 	return mat, tam, provisioned, nil
 }
+
+// tenantProvisionedHook and tenantDeprovisionedHook let cmd/farmer/main.go
+// react to a tenant becoming newly live or going away without internal/pki
+// depending on cmd/farmer's connection-lifecycle code. See
+// OnTenantProvisioned/OnTenantDeprovisioned.
+var (
+	tenantProvisionedHook   func(tenantID string)
+	tenantDeprovisionedHook func(tenantID string)
+)
+
+// OnTenantProvisioned registers fn to be called, in its own goroutine,
+// whenever a brand-new tenant Account is provisioned — via an explicit
+// ProvisionTenant call or ReloadNKeysForTenant's lazy first-enrollment path
+// (enroll.go's acceptEnrolledNKey). cmd/farmer/main.go uses this to open
+// that tenant's dedicated NATS connection and register its full handler
+// set at runtime (docs/design/grlx-tenant-context-threading.md's Option A),
+// instead of only ever connecting the tenants known at boot. Call once at
+// startup, before enrollment can occur; only the most recently registered
+// callback is kept — this package supports exactly one subscriber, not a
+// general pub/sub mechanism.
+func OnTenantProvisioned(fn func(tenantID string)) { tenantProvisionedHook = fn }
+
+// OnTenantDeprovisioned registers fn to be called, in its own goroutine,
+// whenever DeprovisionTenant tears down a tenant's Account. cmd/farmer/main.go
+// uses this to close that tenant's NATS connection and unregister its
+// handlers cleanly (no leaked goroutines/subscriptions — closing the
+// underlying *nats.Conn tears down every subscription registered on it in
+// one call). See OnTenantProvisioned's doc comment for the same
+// single-subscriber caveat.
+func OnTenantDeprovisioned(fn func(tenantID string)) { tenantDeprovisionedHook = fn }
 
 // ensureTenantAccountLocked is ensureTenantAccount's body once mat (the
 // platform-wide operator/SYS material) is already in hand — split out so
@@ -282,6 +337,18 @@ func ProvisionTenant(tenantID, name string) error {
 		log.Errorf("failed to provision tenant %q: %v", tenantID, err)
 		return err
 	}
+	// Mint (or reuse) farmer's own User JWT under this tenant's Account
+	// immediately, rather than waiting for this tenant's first sprout to be
+	// accepted (syncTenantSprouts, below, is also what ReloadNKeysForTenant
+	// calls) — cmd/farmer/main.go's OnTenantProvisioned callback dials this
+	// tenant's connection right after this call returns, and needs
+	// FarmerUserJWTForTenant to already have something to read. Harmless to
+	// also sync sprout state here even though a freshly-provisioned tenant
+	// may not have any yet.
+	if _, err := syncTenantSprouts(mat, tam, tenantID); err != nil {
+		log.Errorf("failed to sync tenant %q's Account JWT during provisioning: %v", tenantID, err)
+		return err
+	}
 	if err := pushAccountUpdate(mat, tam.jwt); err != nil {
 		log.Errorf("failed to push tenant %q's Account JWT to the bus resolver: %v", tenantID, err)
 		return err
@@ -320,6 +387,11 @@ func DeprovisionTenant(tenantID string) error {
 		return err
 	}
 	log.Infof("Deprovisioned tenant %q: Account JWT expired and pushed to the bus resolver.", tenantID)
+	// See OnTenantDeprovisioned's doc comment: lets cmd/farmer/main.go close
+	// this tenant's NATS connection and unregister its handlers.
+	if tenantDeprovisionedHook != nil {
+		go tenantDeprovisionedHook(tenantID)
+	}
 	return nil
 }
 
@@ -373,6 +445,22 @@ func syncTenantSprouts(mat *natsAuthMaterial, tam *tenantAccountMaterial, tenant
 	}
 
 	changed := false
+
+	// Mint/refresh farmer's own User JWT under this tenant's Account —
+	// jwtusers.go's syncNatsAuth does the same for the legacy Account.
+	// This is farmer's connection identity for the dedicated per-tenant
+	// NATS connection cmd/farmer/main.go's ConnectFarmer opens (see
+	// FarmerUserJWTForTenant and docs/design/grlx-tenant-context-threading.md).
+	farmerKey, err := GetPubNKey(FarmerPubNKey)
+	if err != nil {
+		return false, fmt.Errorf("pki: loading farmer's NKey: %w", err)
+	}
+	if ensureUserGranted(ac, farmerKey) {
+		changed = true
+	}
+	if _, mintErr := mintOrReuseUserJWT(farmerUserJWTPathForTenant(tenantID), farmerKey, "farmer", allowAllPermissions(), tam.pub, tam.signingKP); mintErr != nil {
+		log.Errorf("failed to mint farmer User JWT for tenant %s: %v", tenantID, mintErr)
+	}
 
 	for _, s := range getNKeysByTypeForTenant(tenantID, "accepted").Sprouts {
 		row, errGet := findNKeyRowInTenant(tenantID, s.SproutID)
@@ -510,4 +598,28 @@ func GetSproutUserJWTForTenant(tenantID, sproutID string) (string, error) {
 		}
 	}
 	return "", ErrSproutIDNotFound
+}
+
+// FarmerUserJWTForTenant is FarmerUserJWT (jwtusers.go) scoped to an
+// explicit tenant — farmer's own connection identity for the dedicated
+// per-tenant NATS connection cmd/farmer/main.go's ConnectFarmer opens (see
+// docs/design/grlx-tenant-context-threading.md's Option A). Minted by
+// syncTenantSprouts (via ReloadNKeysForTenant or ProvisionTenant, both of
+// which call it) into farmerUserJWTPathForTenant. Falls back to the legacy
+// flat single-tenant path (FarmerUserJWT) when tenantID is the package's
+// current-tenant seam, mirroring GetSproutUserJWTForTenant's fallback for
+// the same reason: the legacy tenant's farmer JWT is minted by syncNatsAuth
+// into farmerUserJWTPath, not under tenants/<id>/.
+func FarmerUserJWTForTenant(tenantID string) (string, error) {
+	if !IsValidTenantID(tenantID) {
+		return "", ErrTenantIDInvalid
+	}
+	if tenantID == currentTenantID() {
+		return FarmerUserJWT()
+	}
+	b, err := os.ReadFile(farmerUserJWTPathForTenant(tenantID))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }

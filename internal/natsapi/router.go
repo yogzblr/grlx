@@ -19,9 +19,12 @@ import (
 	log "github.com/gogrlx/grlx/v2/internal/log"
 )
 
-// handler is a function that processes a NATS API request.
-// It receives the raw JSON params and returns a result or error.
-type handler func(params json.RawMessage) (any, error)
+// handler is a function that processes a NATS API request. It receives the
+// tenant ID of the connection the request arrived on — connection-level
+// metadata captured by Subscribe's closure, per
+// docs/design/grlx-tenant-context-threading.md's Option A — and the raw
+// JSON params, and returns a result or error.
+type handler func(tenantID string, params json.RawMessage) (any, error)
 
 // response is the envelope returned to the caller.
 type response struct {
@@ -103,19 +106,23 @@ var routes = map[string]handler{
 // effects (e.g. running a cmd twice, deleting a job twice).
 const natsCoreQueueGroup = "grlx-core"
 
-// Subscribe registers all NATS API handlers on the given connection.
-// It subscribes to "grlx.api.>" and dispatches based on subject suffix.
-// Each handler is wrapped with RBAC enforcement middleware that checks
-// the caller's token before dispatching.
-func Subscribe(nc *nats.Conn) error {
-	SetNatsConn(nc)
+// Subscribe registers all NATS API handlers on the given connection,
+// scoped to tenantID — the connection's own tenant identity, per
+// docs/design/grlx-tenant-context-threading.md's Option A. It subscribes
+// to "grlx.api.>" and dispatches based on subject suffix. Each handler is
+// wrapped with RBAC enforcement middleware that checks the caller's token
+// before dispatching. Called once per tenant connection: farmer opens one
+// NATS connection per tenant (cmd/farmer/main.go's ConnectFarmer), and
+// every one of them gets its own full set of registrations.
+func Subscribe(nc *nats.Conn, tenantID string) error {
+	SetNatsConn(tenantID, nc)
 
 	for method, h := range routes {
 		subject := Subject(method)
 		handler := authMiddleware(method, h) // wrap with RBAC enforcement
 		action := method                     // capture for audit
 		_, err := nc.QueueSubscribe(subject, natsCoreQueueGroup, func(msg *nats.Msg) {
-			result, err := handler(msg.Data)
+			result, err := handler(tenantID, msg.Data)
 
 			// Audit log: record actions based on configured audit level.
 			if audit.ShouldLog(action) {
@@ -143,10 +150,10 @@ func Subscribe(nc *nats.Conn) error {
 		if err != nil {
 			return fmt.Errorf("natsapi: failed to subscribe to %s: %w", subject, err)
 		}
-		log.Tracef("natsapi: registered handler for %s", subject)
+		log.Tracef("natsapi: registered handler for %s (tenant %s)", subject, tenantID)
 	}
 
-	if err := registerBoxKeySubmitListener(nc); err != nil {
+	if err := registerBoxKeySubmitListener(nc, tenantID); err != nil {
 		return err
 	}
 

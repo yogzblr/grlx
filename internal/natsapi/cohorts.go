@@ -9,6 +9,19 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/rbac"
 )
 
+// cohortRegistry is a single, process-wide *rbac.Registry, deliberately not
+// re-keyed per tenant here even though internal/pki.ListNKeysByType calls
+// below are now correctly threaded to each connection's own tenantID.
+// rbac.Registry already carries an explicit tenantID fixed at construction
+// (workstream E), but the cohort *definitions* it holds are loaded once, at
+// boot/SIGHUP, from a single config file (cmd/farmer/main.go's
+// loadCohortRegistry, driven by rbac.LoadCohortsFromConfig) — the same
+// "genuinely process-level, not a per-request tenant being papered over"
+// shape docs/design/grlx-tenant-context-threading.md's point 4 describes
+// for internal/rbac/internal/auth's policy layer, which this task's brief
+// explicitly keeps out of scope ("has no tenant concept at all and stays
+// that way"). Giving cohort definitions themselves real per-tenant config
+// is that same follow-up workstream's territory, not this one's.
 var cohortRegistry *rbac.Registry
 
 // SetCohortRegistry assigns the cohort registry for NATS API handlers.
@@ -27,7 +40,7 @@ type CohortResolveParams struct {
 	Name string `json:"name"`
 }
 
-func handleCohortsList(_ json.RawMessage) (any, error) {
+func handleCohortsList(_ string, _ json.RawMessage) (any, error) {
 	if cohortRegistry == nil {
 		return map[string][]CohortSummary{"cohorts": {}}, nil
 	}
@@ -65,7 +78,7 @@ type CohortDetail struct {
 	Count    int                `json:"count"`
 }
 
-func handleCohortsGet(params json.RawMessage) (any, error) {
+func handleCohortsGet(tenantID string, params json.RawMessage) (any, error) {
 	if cohortRegistry == nil {
 		return nil, fmt.Errorf("no cohort registry configured")
 	}
@@ -84,7 +97,7 @@ func handleCohortsGet(params json.RawMessage) (any, error) {
 	}
 
 	// Resolve current membership for the detail view.
-	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
+	allKeys := pki.ListNKeysByType(tenantID)
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)
@@ -111,7 +124,7 @@ func handleCohortsGet(params json.RawMessage) (any, error) {
 	return detail, nil
 }
 
-func handleCohortsResolve(params json.RawMessage) (any, error) {
+func handleCohortsResolve(tenantID string, params json.RawMessage) (any, error) {
 	if cohortRegistry == nil {
 		return nil, fmt.Errorf("no cohort registry configured")
 	}
@@ -124,7 +137,7 @@ func handleCohortsResolve(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("cohort name is required")
 	}
 
-	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
+	allKeys := pki.ListNKeysByType(tenantID)
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)
@@ -157,7 +170,7 @@ type CohortRefreshResponse struct {
 	Refreshed []rbac.RefreshResult `json:"refreshed"`
 }
 
-func handleCohortsRefresh(params json.RawMessage) (any, error) {
+func handleCohortsRefresh(tenantID string, params json.RawMessage) (any, error) {
 	if cohortRegistry == nil {
 		return nil, fmt.Errorf("no cohort registry configured")
 	}
@@ -169,7 +182,7 @@ func handleCohortsRefresh(params json.RawMessage) (any, error) {
 		}
 	}
 
-	allKeys := pki.ListNKeysByType(pki.CurrentTenantID())
+	allKeys := pki.ListNKeysByType(tenantID)
 	allSproutIDs := make([]string, 0, len(allKeys.Accepted.Sprouts))
 	for _, km := range allKeys.Accepted.Sprouts {
 		allSproutIDs = append(allSproutIDs, km.SproutID)
@@ -202,7 +215,7 @@ type CohortValidateResponse struct {
 	Cohorts int      `json:"cohorts"`
 }
 
-func handleCohortsValidate(_ json.RawMessage) (any, error) {
+func handleCohortsValidate(_ string, _ json.RawMessage) (any, error) {
 	if cohortRegistry == nil {
 		return CohortValidateResponse{Valid: true, Cohorts: 0}, nil
 	}

@@ -18,11 +18,10 @@ func TestHandlePKIRotateBoxKey_NoConnection(t *testing.T) {
 	setupNatsAPIPKI(t)
 	writeNKey(t, "", "accepted", "web-01", "UKEY_WEB01")
 
-	old := natsConn
-	natsConn = nil
-	t.Cleanup(func() { natsConn = old })
+	tenantID := pki.CurrentTenantID()
+	ClearNatsConn(tenantID)
 
-	if _, err := handlePKIRotateBoxKey(json.RawMessage(`{"id":"web-01"}`)); err == nil {
+	if _, err := handlePKIRotateBoxKey(tenantID, json.RawMessage(`{"id":"web-01"}`)); err == nil {
 		t.Fatal("expected an error when no NATS connection is available")
 	}
 }
@@ -30,7 +29,7 @@ func TestHandlePKIRotateBoxKey_NoConnection(t *testing.T) {
 func TestHandlePKIRotateBoxKey_MissingID(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	if _, err := handlePKIRotateBoxKey(json.RawMessage(`{}`)); err == nil {
+	if _, err := handlePKIRotateBoxKey(pki.CurrentTenantID(), json.RawMessage(`{}`)); err == nil {
 		t.Fatal("expected an error when id is missing")
 	}
 }
@@ -38,7 +37,7 @@ func TestHandlePKIRotateBoxKey_MissingID(t *testing.T) {
 func TestHandlePKIRotateBoxKey_UnknownSprout(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	if _, err := handlePKIRotateBoxKey(json.RawMessage(`{"id":"does-not-exist"}`)); err == nil {
+	if _, err := handlePKIRotateBoxKey(pki.CurrentTenantID(), json.RawMessage(`{"id":"does-not-exist"}`)); err == nil {
 		t.Fatal("expected an error for an unknown sprout")
 	}
 }
@@ -46,7 +45,7 @@ func TestHandlePKIRotateBoxKey_UnknownSprout(t *testing.T) {
 func TestHandlePKIRotateBoxKey_InvalidJSON(t *testing.T) {
 	setupNatsAPIPKI(t)
 
-	if _, err := handlePKIRotateBoxKey(json.RawMessage(`{invalid`)); err == nil {
+	if _, err := handlePKIRotateBoxKey(pki.CurrentTenantID(), json.RawMessage(`{invalid`)); err == nil {
 		t.Fatal("expected an error for invalid JSON")
 	}
 }
@@ -61,16 +60,16 @@ func TestHandlePKIRotateBoxKey_PublishesInstructionOnly(t *testing.T) {
 
 	nc, cleanup := startEmbeddedNATS(t)
 	t.Cleanup(cleanup)
-	old := natsConn
-	natsConn = nc
-	t.Cleanup(func() { natsConn = old })
+	tenantID := pki.CurrentTenantID()
+	SetNatsConn(tenantID, nc)
+	t.Cleanup(func() { ClearNatsConn(tenantID) })
 
 	sub, err := nc.SubscribeSync(SproutSubject("web-01", SproutBoxKeyRotateCmd))
 	if err != nil {
 		t.Fatalf("subscribing: %v", err)
 	}
 
-	result, err := handlePKIRotateBoxKey(json.RawMessage(`{"id":"web-01"}`))
+	result, err := handlePKIRotateBoxKey(tenantID, json.RawMessage(`{"id":"web-01"}`))
 	if err != nil {
 		t.Fatalf("handlePKIRotateBoxKey: %v", err)
 	}
@@ -95,7 +94,7 @@ func TestHandleBoxKeySubmit_RecordsNewActiveKey(t *testing.T) {
 		Subject: SproutSubject("web-01", "boxkey.pub"),
 		Data:    mustMarshal(t, boxKeySubmitRequest{Pub: pub}),
 	}
-	handleBoxKeySubmit(msg)
+	handleBoxKeySubmit(pki.CurrentTenantID(), msg)
 
 	active, _, err := pki.ValidSproutBoxKeys(pki.CurrentTenantID(), "web-01")
 	if err != nil {
@@ -123,7 +122,7 @@ func TestHandleBoxKeySubmit_GracesThePreviousKey(t *testing.T) {
 		Subject: SproutSubject("web-01", "boxkey.pub"),
 		Data:    mustMarshal(t, boxKeySubmitRequest{Pub: newPub}),
 	}
-	handleBoxKeySubmit(msg)
+	handleBoxKeySubmit(pki.CurrentTenantID(), msg)
 
 	active, grace, err := pki.ValidSproutBoxKeys(pki.CurrentTenantID(), "web-01")
 	if err != nil {
@@ -141,13 +140,13 @@ func TestHandleBoxKeySubmit_IgnoresMalformedSubject(t *testing.T) {
 	setupNatsAPIPKI(t)
 	// Fewer than 4 dot-separated components: no sprout ID to key off of.
 	msg := &nats.Msg{Subject: "grlx.sprouts.boxkey.pub", Data: mustMarshal(t, boxKeySubmitRequest{Pub: testBoxPubForNatsAPI(t)})}
-	handleBoxKeySubmit(msg) // must not panic
+	handleBoxKeySubmit(pki.CurrentTenantID(), msg) // must not panic
 }
 
 func TestHandleBoxKeySubmit_IgnoresEmptyPub(t *testing.T) {
 	setupNatsAPIPKI(t)
 	msg := &nats.Msg{Subject: SproutSubject("web-01", "boxkey.pub"), Data: mustMarshal(t, boxKeySubmitRequest{Pub: ""})}
-	handleBoxKeySubmit(msg)
+	handleBoxKeySubmit(pki.CurrentTenantID(), msg)
 
 	if _, _, err := pki.ValidSproutBoxKeys(pki.CurrentTenantID(), "web-01"); err == nil {
 		t.Fatal("expected no box key to be recorded for an empty pub")

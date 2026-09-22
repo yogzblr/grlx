@@ -253,6 +253,23 @@ func GetTenantAccountPub(tenantID string) (string, error) {
 	return row.AccountPub, nil
 }
 
+// ListProvisionedTenantIDs returns every non-deleted tenant ID recorded in
+// pki_tenants — every tenant besides the legacy one (CurrentTenantID(),
+// which isn't itself a pki_tenants row) that cmd/farmer/main.go's
+// ConnectFarmer needs its own dedicated NATS connection for at boot. See
+// docs/design/grlx-tenant-context-threading.md's Option A.
+func ListProvisionedTenantIDs() ([]string, error) {
+	var rows []tenantRow
+	if err := db.Where("deleted = ?", false).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	return ids, nil
+}
+
 func TenantIDForAccountPub(accountPub string) (string, error) {
 	if accountPub == "" {
 		return "", ErrTenantNotFound

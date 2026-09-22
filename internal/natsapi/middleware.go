@@ -98,11 +98,11 @@ func authMiddleware(method string, next handler) handler {
 	requiredAction := NATSMethodAction(method)
 	extractor := scopeExtractors[method]
 
-	return func(params json.RawMessage) (any, error) {
+	return func(tenantID string, params json.RawMessage) (any, error) {
 		// dangerously_allow_root bypasses all auth checks.
 		if intauth.DangerouslyAllowRoot() {
 			log.Warnf("dangerously_allow_root: bypassing auth for NATS method %s", method)
-			return next(params)
+			return next(tenantID, params)
 		}
 
 		// Extract token from params.
@@ -125,13 +125,13 @@ func authMiddleware(method string, next handler) handler {
 			if err != nil {
 				// Extraction errors are not auth failures — let the
 				// handler validate params and return a proper error.
-				return next(params)
+				return next(tenantID, params)
 			}
-			if err := checkScopedAccess(tp.Token, requiredAction, sproutIDs); err != nil {
+			if err := checkScopedAccess(tenantID, tp.Token, requiredAction, sproutIDs); err != nil {
 				return nil, rbac.ErrAccessDenied
 			}
 		}
 
-		return next(params)
+		return next(tenantID, params)
 	}
 }

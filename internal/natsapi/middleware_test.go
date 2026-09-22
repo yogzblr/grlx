@@ -54,13 +54,13 @@ func TestPublicMethods(t *testing.T) {
 
 func TestAuthMiddleware_PublicMethod(t *testing.T) {
 	called := false
-	inner := func(params json.RawMessage) (any, error) {
+	inner := func(_ string, params json.RawMessage) (any, error) {
 		called = true
 		return "ok", nil
 	}
 
 	wrapped := authMiddleware("version", inner)
-	result, err := wrapped(nil)
+	result, err := wrapped("t_test", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestAuthMiddleware_PublicMethod(t *testing.T) {
 }
 
 func TestAuthMiddleware_NoToken(t *testing.T) {
-	inner := func(params json.RawMessage) (any, error) {
+	inner := func(_ string, params json.RawMessage) (any, error) {
 		t.Fatal("handler should not be called without a token")
 		return nil, nil
 	}
@@ -81,7 +81,7 @@ func TestAuthMiddleware_NoToken(t *testing.T) {
 	wrapped := authMiddleware("cook", inner)
 
 	// No params at all
-	_, err := wrapped(nil)
+	_, err := wrapped("t_test", nil)
 	if err == nil {
 		t.Fatal("expected error for missing token")
 	}
@@ -90,27 +90,27 @@ func TestAuthMiddleware_NoToken(t *testing.T) {
 	}
 
 	// Empty params
-	_, err = wrapped(json.RawMessage(`{}`))
+	_, err = wrapped("t_test", json.RawMessage(`{}`))
 	if err != rbac.ErrAccessDenied {
 		t.Fatalf("expected ErrAccessDenied for empty params, got: %v", err)
 	}
 
 	// Params with empty token
-	_, err = wrapped(json.RawMessage(`{"token":""}`))
+	_, err = wrapped("t_test", json.RawMessage(`{"token":""}`))
 	if err != rbac.ErrAccessDenied {
 		t.Fatalf("expected ErrAccessDenied for empty token, got: %v", err)
 	}
 }
 
 func TestAuthMiddleware_InvalidToken(t *testing.T) {
-	inner := func(params json.RawMessage) (any, error) {
+	inner := func(_ string, params json.RawMessage) (any, error) {
 		t.Fatal("handler should not be called with invalid token")
 		return nil, nil
 	}
 
 	wrapped := authMiddleware("cook", inner)
 	params := json.RawMessage(`{"token":"invalid-garbage-token"}`)
-	_, err := wrapped(params)
+	_, err := wrapped("t_test", params)
 	if err == nil {
 		t.Fatal("expected error for invalid token")
 	}

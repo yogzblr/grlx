@@ -94,7 +94,11 @@ func populateFuncMap(sproutID string) template.FuncMap {
 	return v
 }
 
-func SendCookEvent(sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
+// SendCookEvent triggers a recipe cook on sproutID, over tenantID's
+// dedicated NATS connection (see RegisterFarmerNatsConn) — the sprout's own
+// tenant, not necessarily whichever tenant happens to be "current" for the
+// process.
+func SendCookEvent(tenantID, sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
 	basepath := getBasePath()
 	includes, err := collectAllIncludes(sproutID, basepath, recipeID)
 	if err != nil {
@@ -175,8 +179,12 @@ func SendCookEvent(sproutID string, recipeID RecipeName, JID string, test bool, 
 	}
 	b, _ := json.Marshal(rEnvelope)
 	log.Noticef("cooking sprout %s: %s", sproutID, JID)
+	farmerConn := farmerConnFor(tenantID)
+	if farmerConn == nil {
+		return fmt.Errorf("cook: no NATS connection registered for tenant %s", tenantID)
+	}
 	var ack Ack
-	msg, err := conn.Request("grlx.sprouts."+sproutID+".cook", b, 30*time.Second)
+	msg, err := farmerConn.Request("grlx.sprouts."+sproutID+".cook", b, 30*time.Second)
 	if err != nil {
 		return err
 	}

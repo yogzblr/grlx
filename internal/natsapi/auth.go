@@ -18,7 +18,7 @@ type AuthParams struct {
 // embedded token. It returns the user's role, permissions, and admin
 // status — a formal "handshake" that confirms the CLI's key is
 // recognized by the farmer before the user runs any real commands.
-func handleAuthLogin(params json.RawMessage) (any, error) {
+func handleAuthLogin(_ string, params json.RawMessage) (any, error) {
 	var p AuthParams
 	if len(params) > 0 {
 		json.Unmarshal(params, &p)
@@ -80,7 +80,7 @@ func handleAuthLogin(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handleAuthWhoAmI(params json.RawMessage) (any, error) {
+func handleAuthWhoAmI(_ string, params json.RawMessage) (any, error) {
 	var p AuthParams
 	if len(params) > 0 {
 		json.Unmarshal(params, &p)
@@ -108,7 +108,7 @@ func handleAuthWhoAmI(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handleAuthExplain(params json.RawMessage) (any, error) {
+func handleAuthExplain(_ string, params json.RawMessage) (any, error) {
 	var p AuthParams
 	if len(params) > 0 {
 		json.Unmarshal(params, &p)
@@ -163,7 +163,7 @@ type UserRemoveParams struct {
 	Pubkey string `json:"pubkey"`
 }
 
-func handleAuthAddUser(params json.RawMessage) (any, error) {
+func handleAuthAddUser(_ string, params json.RawMessage) (any, error) {
 	var p UserAddParams
 	if len(params) > 0 {
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -185,7 +185,7 @@ func handleAuthAddUser(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handleAuthRemoveUser(params json.RawMessage) (any, error) {
+func handleAuthRemoveUser(_ string, params json.RawMessage) (any, error) {
 	var p UserRemoveParams
 	if len(params) > 0 {
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -207,7 +207,7 @@ func handleAuthRemoveUser(params json.RawMessage) (any, error) {
 	}, nil
 }
 
-func handleAuthListUsers(_ json.RawMessage) (any, error) {
+func handleAuthListUsers(_ string, _ json.RawMessage) (any, error) {
 	users := intauth.ListAllUsers()
 
 	roleNames := intauth.ListRoles()
