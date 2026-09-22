@@ -18,8 +18,15 @@ import (
 // string literal).
 const natsCoreQueueGroup = "grlx-core"
 
-// RegisterFarmerListener subscribes to sprout facts publications and stores
-// them as props on the farmer side.
+// RegisterFarmerListener subscribes to sprout facts publications on nc —
+// one of farmer's per-tenant NATS connections (see
+// docs/design/grlx-tenant-context-threading.md's Option A; called once per
+// tenant connection by cmd/farmer/main.go, so every tenant's facts traffic
+// reaches farmer, not just the legacy tenant's) — and stores them as props
+// on the farmer side. Fact storage itself (internal/props) stays on the
+// bare, legacy-tenant-scoped functions: giving fact ingestion real
+// per-tenant prop scoping is a separate, larger workstream outside this
+// task's file scope (see the design doc's own carve-out for this package).
 //
 // This used to intentionally use plain Subscribe (fan-out), not
 // QueueSubscribe, on the reasoning that props.SetProp wrote into an
@@ -34,7 +41,7 @@ const natsCoreQueueGroup = "grlx-core"
 // QueueSubscribe under the shared "grlx-core" group (matching
 // internal/natsapi/router.go's own request/response handlers) makes
 // exactly one replica handle each event instead.
-func RegisterFarmerListener(nc *nats.Conn) {
+func RegisterFarmerListener(tenantID string, nc *nats.Conn) {
 	_, err := nc.QueueSubscribe("grlx.sprouts.*.facts", natsCoreQueueGroup, func(msg *nats.Msg) {
 		var sf SystemFacts
 		if unmarshalErr := json.Unmarshal(msg.Data, &sf); unmarshalErr != nil {

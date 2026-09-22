@@ -60,7 +60,7 @@ func HCmdRun(w http.ResponseWriter, r *http.Request) {
 
 		go func(target pki.KeyManager) {
 			defer wg.Done()
-			result, err := cmd.FRun(target, command)
+			result, err := cmd.FRun(pki.CurrentTenantID(), target, command)
 			if err != nil {
 				log.Tracef("Error running command on the Sprout: %v", err)
 			}

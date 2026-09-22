@@ -87,9 +87,14 @@ func startCmdTestNATS(t *testing.T) (*nats.Conn, func()) {
 		ns.Shutdown()
 		t.Fatalf("connect to test NATS: %v", err)
 	}
-	icmd.RegisterNatsConn(conn)
+	// HCmdRun dispatches through cmd.FRun using pki.CurrentTenantID() (the
+	// HTTP admin API's documented ceiling — see
+	// docs/design/grlx-tenant-context-threading.md), so tests register the
+	// farmer-side connection under that same tenant.
+	tenantID := pki.CurrentTenantID()
+	icmd.RegisterFarmerNatsConn(tenantID, conn)
 	return conn, func() {
-		icmd.RegisterNatsConn(nil)
+		icmd.UnregisterFarmerNatsConn(tenantID)
 		conn.Close()
 		ns.Shutdown()
 	}

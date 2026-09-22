@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"text/template"
 
 	"github.com/nats-io/nats.go"
@@ -16,10 +17,48 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
+// conn is the single connection a sprout process registers via
+// RegisterNatsConn — used by CookRecipeEnvelope (sproutcook.go) to publish
+// step-completion events back to farmer. Sprout is inherently single-tenant
+// (one process, one connection), so this stays a bare package var.
 var conn *nats.Conn
 
 func RegisterNatsConn(n *nats.Conn) {
 	conn = n
+}
+
+// farmerConns holds farmer's own per-tenant NATS connections — the
+// counterpart to conn above, but keyed by tenant since a single farmer
+// process now holds one connection per tenant (see
+// docs/design/grlx-tenant-context-threading.md's Option A). Only
+// SendCookEvent (farmer's outbound leg, farmercook.go) reads this; sprout
+// never calls RegisterFarmerNatsConn.
+var (
+	farmerConnMu sync.RWMutex
+	farmerConns  = map[string]*nats.Conn{}
+)
+
+// RegisterFarmerNatsConn installs tenantID's NATS connection for
+// SendCookEvent to trigger cooks through. Called once per tenant
+// connection by cmd/farmer/main.go.
+func RegisterFarmerNatsConn(tenantID string, n *nats.Conn) {
+	farmerConnMu.Lock()
+	defer farmerConnMu.Unlock()
+	farmerConns[tenantID] = n
+}
+
+// UnregisterFarmerNatsConn removes tenantID's connection — called when
+// that tenant is deprovisioned and its connection closed.
+func UnregisterFarmerNatsConn(tenantID string) {
+	farmerConnMu.Lock()
+	defer farmerConnMu.Unlock()
+	delete(farmerConns, tenantID)
+}
+
+func farmerConnFor(tenantID string) *nats.Conn {
+	farmerConnMu.RLock()
+	defer farmerConnMu.RUnlock()
+	return farmerConns[tenantID]
 }
 
 func makeRecipeSteps(recipes map[string]interface{}) ([]*Step, error) {

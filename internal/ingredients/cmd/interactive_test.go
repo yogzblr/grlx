@@ -186,26 +186,18 @@ func TestSRunWithEmptyPathInEnv(t *testing.T) {
 }
 
 func TestFRunWithoutNATSConnection(t *testing.T) {
-	// FRun requires a NATS connection — without one, nc.Request panics
-	oldNC := nc
-	nc = nil
-	defer func() { nc = oldNC }()
-
+	// FRun requires a farmer connection registered for the given tenant —
+	// with none registered, it returns an error rather than dereferencing a
+	// nil connection.
 	cmd := apitypes.CmdRun{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Timeout: 5 * time.Second,
 	}
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Log("FRun did not panic with nil NATS conn (may have returned error)")
-		}
-	}()
-
 	target := pki.KeyManager{SproutID: "test-sprout"}
-	_, err := FRun(target, cmd)
+	_, err := FRun("t_no_such_tenant", target, cmd)
 	if err == nil {
-		t.Error("expected error for nil NATS connection")
+		t.Error("expected error for a tenant with no registered NATS connection")
 	}
 }

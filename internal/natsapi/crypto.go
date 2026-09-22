@@ -140,7 +140,8 @@ func openFromSprout(tenantID, sproutID string, envelope []byte) ([]byte, error) 
 // replacement for natsConn.Publish(subject, plaintextJSON) at a
 // farmer->sprout payload boundary this workstream covers.
 func PublishEncryptedTo(tenantID, sproutID, subject string, v any) error {
-	if natsConn == nil {
+	nc := natsConnFor(tenantID)
+	if nc == nil {
 		return fmt.Errorf("natsapi: NATS connection not available")
 	}
 	plaintext, err := json.Marshal(v)
@@ -151,7 +152,7 @@ func PublishEncryptedTo(tenantID, sproutID, subject string, v any) error {
 	if err != nil {
 		return err
 	}
-	return natsConn.Publish(subject, ciphertext)
+	return nc.Publish(subject, ciphertext)
 }
 
 // DecryptEncryptedFrom opens data — an inbound NATS message payload from

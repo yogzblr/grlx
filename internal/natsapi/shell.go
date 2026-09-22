@@ -19,7 +19,7 @@ import (
 // sessionTracker tracks active shell sessions on the farmer for audit logging.
 var sessionTracker = shell.NewTracker()
 
-func handleShellStart(params json.RawMessage) (any, error) {
+func handleShellStart(tenantID string, params json.RawMessage) (any, error) {
 	var req shell.CLIStartRequest
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, fmt.Errorf("invalid request: %w", err)
@@ -33,7 +33,7 @@ func handleShellStart(params json.RawMessage) (any, error) {
 	if !pki.IsValidSproutID(req.SproutID) || strings.Contains(req.SproutID, "_") {
 		return nil, fmt.Errorf("invalid sprout ID: %s", req.SproutID)
 	}
-	registered, _ := pki.NKeyExists(pki.CurrentTenantID(), req.SproutID, "")
+	registered, _ := pki.NKeyExists(tenantID, req.SproutID, "")
 	if !registered {
 		return nil, fmt.Errorf("unknown sprout: %s", req.SproutID)
 	}
@@ -55,7 +55,11 @@ func handleShellStart(params json.RawMessage) (any, error) {
 	data, _ := json.Marshal(startReq)
 	topic := SproutSubject(req.SproutID, SproutShellStart)
 
-	msg, err := natsConn.Request(topic, data, 10*time.Second)
+	nc := natsConnFor(tenantID)
+	if nc == nil {
+		return nil, fmt.Errorf("NATS connection not available")
+	}
+	msg, err := nc.Request(topic, data, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("sprout did not respond: %w", err)
 	}
@@ -90,7 +94,7 @@ func handleShellStart(params json.RawMessage) (any, error) {
 		DoneSubject: resp.DoneSubject,
 	}
 	sessionTracker.Add(sessionInfo)
-	subscribeSessionDone(sessionInfo)
+	subscribeSessionDone(nc, sessionInfo)
 
 	log.Infof("shell: session %s started (user=%s, sprout=%s)", sessionID, pubkey, req.SproutID)
 
@@ -118,12 +122,12 @@ func resolveCallerIdentity(params json.RawMessage) (pubkey, roleName string) {
 // subscribeSessionDone subscribes to the session's done subject on the farmer
 // side. When the sprout publishes the done message, the farmer logs the
 // session end with duration.
-func subscribeSessionDone(info *shell.SessionInfo) {
-	if natsConn == nil || info.DoneSubject == "" {
+func subscribeSessionDone(nc *nats.Conn, info *shell.SessionInfo) {
+	if nc == nil || info.DoneSubject == "" {
 		return
 	}
 
-	sub, err := natsConn.Subscribe(info.DoneSubject, func(msg *nats.Msg) {
+	sub, err := nc.Subscribe(info.DoneSubject, func(msg *nats.Msg) {
 		tracked := sessionTracker.Remove(info.SessionID)
 		if tracked == nil {
 			return

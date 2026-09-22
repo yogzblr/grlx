@@ -32,9 +32,15 @@ import (
 
 // Job represents a job
 
-var nc *nats.Conn
-
-// RegisterNatsConn subscribes to job-related subjects.
+// RegisterNatsConn subscribes to job-related subjects on conn, one of
+// farmer's per-tenant NATS connections (see
+// docs/design/grlx-tenant-context-threading.md's Option A). Called once
+// per tenant connection by cmd/farmer/main.go, so every tenant's job/cook
+// events reach farmer, not just the legacy tenant's — job storage itself
+// (config.JobLogDir) stays a single, un-partitioned directory across every
+// tenant, the same "which connection a handler runs on, not rescoping what
+// the handler does once it's there" carve-out the design doc makes
+// explicit for internal/cook and internal/facts.
 //
 // This intentionally uses plain Subscribe (fan-out), not QueueSubscribe,
 // unlike internal/natsapi/router.go's request/response API handlers. Job
@@ -48,13 +54,17 @@ var nc *nats.Conn
 // the same event N times to shared storage becomes wasted work (and a
 // possible race) rather than useful replication, and QueueSubscribe would
 // become the correct choice.
-func RegisterNatsConn(conn *nats.Conn) {
-	nc = conn
-	_, err := nc.Subscribe("grlx.cook.*.*", logJobs)
+func RegisterNatsConn(tenantID string, conn *nats.Conn) {
+	// conn is used directly below rather than stored in a package-level
+	// var, since RegisterNatsConn can now run concurrently for different
+	// tenants (docs/design/grlx-tenant-context-threading.md) — a shared var
+	// would race between one call's assignment and another's Subscribe, and
+	// nothing else in this package needs to read it back afterward.
+	_, err := conn.Subscribe("grlx.cook.*.*", logJobs)
 	if err != nil {
 		log.Error(err)
 	}
-	_, err = nc.Subscribe("grlx.sprouts.*.cook", logJobCreation)
+	_, err = conn.Subscribe("grlx.sprouts.*.cook", logJobCreation)
 	if err != nil {
 		log.Error(err)
 	}

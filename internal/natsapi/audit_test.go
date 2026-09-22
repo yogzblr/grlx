@@ -11,7 +11,7 @@ func TestHandleAuditListNoLogger(t *testing.T) {
 	// Ensure no global logger is set.
 	audit.SetGlobal(nil)
 
-	_, err := handleAuditList(nil)
+	_, err := handleAuditList("", nil)
 	if err == nil {
 		t.Fatal("expected error when audit logger is not configured")
 	}
@@ -20,7 +20,7 @@ func TestHandleAuditListNoLogger(t *testing.T) {
 func TestHandleAuditQueryNoLogger(t *testing.T) {
 	audit.SetGlobal(nil)
 
-	_, err := handleAuditQuery(nil)
+	_, err := handleAuditQuery("", nil)
 	if err == nil {
 		t.Fatal("expected error when audit logger is not configured")
 	}
@@ -36,7 +36,7 @@ func TestHandleAuditListWithLogger(t *testing.T) {
 	audit.SetGlobal(logger)
 	defer audit.SetGlobal(nil)
 
-	result, err := handleAuditList(nil)
+	result, err := handleAuditList("", nil)
 	if err != nil {
 		t.Fatalf("handleAuditList: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestHandleAuditQueryWithEntries(t *testing.T) {
 	}
 
 	// Query all.
-	result, err := handleAuditQuery(nil)
+	result, err := handleAuditQuery("", nil)
 	if err != nil {
 		t.Fatalf("handleAuditQuery: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestHandleAuditQueryWithEntries(t *testing.T) {
 
 	// Query with filter.
 	params, _ := json.Marshal(audit.QueryParams{Action: "cook"})
-	result, err = handleAuditQuery(params)
+	result, err = handleAuditQuery("", params)
 	if err != nil {
 		t.Fatalf("handleAuditQuery with filter: %v", err)
 	}

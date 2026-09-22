@@ -17,8 +17,13 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
-// startCookTestNATS starts an embedded NATS server and registers the connection
-// with the cook package. Returns a cleanup function.
+// testTenantID is the tenant ID startCookTestNATS registers its connection
+// under, for tests exercising SendCookEvent (farmer's outbound leg).
+const testTenantID = "t_test"
+
+// startCookTestNATS starts an embedded NATS server and registers the
+// connection with the cook package as farmer's tenant connection for
+// testTenantID. Returns a cleanup function.
 func startCookTestNATS(t *testing.T) (*nats.Conn, func()) {
 	t.Helper()
 
@@ -41,9 +46,9 @@ func startCookTestNATS(t *testing.T) (*nats.Conn, func()) {
 		t.Fatalf("connect to test NATS: %v", err)
 	}
 
-	RegisterNatsConn(nc)
+	RegisterFarmerNatsConn(testTenantID, nc)
 	return nc, func() {
-		RegisterNatsConn(nil)
+		UnregisterFarmerNatsConn(testTenantID)
 		nc.Close()
 		ns.Shutdown()
 	}
@@ -1306,7 +1311,7 @@ func TestSendCookEvent(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	jid := GenerateJobID()
-	err = SendCookEvent(sproutID, "independent", jid, false)
+	err = SendCookEvent(testTenantID, sproutID, "independent", jid, false)
 	if err != nil {
 		t.Fatalf("SendCookEvent: %v", err)
 	}
@@ -1335,7 +1340,7 @@ func TestSendCookEventTestMode(t *testing.T) {
 	}
 	defer sub.Unsubscribe()
 
-	err = SendCookEvent(sproutID, "independent", GenerateJobID(), true)
+	err = SendCookEvent(testTenantID, sproutID, "independent", GenerateJobID(), true)
 	if err != nil {
 		t.Fatalf("SendCookEvent (test mode): %v", err)
 	}
@@ -1364,7 +1369,7 @@ func TestSendCookEventWithInvoker(t *testing.T) {
 	}
 	defer sub.Unsubscribe()
 
-	err = SendCookEvent(sproutID, "independent", GenerateJobID(), false, WithInvoker("pubkey-xyz"))
+	err = SendCookEvent(testTenantID, sproutID, "independent", GenerateJobID(), false, WithInvoker("pubkey-xyz"))
 	if err != nil {
 		t.Fatalf("SendCookEvent (with invoker): %v", err)
 	}
@@ -1385,7 +1390,7 @@ func TestSendCookEventNotAcknowledged(t *testing.T) {
 	}
 	defer sub.Unsubscribe()
 
-	err = SendCookEvent(sproutID, "independent", GenerateJobID(), false)
+	err = SendCookEvent(testTenantID, sproutID, "independent", GenerateJobID(), false)
 	if err == nil {
 		t.Error("expected error when sprout does not acknowledge")
 	}
@@ -1406,7 +1411,7 @@ func TestSendCookEventWrongJobID(t *testing.T) {
 	}
 	defer sub.Unsubscribe()
 
-	err = SendCookEvent(sproutID, "independent", GenerateJobID(), false)
+	err = SendCookEvent(testTenantID, sproutID, "independent", GenerateJobID(), false)
 	if err == nil {
 		t.Error("expected error for wrong job ID in ack")
 	}
@@ -1416,7 +1421,7 @@ func TestSendCookEventNoRecipe(t *testing.T) {
 	_, cleanup := startCookTestNATS(t)
 	defer cleanup()
 
-	err := SendCookEvent("some-sprout", "nonexistent-recipe-xyz", GenerateJobID(), false)
+	err := SendCookEvent(testTenantID, "some-sprout", "nonexistent-recipe-xyz", GenerateJobID(), false)
 	if err == nil {
 		t.Error("expected error for non-existent recipe")
 	}
@@ -1426,7 +1431,7 @@ func TestSendCookEventInvalidRecipe(t *testing.T) {
 	_, cleanup := startCookTestNATS(t)
 	defer cleanup()
 
-	err := SendCookEvent("some-sprout", "invalidReq", GenerateJobID(), false)
+	err := SendCookEvent(testTenantID, "some-sprout", "invalidReq", GenerateJobID(), false)
 	if err == nil {
 		t.Error("expected error for invalid recipe")
 	}

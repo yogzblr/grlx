@@ -63,7 +63,7 @@ func HTestPing(w http.ResponseWriter, r *http.Request) {
 
 		go func(target pki.KeyManager) {
 			defer wg.Done()
-			pong, err := test.FPing(target, ping)
+			pong, err := test.FPing(pki.CurrentTenantID(), target, ping)
 			if err != nil {
 				log.Tracef("Error pinging the Sprout: %v", err)
 			}

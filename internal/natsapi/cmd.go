@@ -11,7 +11,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
-func handleCmdRun(params json.RawMessage) (any, error) {
+func handleCmdRun(tenantID string, params json.RawMessage) (any, error) {
 	var ta apitypes.TargetedAction
 	if err := json.Unmarshal(params, &ta); err != nil {
 		return nil, fmt.Errorf("invalid request: %w", err)
@@ -27,7 +27,7 @@ func handleCmdRun(params json.RawMessage) (any, error) {
 		if !pki.IsValidSproutID(target.SproutID) || strings.Contains(target.SproutID, "_") {
 			return nil, fmt.Errorf("invalid sprout ID: %s", target.SproutID)
 		}
-		registered, _ := pki.NKeyExists(pki.CurrentTenantID(), target.SproutID, "")
+		registered, _ := pki.NKeyExists(tenantID, target.SproutID, "")
 		if !registered {
 			return nil, fmt.Errorf("unknown sprout: %s", target.SproutID)
 		}
@@ -43,7 +43,7 @@ func handleCmdRun(params json.RawMessage) (any, error) {
 		wg.Add(1)
 		go func(t pki.KeyManager) {
 			defer wg.Done()
-			result, err := cmd.FRun(t, command)
+			result, err := cmd.FRun(tenantID, t, command)
 			if err != nil {
 				result.Error = err
 			}

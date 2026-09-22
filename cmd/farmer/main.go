@@ -88,6 +88,44 @@ func getHeartbeatConn() *nats.Conn {
 	return heartbeatConn
 }
 
+// tenantConns holds every tenant's live NATS connection — one per tenant,
+// including the legacy tenant (pki.CurrentTenantID()) under its own entry
+// like any other — per docs/design/grlx-tenant-context-threading.md's
+// Option A. Guarded separately from srvMu above since it's read/written
+// from ConnectFarmer's own goroutines (boot-time enumeration,
+// pki.OnTenantProvisioned/OnTenantDeprovisioned callbacks) independently of
+// the API server/heartbeat state srvMu protects.
+var (
+	tenantConnMu sync.Mutex
+	tenantConns  = map[string]*nats.Conn{}
+)
+
+func setTenantConn(tenantID string, nc *nats.Conn) {
+	tenantConnMu.Lock()
+	defer tenantConnMu.Unlock()
+	tenantConns[tenantID] = nc
+}
+
+// removeTenantConn deletes tenantID's entry and returns the connection that
+// was there, or nil if none was registered.
+func removeTenantConn(tenantID string) *nats.Conn {
+	tenantConnMu.Lock()
+	defer tenantConnMu.Unlock()
+	nc := tenantConns[tenantID]
+	delete(tenantConns, tenantID)
+	return nc
+}
+
+func allTenantConns() []*nats.Conn {
+	tenantConnMu.Lock()
+	defer tenantConnMu.Unlock()
+	out := make([]*nats.Conn, 0, len(tenantConns))
+	for _, nc := range tenantConns {
+		out = append(out, nc)
+	}
+	return out
+}
+
 func main() {
 	config.LoadConfig("farmer")
 	fmt.Printf("Starting Farmer (core) with bus URL %s\n", config.FarmerBusURL)
@@ -121,11 +159,28 @@ func main() {
 	if err := pki.ReloadNKeys(); err != nil {
 		log.Errorf("Failed to push NATS auth state to the bus: %v", err)
 	}
-	StartAPIServer()
+
 	// ctx is cancelled on SIGINT/SIGTERM, driving a graceful shutdown of the
-	// cohort refresher, job reaper, NATS connection, and API server.
+	// cohort refresher, job reaper, every tenant's NATS connection, and the
+	// API server. Created here (before StartAPIServer) rather than further
+	// down, so the tenant-provisioning hooks below — which spawn goroutines
+	// bound to it — are registered before the API server can accept its
+	// first enrollment request (POST /v1/enroll is what can trigger
+	// ReloadNKeysForTenant's lazy provisioning path).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// See docs/design/grlx-tenant-context-threading.md's Option A: a
+	// newly-provisioned tenant (explicit ProvisionTenant, or enroll.go's
+	// lazy ReloadNKeysForTenant path) gets its own dedicated NATS
+	// connection and full registration set opened at runtime; a
+	// deprovisioned tenant's connection is closed and its registrations
+	// torn down (closing the *nats.Conn tears down every subscription
+	// registered on it in one call — no separate unsubscribe bookkeeping
+	// needed).
+	pki.OnTenantProvisioned(func(tenantID string) { connectTenantWithRetry(ctx, tenantID) })
+	pki.OnTenantDeprovisioned(disconnectTenant)
+
+	StartAPIServer()
 	natsapi.StartCohortRefresher(ctx, config.CohortRefreshInterval)
 	farmerDone := make(chan struct{})
 	sighupDone := make(chan struct{})
@@ -410,8 +465,13 @@ func handleSIGHUP(ctx context.Context, done chan<- struct{}) {
 	}
 }
 
-func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
-	defer close(done)
+// dialTenantBus opens one NATS connection authenticated as farmer's own
+// User identity under tenantID's Account (pki.FarmerUserJWTForTenant),
+// blocking until connected, ctx is cancelled, or every reconnect attempt is
+// exhausted. See docs/design/grlx-tenant-context-threading.md's Option A:
+// farmer holds one such connection per tenant instead of a single
+// process-global one.
+func dialTenantBus(ctx context.Context, tenantID string) (*nats.Conn, error) {
 	var connectionAttempts atomic.Int64
 	connectionAttempts.Store(1)
 	maxFarmerReconnect := 30
@@ -421,29 +481,30 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 	if FarmerInterface == "0.0.0.0" {
 		FarmerInterface = "localhost"
 	}
-	var err error
-	// Authenticate as the tenant Account User the farmer identity was
-	// granted (see internal/pki/jwtauth-design.md): the User JWT minted by
-	// ReloadNKeys above, plus this farmer's own NKey seed. A bare NKey
-	// connect (the pre-JWT-auth shape) can't satisfy a server configured
-	// with TrustedOperators/an account resolver — it has no account to
-	// belong to without a JWT.
-	farmerJWT, err := pki.FarmerUserJWT()
+	// Authenticate as the User identity this tenant's Account granted farmer
+	// (see internal/pki/jwtauth-design.md): the User JWT minted by
+	// ReloadNKeys/ReloadNKeysForTenant/ProvisionTenant, plus this farmer's
+	// own NKey seed (the same seed for every tenant — see
+	// pki.FarmerUserJWTForTenant's doc comment on why one NKey can hold
+	// distinct User JWTs under many Accounts). A bare NKey connect (the
+	// pre-JWT-auth shape) can't satisfy a server configured with
+	// TrustedOperators/an account resolver — it has no account to belong to
+	// without a JWT.
+	farmerJWT, err := pki.FarmerUserJWTForTenant(tenantID)
 	if err != nil {
-		log.Panicf("farmer User JWT not found (ReloadNKeys must mint it before connecting to the bus): %v", err)
+		return nil, fmt.Errorf("farmer User JWT not found for tenant %s (ReloadNKeys/ReloadNKeysForTenant/ProvisionTenant must mint it before connecting to the bus): %w", tenantID, err)
 	}
 	farmerSeed, err := os.ReadFile(config.NKeyFarmerPrivFile)
 	if err != nil {
-		log.Panic(err)
+		return nil, err
 	}
 	opt := nats.UserJWTAndSeed(farmerJWT, string(farmerSeed))
 	certPool := x509.NewCertPool()
 	rootPEM, err := os.ReadFile(RootCA)
 	if err != nil || rootPEM == nil {
-		log.Panicf("nats: error loading or parsing rootCA file: %v", err)
+		return nil, fmt.Errorf("nats: error loading or parsing rootCA file: %w", err)
 	}
-	ok := certPool.AppendCertsFromPEM(rootPEM)
-	if !ok {
+	if ok := certPool.AppendCertsFromPEM(rootPEM); !ok {
 		log.Errorf("nats: failed to parse root certificate from %v", RootCA)
 	}
 
@@ -452,7 +513,7 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 		RootCAs:    certPool,
 		MinVersion: tls.VersionTLS12,
 	}
-	log.Debug("Attempting to pair Farmer to NATS bus.")
+	log.Debugf("Attempting to pair farmer to the NATS bus for tenant %s.", tenantID)
 	nc, err := nats.Connect(BusURL,
 		nats.Secure(tlsCfg),
 		opt,
@@ -460,67 +521,199 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 		nats.MaxReconnects(maxFarmerReconnect),
 		nats.ReconnectWait(time.Second*15),
 		nats.DisconnectHandler(func(_ *nats.Conn) {
-			log.Warnf("WARN: Reconnecting Farmer to NATS bus, attempt: %d\n", connectionAttempts.Add(1))
+			log.Warnf("WARN: Reconnecting farmer to NATS bus for tenant %s, attempt: %d\n", tenantID, connectionAttempts.Add(1))
 		}),
 	)
 	if err != nil {
-		log.Errorf("Got an error on Connect with Secure Options: %+v\n", err)
+		return nil, fmt.Errorf("connect error for tenant %s: %w", tenantID, err)
 	}
 	if nc == nil {
-		log.Fatalf("Failed to connect Farmer to NATS bus: %v", err)
+		return nil, fmt.Errorf("nil NATS connection for tenant %s", tenantID)
 	}
 	for !nc.IsConnected() {
 		attempts := connectionAttempts.Add(1)
-		log.Debugf("Attempting to pair Farmer to NATS bus (attempt %d/%d).", attempts, maxFarmerReconnect)
+		log.Debugf("Attempting to pair farmer to NATS bus for tenant %s (attempt %d/%d).", tenantID, attempts, maxFarmerReconnect)
 		if attempts >= int64(maxFarmerReconnect) {
-			log.Fatalf("Failed to connect Farmer to NATS %d times, exiting.", attempts)
+			nc.Close()
+			return nil, fmt.Errorf("failed to connect tenant %s to NATS %d times", tenantID, attempts)
 		}
 		select {
 		case <-ctx.Done():
 			nc.Close()
-			return
+			return nil, ctx.Err()
 		case <-time.After(time.Second * 15):
 		}
 	}
-	connectionAttempts.Store(0)
-	log.Debugf("Successfully joined Farmer to NATS bus")
+	log.Debugf("Successfully joined farmer to NATS bus for tenant %s", tenantID)
+	return nc, nil
+}
 
-	if err := log.ConnectNATS(BusURL); err != nil {
+// registerTenantHandlers boots tenantID's full registration set on nc:
+// every RegisterNatsConn-style ingredient registration plus
+// natsapi.Subscribe, each bound to tenantID (docs/design/
+// grlx-tenant-context-threading.md's Option A). Records nc in tenantConns
+// on success so it can be closed later (process shutdown, or
+// disconnectTenant on deprovisioning).
+func registerTenantHandlers(nc *nats.Conn, tenantID string) error {
+	if _, err := nc.Subscribe("grlx.sprouts.announce.>", func(m *nats.Msg) {
+		log.Infof("Received a join event (tenant %s): %s\n", tenantID, string(m.Data))
+	}); err != nil {
+		log.Errorf("Got an error on Subscribe (tenant %s): %+v\n", tenantID, err)
+	}
+
+	test.RegisterFarmerNatsConn(tenantID, nc)
+	cmd.RegisterFarmerNatsConn(tenantID, nc)
+	cook.RegisterFarmerNatsConn(tenantID, nc)
+	jobs.RegisterNatsConn(tenantID, nc)
+	facts.RegisterFarmerListener(tenantID, nc)
+
+	if err := natsapi.Subscribe(nc, tenantID); err != nil {
+		return fmt.Errorf("failed to subscribe NATS API handlers for tenant %s: %w", tenantID, err)
+	}
+	log.Infof("NATS API handlers registered for tenant %s", tenantID)
+	setTenantConn(tenantID, nc)
+	return nil
+}
+
+// connectTenantWithRetry connects tenantID's NATS connection and boots its
+// registrations, retrying with exponential backoff on failure instead of
+// blocking farmer startup or any other tenant's connection. See point 5 of
+// docs/design/grlx-tenant-context-threading.md: only the legacy tenant's
+// connection is load-bearing enough to fail farmer startup outright (it's
+// what every existing single-tenant deployment, the HTTP admin API, and the
+// CLI all depend on); every dynamically-provisioned tenant instead degrades
+// independently — a tenant stuck retrying just can't be reached until the
+// retry succeeds, the same "not misattributed, genuinely unreachable"
+// ceiling this whole effort is about, now scoped to one tenant instead of
+// every tenant but one. This same policy applies whether the tenant was
+// enumerated at boot (ConnectFarmer) or provisioned at runtime
+// (pki.OnTenantProvisioned) — deliberately consistent between the two, per
+// the design doc's "don't leave this undecided or inconsistent" ask.
+func connectTenantWithRetry(ctx context.Context, tenantID string) {
+	backoff := 5 * time.Second
+	const maxBackoff = 5 * time.Minute
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		nc, err := dialTenantBus(ctx, tenantID)
+		if err == nil {
+			if regErr := registerTenantHandlers(nc, tenantID); regErr != nil {
+				log.Errorf("tenant %s: %v", tenantID, regErr)
+				nc.Close()
+			} else {
+				log.Infof("Connected farmer to NATS bus for tenant %s", tenantID)
+				return
+			}
+		} else {
+			log.Errorf("tenant %s: failed to connect to NATS bus, retrying in %s: %v", tenantID, backoff, err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// disconnectTenant closes tenantID's NATS connection and removes it from
+// every package that registered outbound state for it — the deprovisioning
+// counterpart to connectTenantWithRetry. Closing the underlying *nats.Conn
+// tears down every subscription registered on it (natsapi's routes, the
+// box-key listener, cook/jobs/facts's listeners) in one call, so no
+// separate unsubscribe bookkeeping is needed to avoid leaked goroutines or
+// subscriptions.
+func disconnectTenant(tenantID string) {
+	nc := removeTenantConn(tenantID)
+	if nc == nil {
+		return
+	}
+	nc.Close()
+	test.UnregisterFarmerNatsConn(tenantID)
+	cmd.UnregisterFarmerNatsConn(tenantID)
+	cook.UnregisterFarmerNatsConn(tenantID)
+	natsapi.ClearNatsConn(tenantID)
+	log.Infof("Disconnected farmer's NATS connection for tenant %s (deprovisioned)", tenantID)
+}
+
+// ConnectFarmer connects the legacy tenant's NATS connection (fatal on
+// failure, matching this function's pre-existing behavior — see
+// connectTenantWithRetry's doc comment), then opens one additional
+// connection for every other already-provisioned tenant found in PXC, and
+// finally wires up cmd/farmer/main.go's runtime provisioning/deprovisioning
+// hooks (registered in main, before this is called, so a race with an
+// enrollment arriving immediately isn't possible) so tenants provisioned
+// later in this process's lifetime get connected too. See
+// docs/design/grlx-tenant-context-threading.md's Option A.
+func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
+	defer close(done)
+
+	if err := log.ConnectNATS(config.FarmerBusURL); err != nil {
 		log.Errorf("Failed to connect log-nats backend: %v", err)
 	}
 
-	_, err = nc.Subscribe("grlx.sprouts.announce.>", func(m *nats.Msg) {
-		log.Infof("Received a join event: %s\n", string(m.Data))
-	})
-	if err != nil {
-		log.Errorf("Got an error on Subscribe: %+v\n", err)
-	}
-
-	test.RegisterNatsConn(nc)
-	cmd.RegisterNatsConn(nc)
-	cook.RegisterNatsConn(nc)
-	jobs.RegisterNatsConn(nc)
-	facts.RegisterFarmerListener(nc)
-
-	// Now that the bus connection is up, register the heartbeat listener
-	// (its own, separate SYS-account connection).
-	initHeartbeatListener()
-
-	// Set version info and subscribe NATS API handlers.
+	// Set version info once, process-wide — not tenant-scoped.
 	natsapi.SetBuildVersion(config.Version{
 		Arch:      runtime.GOOS,
 		Compiler:  runtime.Version(),
 		GitCommit: GitCommit,
 		Tag:       Tag,
 	})
-	if err := natsapi.Subscribe(nc); err != nil {
-		log.Errorf("Failed to subscribe NATS API handlers: %v", err)
-	} else {
-		log.Info("NATS API handlers registered")
+
+	legacyTenant := pki.CurrentTenantID()
+	nc, err := dialTenantBus(ctx, legacyTenant)
+	if err != nil {
+		log.Fatalf("Failed to connect farmer to NATS bus for the legacy tenant %s: %v", legacyTenant, err)
 	}
-	// Start the job log reaper to clean up old job files.
+	if err := registerTenantHandlers(nc, legacyTenant); err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	// Now that the legacy tenant's connection is up, register the
+	// heartbeat listener (its own, separate SYS-account connection) —
+	// process-wide, not per-tenant: the SYS account already observes every
+	// tenant's CONNECT/DISCONNECT events regardless of which Account a
+	// connection authenticated into (see internal/heartbeat's own doc
+	// comment), so one listener is all this ever needs.
+	initHeartbeatListener()
+
+	ids, err := pki.ListProvisionedTenantIDs()
+	if err != nil {
+		log.Errorf("Failed to list provisioned tenants for connection bootstrap: %v", err)
+	}
+	for _, id := range ids {
+		// Defensive, not load-bearing: ListProvisionedTenantIDs only ever
+		// returns pki_tenants rows, and the legacy tenant
+		// (pki.CurrentTenantID()) never gets one of those — see
+		// pki.GetTenantAccountPub's own doc comment. This guards only
+		// against a dynamically-provisioned tenant ID that happens to
+		// collide with the legacy tenant's string (IsValidTenantID doesn't
+		// forbid that), which would otherwise try to open a second,
+		// redundant connection already covered by dialTenantBus above.
+		// This is a different "is this the legacy tenant" question from
+		// internal/pki's own reloadNKeysFor (pki.go) — that one picks
+		// which on-disk JWT layout/sync path to use (the flat legacy path
+		// vs. tenants/<id>/) and deliberately stays a separate check (see
+		// its own doc comment on why collapsing it would orphan the legacy
+		// tenant's sprouts) — not something this connection-bootstrap loop
+		// should also decide.
+		if id == legacyTenant {
+			continue
+		}
+		go connectTenantWithRetry(ctx, id)
+	}
+
+	// Start the job log reaper to clean up old job files — process-wide,
+	// not per-tenant: job storage (config.JobLogDir) isn't tenant-
+	// partitioned (see internal/jobs.RegisterNatsConn's own doc comment).
 	jobStore := jobs.NewStore()
 	jobStore.StartReaperCtx(ctx, config.JobLogTTL)
+
 	<-ctx.Done()
-	nc.Close()
+	for _, c := range allTenantConns() {
+		c.Close()
+	}
 }

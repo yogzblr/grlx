@@ -88,9 +88,14 @@ func startTestNATSServer(t *testing.T) (*nats.Conn, func()) {
 		t.Fatalf("connect to test NATS: %v", err)
 	}
 
-	ingredtest.RegisterNatsConn(nc)
+	// HTestPing dispatches through test.FPing using pki.CurrentTenantID()
+	// (the HTTP admin API's documented ceiling — see
+	// docs/design/grlx-tenant-context-threading.md), so tests register the
+	// farmer-side connection under that same tenant.
+	ingredtest.RegisterFarmerNatsConn(pki.CurrentTenantID(), nc)
 
 	return nc, func() {
+		ingredtest.UnregisterFarmerNatsConn(pki.CurrentTenantID())
 		nc.Close()
 		ns.Shutdown()
 	}

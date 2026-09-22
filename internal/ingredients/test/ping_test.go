@@ -61,8 +61,9 @@ func TestRegisterNatsConn(t *testing.T) {
 func TestFPingSuccess(t *testing.T) {
 	conn, cleanup := startTestNATS(t)
 	defer cleanup()
-	RegisterNatsConn(conn)
-	defer RegisterNatsConn(nil)
+	const tenantID = "t_test"
+	RegisterFarmerNatsConn(tenantID, conn)
+	defer UnregisterFarmerNatsConn(tenantID)
 
 	target := pki.KeyManager{SproutID: "sprout-1"}
 	topic := "grlx.sprouts." + target.SproutID + ".test.ping"
@@ -89,7 +90,7 @@ func TestFPingSuccess(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	ping := apitypes.PingPong{Ping: false, Pong: false}
-	pong, err := FPing(target, ping)
+	pong, err := FPing(tenantID, target, ping)
 	if err != nil {
 		t.Fatalf("FPing error: %v", err)
 	}
@@ -104,15 +105,16 @@ func TestFPingSuccess(t *testing.T) {
 func TestFPingTimeout(t *testing.T) {
 	conn, cleanup := startTestNATS(t)
 	defer cleanup()
-	RegisterNatsConn(conn)
-	defer RegisterNatsConn(nil)
+	const tenantID = "t_test"
+	RegisterFarmerNatsConn(tenantID, conn)
+	defer UnregisterFarmerNatsConn(tenantID)
 
 	// No subscriber — the request should time out.
 	target := pki.KeyManager{SproutID: "no-such-sprout"}
 	ping := apitypes.PingPong{Ping: false, Pong: false}
 
 	start := time.Now()
-	_, err := FPing(target, ping)
+	_, err := FPing(tenantID, target, ping)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -127,8 +129,9 @@ func TestFPingTimeout(t *testing.T) {
 func TestFPingInvalidResponse(t *testing.T) {
 	conn, cleanup := startTestNATS(t)
 	defer cleanup()
-	RegisterNatsConn(conn)
-	defer RegisterNatsConn(nil)
+	const tenantID = "t_test"
+	RegisterFarmerNatsConn(tenantID, conn)
+	defer UnregisterFarmerNatsConn(tenantID)
 
 	target := pki.KeyManager{SproutID: "bad-sprout"}
 	topic := "grlx.sprouts." + target.SproutID + ".test.ping"
@@ -145,7 +148,7 @@ func TestFPingInvalidResponse(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	ping := apitypes.PingPong{}
-	_, err = FPing(target, ping)
+	_, err = FPing(tenantID, target, ping)
 	if err == nil {
 		t.Fatal("expected unmarshal error, got nil")
 	}
@@ -154,8 +157,9 @@ func TestFPingInvalidResponse(t *testing.T) {
 func TestFPingSetsFieldsCorrectly(t *testing.T) {
 	conn, cleanup := startTestNATS(t)
 	defer cleanup()
-	RegisterNatsConn(conn)
-	defer RegisterNatsConn(nil)
+	const tenantID = "t_test"
+	RegisterFarmerNatsConn(tenantID, conn)
+	defer UnregisterFarmerNatsConn(tenantID)
 
 	target := pki.KeyManager{SproutID: "field-check"}
 	topic := "grlx.sprouts." + target.SproutID + ".test.ping"
@@ -174,7 +178,7 @@ func TestFPingSetsFieldsCorrectly(t *testing.T) {
 
 	// Pass with Ping=false — FPing should override to Ping=true, Pong=false.
 	ping := apitypes.PingPong{Ping: false, Pong: true}
-	_, err = FPing(target, ping)
+	_, err = FPing(tenantID, target, ping)
 	if err != nil {
 		t.Fatalf("FPing error: %v", err)
 	}
@@ -190,8 +194,9 @@ func TestFPingSetsFieldsCorrectly(t *testing.T) {
 func TestFPingDifferentSproutIDs(t *testing.T) {
 	conn, cleanup := startTestNATS(t)
 	defer cleanup()
-	RegisterNatsConn(conn)
-	defer RegisterNatsConn(nil)
+	const tenantID = "t_test"
+	RegisterFarmerNatsConn(tenantID, conn)
+	defer UnregisterFarmerNatsConn(tenantID)
 
 	ids := []string{"alpha", "beta-123", "sprout.with.dots"}
 	for _, id := range ids {
@@ -208,7 +213,7 @@ func TestFPingDifferentSproutIDs(t *testing.T) {
 			}
 			defer sub.Unsubscribe()
 
-			pong, err := FPing(target, apitypes.PingPong{})
+			pong, err := FPing(tenantID, target, apitypes.PingPong{})
 			if err != nil {
 				t.Fatalf("FPing(%q) error: %v", id, err)
 			}
