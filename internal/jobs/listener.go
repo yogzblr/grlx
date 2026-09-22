@@ -32,8 +32,6 @@ import (
 
 // Job represents a job
 
-var nc *nats.Conn
-
 // RegisterNatsConn subscribes to job-related subjects on conn, one of
 // farmer's per-tenant NATS connections (see
 // docs/design/grlx-tenant-context-threading.md's Option A). Called once
@@ -57,12 +55,11 @@ var nc *nats.Conn
 // possible race) rather than useful replication, and QueueSubscribe would
 // become the correct choice.
 func RegisterNatsConn(tenantID string, conn *nats.Conn) {
-	// conn is used directly below, rather than through the package-level nc
+	// conn is used directly below rather than stored in a package-level
 	// var, since RegisterNatsConn can now run concurrently for different
 	// tenants (docs/design/grlx-tenant-context-threading.md) — a shared var
-	// would race between one call's assignment and another's Subscribe.
-	// nc itself is kept only for any existing white-box test that reads it.
-	nc = conn
+	// would race between one call's assignment and another's Subscribe, and
+	// nothing else in this package needs to read it back afterward.
 	_, err := conn.Subscribe("grlx.cook.*.*", logJobs)
 	if err != nil {
 		log.Error(err)
