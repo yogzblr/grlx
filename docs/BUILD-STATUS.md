@@ -79,6 +79,7 @@ resolve merge fallout against J's box-key tenant scoping.
 | H.1 | Linux network/route management (`internal/ingredients/network`) using `vishvananda/netlink`, with a verify-connectivity-or-roll-back guard | session_01Q9NMvFaiFykjHmvCpqSn36 | merged — PR #31 (`111e414`) | n |
 | H.2 | nftables firewall ingredient (`internal/ingredients/firewall`) using `google/nftables` | session_015pQ7NBWmSxJFht6DQyrrbs | merged — PR #36 (`01dcb6b`) | y — a firewall ingredient can lock out or expose a host |
 | H.3 | SELinux ingredient (`internal/ingredients/selinux`) using `opencontainers/selinux` | session_012DtUVSVbEHb11Uz4KzW4Tt | merged — PR #34 (`4693ca9`) | y — CERT-In/DPDP-relevant: silently degrading to permissive is compliance-visible |
+| G.6 remainder | Task Scheduler (Task Scheduler 2.0 COM API) and Windows Update (WUA COM API) ingredients using `go-ole/go-ole`, following `winshortcut`'s established COM lifecycle pattern | session_0139sK5LWbknewZ5sUMBXJa5 | dispatched | y — COM lifecycle bugs, plus Windows Update install actions are a real blast-radius concern |
 
 Before dispatching, validated against `master` that none of the seven were
 already implemented: no ACL/DACL, Task Scheduler/WUA/Shortcut, LGPO,
@@ -100,9 +101,8 @@ Windows variants, `windacl`, `winshortcut`, `lgpo`, `network`, `firewall`,
   workstreams should be treated as "done" or "safe to merge" even after
   their tests pass — only as "ready for review."
 - All of Wave 0, Wave 1, Wave 2, and Section 4's seven ongoing workstreams
-  are now merged. G.6 is the one partial item — only the Shortcut ingredient
-  landed; Task Scheduler and Windows Update ingredients are still open if
-  full G.6 parity is wanted.
+  are merged, except G.6's remainder (Task Scheduler + Windows Update),
+  which is now dispatched to close out full G.6 parity.
 - The six pre-existing Wave 0 workstreams were confirmed directly against the
   repo (code present, tests present, commits/PRs identified in `git log`)
   rather than re-run, per instruction to skip work already done.
