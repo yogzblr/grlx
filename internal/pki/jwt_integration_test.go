@@ -29,7 +29,7 @@ import (
 // does. The returned func shuts the server down.
 func startTestBus(t *testing.T) func() {
 	t.Helper()
-	config.FarmerBusPort = "0"
+	config.FarmerBusPort = "-1" // RANDOM_PORT; "0" would mean nats-server's default 4222
 
 	opts := ConfigureNats()
 	srv, err := nats_server.NewServer(&opts)
@@ -65,7 +65,7 @@ func startTestBus(t *testing.T) func() {
 // over the network connection pushAccountUpdate opens.
 func startTestBusWithoutLocalHandle(t *testing.T) func() {
 	t.Helper()
-	config.FarmerBusPort = "0"
+	config.FarmerBusPort = "-1" // RANDOM_PORT; "0" would mean nats-server's default 4222
 
 	opts := ConfigureNats()
 	srv, err := nats_server.NewServer(&opts)

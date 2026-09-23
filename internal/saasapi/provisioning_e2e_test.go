@@ -97,7 +97,10 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	tmp := t.TempDir()
 	config.FarmerPKI = filepath.Join(tmp, "pki") + "/"
 	config.FarmerInterface = "127.0.0.1"
-	config.FarmerBusPort = "0"
+	// -1, not "0": nats-server maps Port 0 to the default 4222, which
+	// collides with other packages' test buses under a parallel
+	// `go test ./...`. -1 is nats-server's RANDOM_PORT.
+	config.FarmerBusPort = "-1"
 	config.FarmerWSPort = ""
 	config.FarmerOrganization = "grlx-e2e"
 	config.RootCA = filepath.Join(tmp, "rootca.pem")
