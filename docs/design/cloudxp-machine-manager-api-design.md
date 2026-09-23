@@ -235,6 +235,8 @@ everywhere else in this design (§4's "every query includes `tenant_id`").
 
 Transport: NATS subjects under `grlx.api.*` (existing) and a new `grlx.internal.*` prefix. Authenticated via a privileged internal NATS identity (system-account-scoped user or mTLS), distinct from any tenant's sprout/user credentials. Never exposed to a tenant, a sprout, or a human directly.
 
+**Decided for `internal.tenant.*`:** a narrowly-scoped User under the SYS Account, handled on farmer's existing SYS listener connection. See `grlx-internal-api-account.md` for the reasoning and the exact permission set. The `internal.tenant.*` subjects are implemented; the `internal.sprout*` subjects below are not yet.
+
 ### 2.1 Existing subjects (unchanged shape, now tenant-scoped + internal-only)
 
 | Subject | Purpose | Tenant-scoping note |
@@ -259,6 +261,7 @@ Transport: NATS subjects under `grlx.api.*` (existing) and a new `grlx.internal.
 | `internal.tenant.provision` | SaaS API → Farmer, fire-and-forget | Create the NATS Account + `farmer`-schema tenant partition. Async (§5.2) — no reply expected. |
 | `internal.tenant.provisioned.{job_id}` | Farmer → SaaS API, published | Completion callback. Farmer has no write access to `saas` schema, so this event is how status gets back. |
 | `internal.tenant.deprovision` | SaaS API → Farmer | Reverse of provision. Same async/callback shape. |
+| `internal.tenant.deprovisioned.{job_id}` | Farmer → SaaS API, published | Deprovision's completion callback, same shape as `provisioned`. |
 | `internal.sprout.mint` | SaaS API → Farmer, request-reply | Mint a User JWT + NKey identity for a newly-enrolled sprout, given `tenant_id` + submitted pubkeys. Called from farmer's own pre-enrollment HTTP path (which validates the registration key against `saas.enrollment_keys` directly, per §1.2) — this subject is the step after that validation succeeds — full sequence in §3. |
 | `internal.sprout.revoke` | SaaS API → Farmer, request-reply | Revoke a sprout's JWT/NKey (backs "unenroll"). |
 | `internal.sprouts.list` | SaaS API → Farmer, request-reply | Tenant-scoped, **paginated** version of `sprouts.list` (the existing subject returns an unbounded list — not viable at 1M sprouts). |
@@ -436,7 +439,7 @@ No cross-schema foreign keys — `tenant_id`/`sprout_id` are enforced by convent
 ### 4.2 `saas` schema tables (new)
 ```sql
 tenants               (id, name, status, plan_id, created_at, updated_at)
-provisioning_jobs     (id, tenant_id, type, status, attempts, last_error, created_at, updated_at)
+provisioning_jobs     (id, tenant_id, type, status, attempts, last_error, warning, created_at, updated_at)
 enrollment_keys        (id, tenant_id, key_hash, expiry, max_uses, used_count, revoked)
 asset_links           (id, tenant_id, sprout_id UNIQUE, asset_id UNIQUE, linked_at)
 asset_action_batches  (id, tenant_id, requested_asset_ids, created_at)

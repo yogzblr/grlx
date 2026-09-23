@@ -47,15 +47,20 @@ func pushAccountUpdate(mat *natsAuthMaterial, accountJWT string) error {
 // uses for claims-update pushes. It's exported for internal/heartbeat,
 // which needs a SYS-account connection to subscribe to
 // $SYS.ACCOUNT.*.CONNECT/DISCONNECT — only the SYS account (or a Account
-// with SDK-level system-event permissions) receives those advisories. The
-// caller owns the returned connection and should keep it open for the
-// life of the listener rather than reconnecting per call.
-func ConnectSystemAccount() (*nats.Conn, error) {
+// with SDK-level system-event permissions) receives those advisories —
+// and cmd/farmer/main.go also registers internal/natsapi's
+// internal.tenant.provision/deprovision handlers on that same connection
+// (docs/design/grlx-internal-api-account.md). The caller owns the returned
+// connection and should keep it open for the life of the listener rather
+// than reconnecting per call; extra opts (e.g. nats.MaxReconnects(-1),
+// nats.RetryOnFailedConnect(true) for a connection that must outlive a
+// bus outage) are applied after the defaults below.
+func ConnectSystemAccount(opts ...nats.Option) (*nats.Conn, error) {
 	mat, err := ensureNatsAuth()
 	if err != nil {
 		return nil, fmt.Errorf("bootstrapping NATS auth material: %w", err)
 	}
-	return connectSystemAccount(mat)
+	return connectSystemAccount(mat, opts...)
 }
 
 func publishClaimsUpdate(nc *nats.Conn, accountJWT string) error {
@@ -76,7 +81,7 @@ func publishClaimsUpdate(nc *nats.Conn, accountJWT string) error {
 // connectSystemAccount dials the configured bus as the farmer's SYS push
 // user. It reuses the same root-CA trust the farmer's own NATS connection
 // (cmd/farmer/main.go's ConnectFarmer) already relies on.
-func connectSystemAccount(mat *natsAuthMaterial) (*nats.Conn, error) {
+func connectSystemAccount(mat *natsAuthMaterial, opts ...nats.Option) (*nats.Conn, error) {
 	busURL := config.FarmerBusURL
 	rootPEM, err := os.ReadFile(config.RootCA)
 	if err != nil || rootPEM == nil {
@@ -90,9 +95,9 @@ func connectSystemAccount(mat *natsAuthMaterial) (*nats.Conn, error) {
 		RootCAs:    certPool,
 		MinVersion: tls.VersionTLS12,
 	}
-	return nats.Connect(busURL,
+	return nats.Connect(busURL, append([]nats.Option{
 		nats.Secure(tlsCfg),
 		nats.UserJWTAndSeed(mat.sysUserJWT, string(mat.sysUserSeed)),
 		nats.Timeout(pushTimeout),
-	)
+	}, opts...)...)
 }
