@@ -12,8 +12,20 @@ import (
 // Config holds the saasapi service's runtime configuration. Unlike
 // farmer/sprout/grlx, this is a standalone service with its own env-based
 // config rather than a new binary wired into internal/config's jety
-// loader — the design doc's §1.7/§6 human-user auth model isn't settled
-// yet, so there's no shared config surface to plug into.
+// loader.
+//
+// Auth (see middleware.go's Auth and NewAuthConfig) is configured from
+// this same env-var surface, read once at process startup:
+//
+//   - INTERNAL_AUTH_SECRET_CURRENT / INTERNAL_AUTH_SECRET_PREVIOUS: the
+//     BFF's shared service secret (layer 1). Sourced from a Kubernetes
+//     Secret kept in sync with Vault/OpenBao by External Secrets
+//     Operator, with Reloader triggering a rolling restart on change.
+//     Read once here, not polled or hot-reloaded — see middleware.go for
+//     why two values exist.
+//   - SAASAPI_KEYCLOAK_JWKS_URL / SAASAPI_JWT_ISSUER /
+//     SAASAPI_JWT_AUDIENCE: the Keycloak realm whose end-user JWTs the
+//     BFF forwards (layer 2).
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to, e.g. ":8081".
 	ListenAddr string
@@ -24,6 +36,22 @@ type Config struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
+
+	// InternalAuthSecretCurrent is the required, currently-valid shared
+	// service secret the BFF presents on X-Internal-Auth.
+	InternalAuthSecretCurrent string
+	// InternalAuthSecretPrevious is the previous secret value, still
+	// accepted during a rotation window. Empty means only Current is
+	// accepted.
+	InternalAuthSecretPrevious string
+
+	// KeycloakJWKSURL is the Keycloak realm's JWKS endpoint, e.g.
+	// "https://keycloak.example.com/realms/cloudxp/protocol/openid-connect/certs".
+	KeycloakJWKSURL string
+	// JWTIssuer is the expected "iss" claim on end-user JWTs.
+	JWTIssuer string
+	// JWTAudience is the expected "aud" claim on end-user JWTs.
+	JWTAudience string
 }
 
 // LoadConfig reads the saasapi service's configuration from environment
@@ -35,6 +63,13 @@ func LoadConfig() Config {
 		ReadTimeout:  20 * time.Second,
 		WriteTimeout: 20 * time.Second,
 		IdleTimeout:  60 * time.Second,
+
+		InternalAuthSecretCurrent:  os.Getenv("INTERNAL_AUTH_SECRET_CURRENT"),
+		InternalAuthSecretPrevious: os.Getenv("INTERNAL_AUTH_SECRET_PREVIOUS"),
+
+		KeycloakJWKSURL: os.Getenv("SAASAPI_KEYCLOAK_JWKS_URL"),
+		JWTIssuer:       os.Getenv("SAASAPI_JWT_ISSUER"),
+		JWTAudience:     os.Getenv("SAASAPI_JWT_AUDIENCE"),
 	}
 	return cfg
 }

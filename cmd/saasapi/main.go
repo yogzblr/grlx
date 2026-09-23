@@ -26,6 +26,17 @@ func main() {
 	}
 	saasapi.SetDB(db)
 
+	// A background context: the JWKS cache's auto-refresh goroutine
+	// (see NewAuthConfig) should live for the whole process, not just
+	// until shutdown starts.
+	authCfg, err := saasapi.NewAuthConfig(context.Background(),
+		cfg.InternalAuthSecretCurrent, cfg.InternalAuthSecretPrevious,
+		cfg.KeycloakJWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
+	if err != nil {
+		log.Fatalf("saasapi: failed to configure auth: %v", err)
+	}
+	saasapi.SetAuthConfig(authCfg)
+
 	// Plain HTTP: TLS termination is assumed to happen at the gateway
 	// (Envoy, workstream H) in front of this service, consistent with the
 	// design doc's architecture diagram (§0) showing CloudXP/tenants

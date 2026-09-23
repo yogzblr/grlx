@@ -126,6 +126,7 @@ func TestRateLimitMiddlewareKeysByAuthorizationHeader(t *testing.T) {
 
 func TestRouterRateLimitsEnrollmentKeyIssuance(t *testing.T) {
 	newTestDB(t)
+	auth := newTestAuthEnv(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
 	// Isolate this test from any budget other tests already spent
 	// against the package-level enrollmentKeyIssuanceLimiter.
@@ -133,11 +134,16 @@ func TestRouterRateLimitsEnrollmentKeyIssuance(t *testing.T) {
 
 	mux := NewRouter()
 	body := `{"expires_in_hours":24,"max_uses":50}`
+	// RateLimit keys by the raw Authorization header value (see
+	// middleware.go), so every iteration must reuse the same signed
+	// token, not mint a fresh one each time.
+	bearer := "Bearer " + auth.mintTokenForTenant(tenantID)
 
 	var last *httptest.ResponseRecorder
 	for i := 0; i < enrollmentKeyIssuanceBurst+1; i++ {
 		r := httptest.NewRequest("POST", "/v1/tenants/"+tenantID+"/enrollment-keys", strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer same-token")
+		r.Header.Set(InternalAuthHeader, testInternalAuthSecretCurrent)
+		r.Header.Set("Authorization", bearer)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
 		last = w
@@ -149,15 +155,18 @@ func TestRouterRateLimitsEnrollmentKeyIssuance(t *testing.T) {
 
 func TestListEnrollmentKeysIsNotRateLimited(t *testing.T) {
 	newTestDB(t)
+	auth := newTestAuthEnv(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
 
 	mux := NewRouter()
+	bearer := "Bearer " + auth.mintTokenForTenant(tenantID)
 	// Far more than the enrollment-key issuance burst — GET listing has
 	// no limiter of its own (see router.go's reasoning), so none of
 	// these should ever come back 429.
 	for i := 0; i < enrollmentKeyIssuanceBurst*3; i++ {
 		r := httptest.NewRequest("GET", "/v1/tenants/"+tenantID+"/enrollment-keys", nil)
-		r.Header.Set("Authorization", "Bearer same-token")
+		r.Header.Set(InternalAuthHeader, testInternalAuthSecretCurrent)
+		r.Header.Set("Authorization", bearer)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
 		if w.Code == http.StatusTooManyRequests {

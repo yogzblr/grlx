@@ -142,7 +142,7 @@ Thin, tenant-scoped wrappers over farmer's existing `recipes.*`, `jobs.*`, and `
 | `GET` | `/tenants/{tenant_id}/jobs/{jid}` |
 | `GET` | `/tenants/{tenant_id}/audit?date=...` |
 
-### 1.7 Teams, API keys, webhooks, usage — *(surface only; not detailed yet)*
+### 1.7 Request auth (decided), plus teams, API keys, webhooks, usage — *(surface only; not detailed yet)*
 
 These close the gaps identified earlier but haven't been through a design pass the way §1.1–1.6 have:
 
@@ -153,7 +153,20 @@ These close the gaps identified earlier but haven't been through a design pass t
 | `POST/GET/DELETE` | `/tenants/{tenant_id}/webhooks` |
 | `GET` | `/tenants/{tenant_id}/usage`, `/tenants/{tenant_id}/plan` |
 
-Flagged explicitly as **not yet designed** — auth scheme for human users (bearer/API-key vs. SSO/OIDC), webhook delivery/retry semantics, and billing-system integration are all open. Two candidates worth evaluating when this gets designed, surfaced while working through the sprout-JWT design and set aside there as a better fit here instead: `gourdiantoken` (Go, MIT — access/refresh rotation, revocation, multi-tenant bulk revocation via a `tid` claim, matching this API's own tenant model closely; young/single-maintainer, worth weighing against a more established primitive), and OpenBao's own Identity/OIDC provider (native ID-token issuance against OpenBao's existing entity model, if human users end up modeled there) as an alternative to standing up a separate IdP.
+Webhook delivery/retry semantics and billing-system integration remain **not yet designed**. Auth for every SaaS API request — human-user requests included — is now **decided** (internal/saasapi/middleware.go's `Auth`, FLAG FOR SECURITY REVIEW): two independent layers, both required, checked in order.
+
+1. **Shared service secret (BFF identity).** The BFF (a browser-facing frontend, not modeled elsewhere in this doc) is the SaaS API's only intended caller. It presents a pre-shared secret on a dedicated `X-Internal-Auth` header, compared with `crypto/subtle.ConstantTimeCompare` — never `==` — against `INTERNAL_AUTH_SECRET_CURRENT` and, during a rotation window, the optional `INTERNAL_AUTH_SECRET_PREVIOUS`. Both are plain environment variables, sourced from a Kubernetes Secret that External Secrets Operator keeps in sync with Vault/OpenBao, with Reloader triggering a rolling restart on change; the service reads them once at startup, the same as its other config, not polled or hot-reloaded in-process. The two-value scheme exists because a rolling restart doesn't update every replica (of this service or the BFF) atomically — without it, the overlap window between old and new secret would cause spurious 401s. This check runs first, before any JWKS fetch or JWT parsing, since it's the cheaper of the two layers.
+2. **Keycloak-issued end-user JWT.** The BFF authenticates end users against Keycloak and forwards the user's own Keycloak-issued JWT (`Authorization: Bearer ...`) on every request. Verified with `github.com/lestrrat-go/jwx/v2` (already a dependency, minting `internal/gatewayjwt`'s sprout-facing tokens) against the realm's JWKS (`/realms/{realm}/protocol/openid-connect/certs`), fetched through an auto-refreshing `jwk.Cache`, checking signature, issuer, audience, and expiry.
+
+   The end-user token's `organization` claim is a single flat object, always present:
+   ```json
+   { "organization": { "id": "a1b2c3d4-...", "name": "acme-corp", "attributes": { "tier": "enterprise" } } }
+   ```
+   `organization.id` is CloudXP's `customer_id` — the same concept as `tenant_id` everywhere else in this codebase (this section's own `{tenant_id}` path parameter, `internal/pki`'s and `internal/props`'s `tenantID`). There is deliberately no separate `customer_id` field or type: for any route with a `{tenant_id}` path parameter, `organization.id` is compared directly against it (routes without one, e.g. §1.8's fleet-catalog routes, skip this check). Because the claim is confirmed always present on a correctly-configured realm, an absent or unparseable claim on an otherwise-valid, otherwise-verified token is treated as a defensive safety net for misconfiguration, not an expected path — logged as a warning and rejected with 403, not trusted or allowed to panic.
+
+Both layers fail identically from the caller's point of view: a missing/mismatched secret, a missing/malformed bearer token, and a signature/issuer/audience/expiry failure are all `401` with the same generic `unauthorized` body — the real reason is only in the server-side log — matching §3.4's enrollment-endpoint discipline of never handing a caller a diagnostic oracle. A tenant mismatch, or a missing/unparseable `organization` claim, is `403`: a valid caller on both layers asking for the wrong resource. On success, the full parsed organization (id, name, attributes) is attached to the request context for handlers to read, not just the boolean match result.
+
+The remaining §1.7 surface — teams, API keys as a *caller-manageable credential* (distinct from the BFF's own fixed shared secret above), webhooks, and usage/billing — is still a surface-only sketch, not detailed to this level. Two candidates remain worth evaluating if a caller-manageable API-key scheme is designed later, surfaced while working through the sprout-JWT design and set aside there as a better fit here instead: `gourdiantoken` (Go, MIT — access/refresh rotation, revocation, multi-tenant bulk revocation via a `tid` claim, matching this API's own tenant model closely; young/single-maintainer, worth weighing against a more established primitive), and OpenBao's own Identity/OIDC provider (native ID-token issuance against OpenBao's existing entity model, if human users end up modeled there) as an alternative to standing up a separate IdP.
 
 ### 1.8 Fleet updates
 
@@ -444,7 +457,7 @@ already cover dispatch tracking for any `action.type`, including
 
 ## 6. Open items (not yet designed)
 
-- Human-user auth for the SaaS API itself (API keys vs. SSO/OIDC) — §1.7.
+- Caller-manageable API keys (`/tenants/{tenant_id}/api-keys`) as a credential type distinct from the BFF's fixed shared secret — §1.7. Request auth itself (shared-secret + Keycloak JWT) is decided, see §1.7.
 - Webhook delivery/retry semantics — §1.7.
 - Billing/metering integration specifics — §1.7.
 - Quota/rate-limit enforcement values and where exactly they're checked (SaaS API is the intended enforcement point, per earlier discussion, but no limits have been set).

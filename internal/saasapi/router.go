@@ -26,8 +26,10 @@ const (
 var enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
 
 // NewRouter builds the SaaS API's HTTP router (design doc §1.1, §1.2).
-// Every route is wrapped in Auth — see middleware.go for what that
-// currently does and does not check.
+// Every route is wrapped in Auth — see middleware.go for the two-layer
+// shared-secret + Keycloak-JWT check it performs, and SetAuthConfig,
+// which must be called (from main, after NewAuthConfig) before this
+// router serves any request.
 func NewRouter() *http.ServeMux {
 	mux := http.NewServeMux()
 

@@ -2,6 +2,7 @@ package saasapi
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,29 +29,113 @@ func Logger(inner http.Handler, name string) http.Handler {
 	})
 }
 
-// Auth is a placeholder for the bearer-token/tenant-claim auth the design
-// doc describes (§1: "All endpoints require a bearer token whose claims
-// include the caller's tenant_id"). Human-user auth for the SaaS API
-// (API keys vs. SSO/OIDC) is explicitly listed as not yet designed (§1.7,
-// §6), so there is no concrete scheme to implement yet.
+// Auth implements the design doc's §1 auth boundary ("All endpoints
+// require a bearer token whose claims include the caller's tenant_id")
+// as two independent layers, checked in order, both required:
 //
-// This stub only performs the one check that doesn't depend on the
-// undecided scheme: it requires *some* Authorization header to be
-// present, so routes aren't accidentally left wide open. It does NOT
-// verify the token or extract/enforce a tenant_id claim — every handler
-// in this package trusts the {tenant_id} path parameter as-is. Wiring
-// real verification (and re-checking path tenant_id against the token's
-// claim, per §4's tenant-safety convention) is required before this
-// service is exposed beyond internal testing.
+// Layer 1 — shared service secret (BFF identity). The BFF is the only
+// intended caller of this service. It presents a pre-shared secret on
+// the InternalAuthHeader ("X-Internal-Auth") header, compared with
+// crypto/subtle.ConstantTimeCompare against AuthConfig's secretCurrent
+// and (if configured) secretPrevious. The secret is sourced from a
+// Kubernetes Secret that External Secrets Operator keeps in sync with
+// Vault/OpenBao, with Reloader triggering a rolling restart on change;
+// it's read once at startup (see NewAuthConfig/SetAuthConfig), not
+// polled or hot-reloaded here. Because a rolling restart doesn't update
+// every replica (of this service or the BFF) atomically, two secret
+// values are accepted side by side during a rotation window —
+// INTERNAL_AUTH_SECRET_CURRENT and the optional
+// INTERNAL_AUTH_SECRET_PREVIOUS — so the window doesn't cause spurious
+// 401s. This check runs before any JWKS fetch or JWT parsing, since it's
+// the cheaper of the two.
 //
-// TODO(§1.7/§6): replace with real bearer-token verification once the
-// SaaS API's human-user auth scheme is designed.
+// Layer 2 — Keycloak-issued end-user JWT. The BFF authenticates end
+// users against Keycloak and forwards the user's own Keycloak-issued JWT
+// (Authorization: Bearer ...) on every request. Verified via
+// github.com/lestrrat-go/jwx/v2 against the realm's JWKS (fetched
+// through an auto-refreshing jwk.Cache — see AuthConfig), checking
+// signature, issuer, audience, and expiry.
+//
+// For any route with a {tenant_id} path parameter, the verified JWT's
+// "organization" claim is parsed (see Organization) and organization.id
+// — CloudXP's "customer_id", the same concept as tenant_id everywhere
+// else in this codebase — is compared against the path's {tenant_id}.
+// This claim is confirmed always present on a correctly-configured
+// Keycloak realm, so an absent or unparseable claim here is treated as a
+// defensive safety net for misconfiguration, not an expected path: it's
+// logged as a warning (this should never happen) and rejected with 403,
+// same as an outright mismatch, rather than trusted or allowed to panic.
+// Routes without a {tenant_id} parameter (e.g. §1.8's fleet-catalog
+// routes) skip this check entirely.
+//
+// Both layers fail the same way from the caller's point of view: missing
+// or mismatched secret, missing/malformed bearer token, and signature/
+// issuer/audience/expiry failures are all 401 "unauthorized" with no
+// detail in the response body — the real reason is logged internally
+// (Warnf), but never distinguishable from each other over the wire, same
+// generic-failure discipline as the enrollment endpoint's single
+// "enrollment_failed" response (design doc §3.4). A tenant_id mismatch
+// or missing/malformed organization claim on an otherwise-valid,
+// otherwise-verified token is 403 — a valid caller on both layers,
+// asking for the wrong resource.
+//
+// On success, the full parsed Organization (id, name, attributes) is
+// attached to the request context via OrganizationFromContext, not just
+// the boolean match result.
 func Auth(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "" {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing Authorization header")
+		cfg := authCfg
+		if cfg == nil {
+			log.Errorf("saasapi: %s: Auth called before SetAuthConfig; rejecting", name)
+			writeError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
 			return
 		}
+
+		// Layer 1: shared service secret (BFF identity), checked first
+		// and cheaply, before any JWKS fetch or JWT parsing.
+		if !cfg.validInternalSecret(r.Header.Get(InternalAuthHeader)) {
+			log.Warnf("saasapi: %s: missing or invalid %s header", name, InternalAuthHeader)
+			writeError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+			return
+		}
+
+		// Layer 2: Keycloak-issued end-user JWT.
+		const bearerPrefix = "Bearer "
+		authz := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authz, bearerPrefix) || authz == bearerPrefix {
+			log.Warnf("saasapi: %s: missing or malformed Authorization header", name)
+			writeError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+			return
+		}
+		raw := strings.TrimPrefix(authz, bearerPrefix)
+
+		tok, err := cfg.verifyBearerToken(r.Context(), raw)
+		if err != nil {
+			log.Warnf("saasapi: %s: JWT verification failed: %v", name, err)
+			writeError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+			return
+		}
+
+		org, orgErr := parseOrganizationClaim(tok)
+
+		tenantID := r.PathValue("tenant_id")
+		if tenantID != "" {
+			if orgErr != nil {
+				log.Warnf("saasapi: %s: organization claim missing or malformed on an otherwise-valid token (this should never happen if Keycloak is configured correctly): %v", name, orgErr)
+				writeError(w, http.StatusForbidden, "forbidden", "forbidden")
+				return
+			}
+			if org.ID != tenantID {
+				log.Warnf("saasapi: %s: token organization.id %q does not match path tenant_id %q", name, org.ID, tenantID)
+				writeError(w, http.StatusForbidden, "forbidden", "forbidden")
+				return
+			}
+		}
+
+		if orgErr == nil {
+			r = r.WithContext(withOrganization(r.Context(), org))
+		}
+
 		inner.ServeHTTP(w, r)
 	})
 }
@@ -135,14 +220,14 @@ func (l *perCallerLimiter) evictLocked(now time.Time) {
 // security-review concerns, extended here to enrollment-key issuance —
 // see router.go for which routes use this).
 //
-// Keying: since Auth today only checks that *some* Authorization header
-// is present (no real token parsing — see Auth's own TODO), this keys
-// buckets by the raw Authorization header value. That's a deliberate
-// stopgap, not a real caller identity: it groups requests that reuse the
-// same header value, but a caller can trivially get a fresh bucket by
-// sending a different (even garbage) header value each time. Once real
-// auth lands (§1.7/§6), this should key by the authenticated tenant_id
-// or API key ID instead, which can't be spoofed by the caller.
+// Keying: this keys buckets by the raw Authorization header value,
+// still a stopgap even now that Auth verifies the bearer JWT for real —
+// RateLimit runs without access to Auth's parsed Organization, and a
+// caller can still get a fresh bucket by presenting a different (but
+// individually valid) token each time. A follow-up should key by the
+// authenticated organization.id instead (available via
+// OrganizationFromContext once Auth has run), which can't be varied by
+// the caller.
 func RateLimit(inner http.Handler, limiter *perCallerLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("Authorization")
