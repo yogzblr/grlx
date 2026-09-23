@@ -103,7 +103,7 @@ type tokenOpts struct {
 	audience  string
 	expiresAt time.Time
 	org       *Organization // nil: omit the organization claim entirely
-	badOrg    bool           // true: include an organization claim with no "id" field
+	badOrg    bool          // true: include an organization claim with no "id" field
 }
 
 func (e *testAuthEnv) mintToken(opts tokenOpts) string {
