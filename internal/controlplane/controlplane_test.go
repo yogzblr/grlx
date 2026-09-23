@@ -56,3 +56,16 @@ func TestPublicErrorMessage(t *testing.T) {
 		t.Fatalf("PublicErrorMessage(\"\") = %q", got)
 	}
 }
+
+func TestPublicWarningMessage(t *testing.T) {
+	if PublicWarningMessage("") != "" {
+		t.Fatal("expected no message for no warning")
+	}
+	if PublicWarningMessage(WarningTenantNotProvisioned) == "" {
+		t.Fatal("no public message for WarningTenantNotProvisioned")
+	}
+	leaked := WarningCode("stat /etc/grlx/pki/nats-auth/tenants/t_1: no such file")
+	if got := PublicWarningMessage(leaked); got == "" || got == string(leaked) {
+		t.Fatalf("PublicWarningMessage(unknown) = %q, want a generic message", got)
+	}
+}

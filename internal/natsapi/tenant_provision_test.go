@@ -103,12 +103,15 @@ func TestTenantProvision_FailurePublishesFailedWithError(t *testing.T) {
 	}
 }
 
-func TestTenantDeprovision_SuccessAndFailure(t *testing.T) {
+func TestTenantDeprovision_SuccessNotFoundAndFailure(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 	stubTenantProvisioning(t, nil, func(id string) error {
-		if id == "t_missing" {
+		switch id {
+		case "t_missing":
 			return fmt.Errorf("looking up tenant: %w", pki.ErrTenantNotFound)
+		case "t_dberr":
+			return errors.New("pki: looking up tenant \"t_dberr\": sql: database is closed")
 		}
 		return nil
 	})
@@ -119,11 +122,21 @@ func TestTenantDeprovision_SuccessAndFailure(t *testing.T) {
 	sub, _ := nc.SubscribeSync(controlplane.SubjectTenantDeprovisionedWildcard)
 
 	publishJSON(t, nc, controlplane.SubjectTenantDeprovision, controlplane.TenantDeprovisionRequest{JobID: "pj_d1", TenantID: "t_1"})
-	if res := nextResult(t, sub); res.Status != controlplane.StatusOffboarded || res.JobID != "pj_d1" {
+	if res := nextResult(t, sub); res.Status != controlplane.StatusOffboarded || res.JobID != "pj_d1" || res.WarningCode != "" {
 		t.Fatalf("unexpected result %+v", res)
 	}
+
+	// Never provisioned on farmer: nothing to tear down, so it's a
+	// success, qualified by a warning.
 	publishJSON(t, nc, controlplane.SubjectTenantDeprovision, controlplane.TenantDeprovisionRequest{JobID: "pj_d2", TenantID: "t_missing"})
-	if res := nextResult(t, sub); res.Status != controlplane.StatusFailed || res.ErrorCode != controlplane.ErrorTenantNotFound {
+	if res := nextResult(t, sub); res.Status != controlplane.StatusOffboarded || res.WarningCode != controlplane.WarningTenantNotProvisioned || res.ErrorCode != "" {
+		t.Fatalf("unexpected result %+v", res)
+	}
+
+	// Any other error — a DB failure included — must still fail: it could
+	// mean the tenant's Account is still live.
+	publishJSON(t, nc, controlplane.SubjectTenantDeprovision, controlplane.TenantDeprovisionRequest{JobID: "pj_d3", TenantID: "t_dberr"})
+	if res := nextResult(t, sub); res.Status != controlplane.StatusFailed || res.ErrorCode != controlplane.ErrorInternal || res.WarningCode != "" {
 		t.Fatalf("unexpected result %+v", res)
 	}
 }

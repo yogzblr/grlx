@@ -439,7 +439,7 @@ No cross-schema foreign keys — `tenant_id`/`sprout_id` are enforced by convent
 ### 4.2 `saas` schema tables (new)
 ```sql
 tenants               (id, name, status, plan_id, created_at, updated_at)
-provisioning_jobs     (id, tenant_id, type, status, attempts, last_error, created_at, updated_at)
+provisioning_jobs     (id, tenant_id, type, status, attempts, last_error, warning, created_at, updated_at)
 enrollment_keys        (id, tenant_id, key_hash, expiry, max_uses, used_count, revoked)
 asset_links           (id, tenant_id, sprout_id UNIQUE, asset_id UNIQUE, linked_at)
 asset_action_batches  (id, tenant_id, requested_asset_ids, created_at)

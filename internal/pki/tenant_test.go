@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -132,5 +133,39 @@ func TestDeprovisionTenant_NotFound(t *testing.T) {
 	setupTestPKI(t)
 	if err := DeprovisionTenant("t_never_existed"); err == nil {
 		t.Fatal("expected DeprovisionTenant to fail for an unknown tenant")
+	}
+}
+
+// TestTenantLookup_NotFoundVsDBError pins the distinction the SaaS API's
+// deprovision path relies on (internal/natsapi treats ErrTenantNotFound
+// from DeprovisionTenant as "never provisioned, nothing to tear down"):
+// only a genuinely absent row is ErrTenantNotFound; a database failure is
+// a different error, so it can never be mistaken for a successful
+// offboarding while the tenant's Account is still live.
+func TestTenantLookup_NotFoundVsDBError(t *testing.T) {
+	setupTestPKI(t)
+
+	if _, err := getTenantRow("t_absent"); !errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("getTenantRow(absent) = %v, want ErrTenantNotFound", err)
+	}
+	if err := DeprovisionTenant("t_absent"); !errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("DeprovisionTenant(absent) = %v, want ErrTenantNotFound", err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB(): %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("closing test db: %v", err)
+	}
+	if _, err := getTenantRow("t_absent"); err == nil || errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("getTenantRow with a broken DB = %v, want a non-ErrTenantNotFound error", err)
+	}
+	if err := DeprovisionTenant("t_absent"); err == nil || errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("DeprovisionTenant with a broken DB = %v, want a non-ErrTenantNotFound error", err)
+	}
+	if err := ProvisionTenant("t_absent", "x"); err == nil || errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("ProvisionTenant with a broken DB = %v, want a real lookup error", err)
 	}
 }

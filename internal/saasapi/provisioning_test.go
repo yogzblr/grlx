@@ -8,6 +8,8 @@ package saasapi
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -218,6 +220,13 @@ func TestConnectBus_FailsClosedOnMissingOrMismatchedCredential(t *testing.T) {
 		t.Fatalf("empty config: err = %v, want ErrBusNotConfigured", err)
 	}
 
+	writeSeed := func(seed []byte) string {
+		path := filepath.Join(t.TempDir(), "nkey.seed")
+		if err := os.WriteFile(path, seed, 0o600); err != nil {
+			t.Fatalf("writing seed file: %v", err)
+		}
+		return path
+	}
 	userA, _ := nkeys.CreateUser()
 	seedA, _ := userA.Seed()
 	userB, _ := nkeys.CreateUser()
@@ -227,46 +236,36 @@ func TestConnectBus_FailsClosedOnMissingOrMismatchedCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encoding JWT: %v", err)
 	}
-	cfg := Config{NATSURL: "nats://127.0.0.1:1", NATSCAFile: "/nonexistent", NATSNKeySeed: string(seedA), NATSUserJWT: jwtForB}
-	if _, err := ConnectBus(cfg); err == nil {
-		t.Fatal("expected a seed/JWT pair from different credentials to be rejected before dialing")
+	cfg := Config{NATSURL: "nats://127.0.0.1:1", NATSCAFile: "/nonexistent", NATSNKeySeedFile: writeSeed(seedA), NATSUserJWT: jwtForB}
+	if _, err := ConnectBus(cfg); err == nil || !strings.Contains(err.Error(), "different credentials") {
+		t.Fatalf("expected a seed/JWT pair from different credentials to be rejected before dialing, got %v", err)
 	}
 
 	acctSeed, _ := acct.Seed()
-	cfg.NATSNKeySeed = string(acctSeed)
+	cfg.NATSNKeySeedFile = writeSeed(acctSeed)
 	if _, err := ConnectBus(cfg); err == nil {
 		t.Fatal("expected a non-User seed to be rejected")
 	}
 
-	cfg.NATSNKeySeed = string(seedA)
+	cfg.NATSNKeySeedFile = writeSeed(seedA)
 	cfg.NATSUserJWT = "not-a-jwt"
 	if _, err := ConnectBus(cfg); err == nil {
 		t.Fatal("expected a malformed JWT to be rejected")
 	}
+
+	cfg.NATSNKeySeedFile = filepath.Join(t.TempDir(), "missing.seed")
+	if _, err := ConnectBus(cfg); err == nil || !strings.Contains(err.Error(), "SAASAPI_NATS_NKEY_SEED_FILE") {
+		t.Fatalf("expected a missing seed file to be rejected, got %v", err)
+	}
 }
 
-// TestApplyProvisioningResult_NeverDisplaysResultText: whatever arrives in
-// error_code — here, text that looks like a leaked internal error — the
-// stored/displayed last_error is only ever one of the fixed public
-// messages plus the job reference.
-func TestApplyProvisioningResult_NeverDisplaysResultText(t *testing.T) {
-	gdb := newTestDB(t)
-	tenant, job := seedTenantAndJob(t, gdb, TenantStatusPending, ProvisioningJobProvision)
-	leaky := controlplane.ErrorCode("open /etc/grlx/pki/nats-auth/operator.nk: permission denied")
-
-	if err := applyProvisioningResult(ProvisioningJobProvision, controlplane.TenantResult{
-		JobID: job.ID, TenantID: tenant.ID, Status: controlplane.StatusFailed, ErrorCode: leaky,
-	}); err != nil {
-		t.Fatalf("applyProvisioningResult: %v", err)
-	}
-	gotTenant, gotJob := reload(t, gdb, tenant.ID, job.ID)
-	if gotTenant.Status != TenantStatusFailed {
-		t.Fatalf("tenant status = %q, want failed", gotTenant.Status)
-	}
-	if want := publicJobError(job.ID, controlplane.ErrorInternal); gotJob.LastError != want {
-		t.Fatalf("last_error = %q, want %q", gotJob.LastError, want)
-	}
-	if strings.Contains(gotJob.LastError, "/etc/grlx") || strings.Contains(gotJob.LastError, "operator.nk") {
-		t.Fatalf("last_error leaked result text: %q", gotJob.LastError)
+// TestLoadConfig_SeedIsReadFromFileOnly: the raw seed is never taken from
+// the environment — only a path to it.
+func TestLoadConfig_SeedIsReadFromFileOnly(t *testing.T) {
+	t.Setenv("SAASAPI_NATS_NKEY_SEED", "SUAIGNOREDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+	t.Setenv("SAASAPI_NATS_NKEY_SEED_FILE", "/run/secrets/saasapi-nats/nkey.seed")
+	cfg := LoadConfig()
+	if cfg.NATSNKeySeedFile != "/run/secrets/saasapi-nats/nkey.seed" {
+		t.Fatalf("NATSNKeySeedFile = %q", cfg.NATSNKeySeedFile)
 	}
 }

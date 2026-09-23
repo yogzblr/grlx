@@ -145,7 +145,8 @@ func publicJobError(jobID string, code controlplane.ErrorCode) string {
 //   - provision succeeded:   tenant pending -> active
 //   - provision failed:      tenant pending -> failed (job.last_error set
 //     to a fixed public message, see publicJobError)
-//   - deprovision succeeded: tenant offboarding -> offboarded
+//   - deprovision succeeded: tenant offboarding -> offboarded (with
+//     job.warning set if farmer had nothing to tear down)
 //   - deprovision failed:    tenant stays offboarding; GetTenantStatus
 //     surfaces the failed job's last_error
 //
@@ -178,9 +179,13 @@ func applyProvisioningResult(jobType ProvisioningJobType, res controlplane.Tenan
 			return fmt.Errorf("%w: job belongs to tenant %s, result names %s", errUnexpectedResult, job.TenantID, res.TenantID)
 		}
 
-		jobUpdate := map[string]any{"status": ProvisioningJobSucceeded, "last_error": ""}
+		jobUpdate := map[string]any{
+			"status":     ProvisioningJobSucceeded,
+			"last_error": "",
+			"warning":    controlplane.PublicWarningMessage(res.WarningCode),
+		}
 		if !succeeded {
-			jobUpdate = map[string]any{"status": ProvisioningJobFailed, "last_error": publicJobError(job.ID, res.ErrorCode)}
+			jobUpdate = map[string]any{"status": ProvisioningJobFailed, "last_error": publicJobError(job.ID, res.ErrorCode), "warning": ""}
 		}
 		r := tx.Model(&ProvisioningJob{}).Where("id = ? AND status = ?", job.ID, ProvisioningJobPending).Updates(jobUpdate)
 		if r.Error != nil {

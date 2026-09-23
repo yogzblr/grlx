@@ -153,7 +153,12 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	}
 	t.Setenv("SAASAPI_NATS_URL", "nats://"+config.FarmerBusURL)
 	t.Setenv("SAASAPI_NATS_CA_FILE", config.RootCA)
-	t.Setenv("SAASAPI_NATS_NKEY_SEED", string(seed))
+	// The seed arrives as a file — the Secret mounted as a volume.
+	seedFile := filepath.Join(t.TempDir(), "nkey.seed")
+	if err := os.WriteFile(seedFile, seed, 0o600); err != nil {
+		t.Fatalf("writing seed file: %v", err)
+	}
+	t.Setenv("SAASAPI_NATS_NKEY_SEED_FILE", seedFile)
 	t.Setenv("SAASAPI_NATS_USER_JWT", userJWT)
 	nc, err := ConnectBus(LoadConfig())
 	if err != nil {
@@ -396,6 +401,72 @@ func TestProvisioningBridge_EndToEnd_FarmerFailureMovesTenantToFailed(t *testing
 		t.Fatalf("provisioning job = %+v, want failed with %q", job, want)
 	}
 	assertNoInternalDetail(t, "saas.provisioning_jobs.last_error", job.LastError)
+}
+
+// TestProvisioningBridge_EndToEnd_DeleteNeverProvisionedTenant: a tenant
+// whose provisioning failed before farmer recorded anything (here, a
+// corrupted operator seed makes the real pki.ProvisionTenant fail before
+// it writes a pki_tenants row) is offboarded on DELETE — the real
+// pki.DeprovisionTenant finds nothing to tear down, and GET status answers
+// 200 with the fixed warning message rather than leaving it stuck in
+// offboarding.
+func TestProvisioningBridge_EndToEnd_DeleteNeverProvisionedTenant(t *testing.T) {
+	env := newE2EEnv(t)
+	operatorSeed := filepath.Join(config.FarmerPKI, "nats-auth", "operator.nk")
+	good, err := os.ReadFile(operatorSeed)
+	if err != nil {
+		t.Fatalf("reading operator seed: %v", err)
+	}
+	if err := os.WriteFile(operatorSeed, []byte("not-a-seed"), 0o600); err != nil {
+		t.Fatalf("corrupting operator seed: %v", err)
+	}
+
+	tenantID := env.createTenant(t, "Never Provisioned Co")
+	if status := env.waitForStatus(t, tenantID, TenantStatusPending); status.Status != TenantStatusFailed {
+		t.Fatalf("tenant status = %q, want failed", status.Status)
+	}
+	if ids, _ := pki.ListProvisionedTenantIDs(); contains(ids, tenantID) {
+		t.Fatal("expected farmer to have recorded nothing for the tenant")
+	}
+
+	if err := os.WriteFile(operatorSeed, good, 0o600); err != nil {
+		t.Fatalf("restoring operator seed: %v", err)
+	}
+	deprovResults := env.observe(t, controlplane.SubjectTenantDeprovisionedWildcard)
+	if w := env.do(t, "DELETE", "/v1/tenants/"+tenantID, tenantID, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("DELETE: status %d, body %s", w.Code, w.Body.String())
+	}
+	dres, _ := nextJSON[controlplane.TenantResult](t, deprovResults, "an internal.tenant.deprovisioned result")
+	if dres.Status != controlplane.StatusOffboarded || dres.WarningCode != controlplane.WarningTenantNotProvisioned {
+		t.Fatalf("farmer reported %+v, want offboarded with tenant_not_provisioned", dres)
+	}
+
+	status := env.waitForStatus(t, tenantID, TenantStatusOffboarding)
+	want := controlplane.PublicWarningMessage(controlplane.WarningTenantNotProvisioned)
+	if status.Status != TenantStatusOffboarded || status.Warning != want || status.LastError != "" {
+		t.Fatalf("GET status = %+v, want offboarded with warning %q", status, want)
+	}
+}
+
+// TestProvisioningBridge_EndToEnd_DeleteWhileProvisioningIsRejected: with
+// farmer's handler not answering, the tenant stays pending, and DELETE is
+// refused with 409 rather than racing a deprovision against the in-flight
+// provision.
+func TestProvisioningBridge_EndToEnd_DeleteWhileProvisioningIsRejected(t *testing.T) {
+	env := newE2EEnv(t)
+	// Take farmer's handler off the bus so the provision stays in flight.
+	env.farmerSYS.Close()
+
+	tenantID := env.createTenant(t, "In Flight Co")
+	w := env.do(t, "DELETE", "/v1/tenants/"+tenantID, tenantID, "")
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "provisioning_in_progress") {
+		t.Fatalf("DELETE: status %d, body %s; want 409 provisioning_in_progress", w.Code, w.Body.String())
+	}
+	var n int64
+	env.saasDB.Model(&ProvisioningJob{}).Where("tenant_id = ? AND type = ?", tenantID, ProvisioningJobDeprovision).Count(&n)
+	if n != 0 {
+		t.Fatalf("expected no deprovision job, found %d", n)
+	}
 }
 
 // assertNoInternalDetail fails if s carries the farmer-side error detail

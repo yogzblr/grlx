@@ -27,6 +27,7 @@ package pki
 // on, not a tenant boundary itself; see jwtauth.go's own security-review
 // note on operator key custody, which applies identically here.
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -296,6 +297,11 @@ func ensureTenantAccountLocked(mat *natsAuthMaterial, tenantID, nameHint string)
 		return nil, false, fmt.Errorf("pki: tenant %q was deprovisioned; call ProvisionTenant explicitly to re-provision it", tenantID)
 	case lookupErr == nil:
 		nameHint = row.Name
+	case !errors.Is(lookupErr, ErrTenantNotFound):
+		// A real lookup failure, not an absent row: don't fall through to
+		// upsertTenantRow, whose upsert would also reset Deleted and so
+		// silently un-delete a deprovisioned tenant.
+		return nil, false, lookupErr
 	default:
 		name := nameHint
 		if name == "" {

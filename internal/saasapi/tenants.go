@@ -18,6 +18,9 @@ type tenantStatusResponse struct {
 	TenantID  string       `json:"tenant_id"`
 	Status    TenantStatus `json:"status"`
 	LastError string       `json:"last_error,omitempty"`
+	// Warning is set when the most recent job succeeded with a warning —
+	// e.g. offboarding a tenant that was never provisioned on farmer.
+	Warning string `json:"warning,omitempty"`
 }
 
 // CreateTenant handles POST /tenants (design doc §1.1). It's async: the
@@ -129,29 +132,73 @@ func PatchTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tenant)
 }
 
+// errProvisioningInProgress / errTenantStateChanged are DeleteTenant's
+// in-transaction conflict outcomes.
+var (
+	errProvisioningInProgress = errors.New("tenant provisioning is still in progress")
+	errTenantStateChanged     = errors.New("tenant status changed concurrently")
+)
+
 // DeleteTenant handles DELETE /tenants/{tenant_id} (design doc §1.1) —
 // offboarding follows the same async create-row-then-poll pattern as
 // CreateTenant.
+//
+// A tenant whose provisioning is still in flight (status pending, or any
+// provision job still pending) can't be deleted yet: 409
+// provisioning_in_progress, retry once GET .../status leaves pending.
+// Allowing it would race the provision and deprovision requests against
+// each other on farmer (its queue group can hand them to different
+// replicas), which could end with a live NATS Account for a tenant the
+// saas schema considers offboarded. Only active or failed tenants can be
+// offboarded, and that's enforced by a conditional update inside the
+// transaction, not just the pre-check, so a concurrent status change can't
+// slip past it.
 func DeleteTenant(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := lookupTenant(w, r)
 	if !ok {
 		return
 	}
-	if tenant.Status == TenantStatusOffboarding || tenant.Status == TenantStatusOffboarded {
+	switch tenant.Status {
+	case TenantStatusOffboarding, TenantStatusOffboarded:
 		writeError(w, http.StatusConflict, "offboarding_in_progress", "tenant is already offboarding or offboarded")
+		return
+	case TenantStatusPending:
+		writeError(w, http.StatusConflict, "provisioning_in_progress", "tenant provisioning is still in progress; retry once it has completed")
 		return
 	}
 
 	var job *ProvisioningJob
 	err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&tenant).Update("status", TenantStatusOffboarding).Error; err != nil {
+		var inFlight int64
+		if err := tx.Model(&ProvisioningJob{}).
+			Where("tenant_id = ? AND type = ? AND status = ?", tenant.ID, ProvisioningJobProvision, ProvisioningJobPending).
+			Count(&inFlight).Error; err != nil {
 			return err
+		}
+		if inFlight > 0 {
+			return errProvisioningInProgress
+		}
+		res := tx.Model(&Tenant{}).
+			Where("id = ? AND status IN ?", tenant.ID, []TenantStatus{TenantStatusActive, TenantStatusFailed}).
+			Update("status", TenantStatusOffboarding)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errTenantStateChanged
 		}
 		var jobErr error
 		job, jobErr = enqueueProvisioningJob(tx, tenant.ID, ProvisioningJobDeprovision)
 		return jobErr
 	})
-	if err != nil {
+	switch {
+	case errors.Is(err, errProvisioningInProgress):
+		writeError(w, http.StatusConflict, "provisioning_in_progress", "tenant provisioning is still in progress; retry once it has completed")
+		return
+	case errors.Is(err, errTenantStateChanged):
+		writeError(w, http.StatusConflict, "tenant_state_changed", "tenant status changed while offboarding was requested; retry")
+		return
+	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to start tenant offboarding")
 		return
 	}
@@ -163,7 +210,9 @@ func DeleteTenant(w http.ResponseWriter, r *http.Request) {
 
 // GetTenantStatus handles GET /tenants/{tenant_id}/status (design doc
 // §1.1) — a lightweight status-only poll, including the last provisioning
-// error if the most recent outbox job for this tenant failed.
+// error if the most recent outbox job for this tenant failed, or its
+// warning if it succeeded with one (both fixed, caller-safe messages —
+// see provisioning.go's publicJobError and controlplane.PublicWarningMessage).
 func GetTenantStatus(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := lookupTenant(w, r)
 	if !ok {
@@ -171,11 +220,14 @@ func GetTenantStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := tenantStatusResponse{TenantID: tenant.ID, Status: tenant.Status}
-	if tenant.Status == TenantStatusFailed || tenant.Status == TenantStatusOffboarding {
-		var job ProvisioningJob
-		err := db.Where("tenant_id = ?", tenant.ID).Order("created_at DESC").First(&job).Error
-		if err == nil && job.Status == ProvisioningJobFailed {
+	var job ProvisioningJob
+	if err := db.Where("tenant_id = ?", tenant.ID).Order("created_at DESC").First(&job).Error; err == nil {
+		switch {
+		case job.Status == ProvisioningJobFailed &&
+			(tenant.Status == TenantStatusFailed || tenant.Status == TenantStatusOffboarding):
 			resp.LastError = job.LastError
+		case job.Status == ProvisioningJobSucceeded:
+			resp.Warning = job.Warning
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

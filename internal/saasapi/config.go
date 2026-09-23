@@ -30,13 +30,18 @@ import (
 // The NATS connection to farmer (see bus.go's ConnectBus, and
 // docs/design/grlx-internal-api-account.md) is configured the same way:
 //
-//   - SAASAPI_NATS_NKEY_SEED / SAASAPI_NATS_USER_JWT: this service's own
-//     NATS identity — a narrowly-scoped User under the bus's SYS Account,
-//     minted by farmer (pki.EnsureSaaSAPICredential). Same operational
-//     model as INTERNAL_AUTH_SECRET_*: a Kubernetes Secret kept in sync
-//     with OpenBao by External Secrets Operator, Reloader rolling the
-//     Deployment on rotation, read once here at startup. The seed is the
-//     secret half; the JWT isn't secret but must travel with it.
+//   - SAASAPI_NATS_NKEY_SEED_FILE / SAASAPI_NATS_USER_JWT: this service's
+//     own NATS identity — a narrowly-scoped User under the bus's SYS
+//     Account, minted by farmer (pki.EnsureSaaSAPICredential). Same
+//     operational model as INTERNAL_AUTH_SECRET_*: a Kubernetes Secret
+//     kept in sync with OpenBao by External Secrets Operator, Reloader
+//     rolling the Deployment on rotation, read once at startup. The seed
+//     is the secret half, so it's taken only as a *path* to a file — the
+//     Secret mounted as a volume — never as a raw env var: a mounted
+//     Secret isn't inherited by child processes or captured in crash
+//     dumps/`env` output the way an environment variable is (the same
+//     preference internal/pki/jwtauth.go's GRLX_NATS_*_SEED_FILE states).
+//     The JWT isn't secret, but must travel with the seed.
 //   - SAASAPI_NATS_URL: the bus's client URL (e.g. "nats://farmerbus:4222";
 //     TLS is always required, the scheme notwithstanding).
 //   - SAASAPI_NATS_CA_FILE: path to the root CA PEM that signed the bus's
@@ -74,8 +79,10 @@ type Config struct {
 	// NATSCAFile is the path to the root CA PEM used to verify the bus's
 	// TLS certificate.
 	NATSCAFile string
-	// NATSNKeySeed is this service's NATS User NKey seed ("SU...").
-	NATSNKeySeed string
+	// NATSNKeySeedFile is the path to a file holding this service's NATS
+	// User NKey seed ("SU..."). The seed itself is read by ConnectBus and
+	// never held in Config.
+	NATSNKeySeedFile string
 	// NATSUserJWT is this service's signed NATS User JWT.
 	NATSUserJWT string
 }
@@ -97,10 +104,10 @@ func LoadConfig() Config {
 		JWTIssuer:       os.Getenv("SAASAPI_JWT_ISSUER"),
 		JWTAudience:     os.Getenv("SAASAPI_JWT_AUDIENCE"),
 
-		NATSURL:      os.Getenv("SAASAPI_NATS_URL"),
-		NATSCAFile:   os.Getenv("SAASAPI_NATS_CA_FILE"),
-		NATSNKeySeed: os.Getenv("SAASAPI_NATS_NKEY_SEED"),
-		NATSUserJWT:  os.Getenv("SAASAPI_NATS_USER_JWT"),
+		NATSURL:          os.Getenv("SAASAPI_NATS_URL"),
+		NATSCAFile:       os.Getenv("SAASAPI_NATS_CA_FILE"),
+		NATSNKeySeedFile: os.Getenv("SAASAPI_NATS_NKEY_SEED_FILE"),
+		NATSUserJWT:      os.Getenv("SAASAPI_NATS_USER_JWT"),
 	}
 	return cfg
 }

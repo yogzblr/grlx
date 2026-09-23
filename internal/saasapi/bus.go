@@ -48,21 +48,21 @@ var ErrBusNotConfigured = errors.New("saasapi: NATS connection not configured")
 func validateBusCredential(seed, userJWT string) error {
 	kp, err := nkeys.FromSeed([]byte(strings.TrimSpace(seed)))
 	if err != nil {
-		return fmt.Errorf("saasapi: SAASAPI_NATS_NKEY_SEED is not a valid NKey seed: %w", err)
+		return fmt.Errorf("saasapi: SAASAPI_NATS_NKEY_SEED_FILE does not hold a valid NKey seed: %w", err)
 	}
 	pub, err := kp.PublicKey()
 	if err != nil {
 		return err
 	}
 	if nkeys.Prefix(pub) != nkeys.PrefixByteUser {
-		return fmt.Errorf("saasapi: SAASAPI_NATS_NKEY_SEED is not a User seed")
+		return fmt.Errorf("saasapi: SAASAPI_NATS_NKEY_SEED_FILE does not hold a User seed")
 	}
 	uc, err := jwt.DecodeUserClaims(strings.TrimSpace(userJWT))
 	if err != nil {
 		return fmt.Errorf("saasapi: SAASAPI_NATS_USER_JWT is not a valid NATS User JWT: %w", err)
 	}
 	if uc.Subject != pub {
-		return fmt.Errorf("saasapi: SAASAPI_NATS_USER_JWT was issued to %s, but SAASAPI_NATS_NKEY_SEED is %s — the seed and JWT are from different credentials", uc.Subject, pub)
+		return fmt.Errorf("saasapi: SAASAPI_NATS_USER_JWT was issued to %s, but the seed in SAASAPI_NATS_NKEY_SEED_FILE is %s — the seed and JWT are from different credentials", uc.Subject, pub)
 	}
 	return nil
 }
@@ -77,10 +77,15 @@ func validateBusCredential(seed, userJWT string) error {
 // Once connected, the connection reconnects indefinitely, so a bus
 // restart doesn't permanently sever it.
 func ConnectBus(cfg Config) (*nats.Conn, error) {
-	if cfg.NATSURL == "" || cfg.NATSCAFile == "" || cfg.NATSNKeySeed == "" || cfg.NATSUserJWT == "" {
-		return nil, fmt.Errorf("%w: SAASAPI_NATS_URL, SAASAPI_NATS_CA_FILE, SAASAPI_NATS_NKEY_SEED and SAASAPI_NATS_USER_JWT are all required", ErrBusNotConfigured)
+	if cfg.NATSURL == "" || cfg.NATSCAFile == "" || cfg.NATSNKeySeedFile == "" || cfg.NATSUserJWT == "" {
+		return nil, fmt.Errorf("%w: SAASAPI_NATS_URL, SAASAPI_NATS_CA_FILE, SAASAPI_NATS_NKEY_SEED_FILE and SAASAPI_NATS_USER_JWT are all required", ErrBusNotConfigured)
 	}
-	if err := validateBusCredential(cfg.NATSNKeySeed, cfg.NATSUserJWT); err != nil {
+	seedBytes, err := os.ReadFile(cfg.NATSNKeySeedFile)
+	if err != nil {
+		return nil, fmt.Errorf("saasapi: reading SAASAPI_NATS_NKEY_SEED_FILE: %w", err)
+	}
+	seed := strings.TrimSpace(string(seedBytes))
+	if err := validateBusCredential(seed, cfg.NATSUserJWT); err != nil {
 		return nil, err
 	}
 	rootPEM, err := os.ReadFile(cfg.NATSCAFile)
@@ -94,7 +99,7 @@ func ConnectBus(cfg Config) (*nats.Conn, error) {
 	nc, err := nats.Connect(cfg.NATSURL,
 		nats.Name("grlx-saasapi"),
 		nats.Secure(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}),
-		nats.UserJWTAndSeed(strings.TrimSpace(cfg.NATSUserJWT), strings.TrimSpace(cfg.NATSNKeySeed)),
+		nats.UserJWTAndSeed(strings.TrimSpace(cfg.NATSUserJWT), seed),
 		nats.Timeout(10*time.Second),
 		nats.RetryOnFailedConnect(false),
 		nats.MaxReconnects(-1),

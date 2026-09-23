@@ -20,6 +20,9 @@ package pki
 // than a per-request value today).
 
 import (
+	"errors"
+	"fmt"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -207,11 +210,19 @@ func markTenantDeleted(id string) error {
 }
 
 // getTenantRow looks up a single tenant registry row by ID, including
-// deleted ones (callers that care about Deleted check it themselves).
+// deleted ones (callers that care about Deleted check it themselves). It
+// returns ErrTenantNotFound only when no row exists; any other database
+// error is returned wrapped, never disguised as not-found — callers act on
+// "not found" (ensureTenantAccountLocked creates the row; the SaaS API's
+// deprovision path treats it as nothing to tear down), which would be
+// wrong for a transient lookup failure.
 func getTenantRow(id string) (*tenantRow, error) {
 	var row tenantRow
 	if err := db.Where("id = ?", id).First(&row).Error; err != nil {
-		return nil, ErrTenantNotFound
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantNotFound
+		}
+		return nil, fmt.Errorf("pki: looking up tenant %q: %w", id, err)
 	}
 	return &row, nil
 }

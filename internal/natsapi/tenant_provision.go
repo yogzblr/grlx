@@ -106,7 +106,18 @@ func handleTenantDeprovision(nc *nats.Conn, data []byte) {
 
 	res := controlplane.TenantResult{JobID: req.JobID, TenantID: req.TenantID, Status: controlplane.StatusOffboarded}
 	err := deprovisionTenant(req.TenantID)
-	if err != nil {
+	switch {
+	case errors.Is(err, pki.ErrTenantNotFound):
+		// No pki_tenants row at all — e.g. provisioning failed before
+		// anything was created — so there's nothing to tear down: the
+		// tenant's end state (no Account on the bus) already holds.
+		// Offboarded, with a warning. Safe only because pki returns
+		// ErrTenantNotFound solely for a genuinely absent row, never for a
+		// database error (see getTenantRow).
+		log.Warnf("natsapi: deprovisioning tenant %q (job %s): tenant was never provisioned; nothing to tear down", req.TenantID, req.JobID)
+		res.WarningCode = controlplane.WarningTenantNotProvisioned
+		err = nil
+	case err != nil:
 		log.Errorf("natsapi: deprovisioning tenant %q (job %s) failed: %v", req.TenantID, req.JobID, err)
 		res.Status = controlplane.StatusFailed
 		res.ErrorCode = tenantErrorCode(err)

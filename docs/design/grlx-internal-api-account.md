@@ -244,12 +244,20 @@ User JWT is delivered." Two findings qualify that wording:
 
 ### Getting the credential to the saasapi Deployment
 
-`SAASAPI_NATS_NKEY_SEED` and `SAASAPI_NATS_USER_JWT` (plus
+`SAASAPI_NATS_NKEY_SEED_FILE` and `SAASAPI_NATS_USER_JWT` (plus
 `SAASAPI_NATS_URL` and `SAASAPI_NATS_CA_FILE`) are read once at startup in
 `internal/saasapi/config.go`. This is the same operational model as
 `INTERNAL_AUTH_SECRET_CURRENT`/`PREVIOUS`: a Kubernetes Secret kept in
 sync with OpenBao by External Secrets Operator, with Reloader rolling the
 Deployment when it changes.
+
+**The seed is only ever taken as a file** (decided on review): the Secret
+is mounted as a volume and `SAASAPI_NATS_NKEY_SEED_FILE` names the path.
+There is no raw-seed environment variable. A mounted Secret isn't
+inherited by child processes or captured in crash dumps or `env` output
+the way an environment variable is. This matches `jwtauth.go`'s preference
+for the `GRLX_NATS_*_SEED_FILE` form. The JWT isn't secret and stays an
+environment variable.
 
 **Not in this repo:** the OpenBao KV path, the `ExternalSecret` manifest,
 and the Reloader annotation. This repo has no Kubernetes manifests at all;
@@ -259,8 +267,8 @@ as the gatewayjwt Envoy wiring. The intended production flow is:
 
 1. Ops generates the SaaS API's NKey seed and stores it in OpenBao KV.
 2. ESO syncs it to farmer as `GRLX_NATS_SAASAPI_USER_SEED_FILE`, so farmer
-   never writes the seed to its own disk, and to saasapi as
-   `SAASAPI_NATS_NKEY_SEED`.
+   never writes the seed to its own disk, and to saasapi as a mounted
+   Secret file named by `SAASAPI_NATS_NKEY_SEED_FILE`.
 3. At boot, farmer calls `pki.EnsureSaaSAPICredential()`. That mints the
    User JWT (re-minting only if the key or permissions changed), revokes
    and pushes the previous key if it rotated, and writes the JWT to
@@ -324,6 +332,38 @@ a farmer path, and asserts that the text appears in none of the published
 result, `saas.provisioning_jobs.last_error`, or the `GET` status
 response. Putting `err.Error()` back on the bus makes that test fail.
 
+## Offboarding rules (decided on review)
+
+- **DELETE is refused while provisioning is in flight.** If the tenant is
+  `pending`, or any provision job for it is still `pending`, `DELETE
+  /tenants/{id}` returns 409 `provisioning_in_progress` and changes
+  nothing. Only `active` or `failed` tenants can be offboarded, and that's
+  enforced by a conditional update inside the transaction, not just the
+  pre-check. This closes the race where farmer's queue group could run a
+  tenant's provision and deprovision requests out of order on different
+  replicas and leave a live Account for a tenant that `saas` considers
+  offboarded. The result listener's status guards remain as defense in
+  depth: a late provision success never moves an `offboarding` tenant
+  back to `active`.
+- **Offboarding a tenant farmer never provisioned succeeds, with a
+  warning.** If `pki.DeprovisionTenant` finds no `pki_tenants` row
+  (`ErrTenantNotFound`), there's nothing to tear down. Farmer reports
+  `offboarded` with `warning_code: tenant_not_provisioned`, the tenant
+  moves to `offboarded`, and `GET /tenants/{id}/status` answers 200 with a
+  fixed `warning` message (`controlplane.PublicWarningMessage`). The
+  `DELETE` itself stays 202, because the async contract is unchanged:
+  farmer is what finds out there was nothing to tear down.
+- **What makes that safe.** `getTenantRow` used to map *every* lookup
+  error, including a transient DB error, to `ErrTenantNotFound`. It now
+  returns `ErrTenantNotFound` only for an absent row, and wraps any other
+  database error. Without that, a DB outage during a deprovision would
+  have been reported as success while the tenant's Account stayed live on
+  the bus. The same fix closes a latent bug in `ensureTenantAccountLocked`:
+  on any lookup error it fell through to `upsertTenantRow`, whose upsert
+  resets `deleted`, so a transient error could silently un-delete a
+  deprovisioned tenant. It now returns the error instead
+  (`TestTenantLookup_NotFoundVsDBError`).
+
 ## Deferred / open questions
 
 - **Outbox re-dispatch sweeper.** NATS core gives no redelivery guarantee
@@ -338,35 +378,14 @@ response. Putting `err.Error()` back on the bus makes that test fail.
   client and an OpenBao policy granting farmer write access to one path.
   Or should an ops Job copy it? It belongs in the ops repo either way,
   and needs a decision.
-- **Deprovisioning a tenant farmer never provisioned.**
-  `pki.DeprovisionTenant` returns `ErrTenantNotFound` for an unknown
-  tenant, and the handler reports that as `failed`, so the tenant stays
-  `offboarding`. Treating not-found as success would be friendlier, but
-  `getTenantRow` currently maps *every* lookup error, including a
-  transient DB error, to `ErrTenantNotFound`. Treating it as success could
-  mark a tenant `offboarded` in `saas` while its Account is still live on
-  the bus. We left it failing closed until `getTenantRow` separates the
-  two cases.
-- **DELETE racing provisioning.** Farmer's queue group can hand a
-  tenant's provision and deprovision requests to different replicas, so
-  they may run in either order. The SaaS API side is safe either way:
-  tenant transitions are conditional on the current status, so a late
-  provision success never moves an `offboarding` tenant back to `active`
-  (`TestApplyProvisioningResult_LateProvisionSuccessDoesNotResurrect`).
-  Farmer's side can end with a deprovision that failed (tenant not
-  provisioned yet) followed by a provision that succeeded, which leaves a
-  live Account for a tenant that is `offboarding` in `saas`. The outbox
-  sweeper, or a guard on DELETE while a provision job is still pending,
-  should close this.
 - **`internal.sprout.*` permissions.** Added when those handlers land (see
   above). `internal.sprout.mint`, `.revoke`, `.action`, and
   `internal.sprouts.list` are request-reply, so that change also has to
   grant a *scoped* inbox. Use `nats.CustomInboxPrefix` with, for example,
   `_INBOX.saasapi.>` rather than a bare `_INBOX.>`, so the SaaS API can't
   subscribe to other SYS users' reply inboxes.
-- **Seed via env var vs file.** The brief names `SAASAPI_NATS_NKEY_SEED`
-  as an environment variable, matching `INTERNAL_AUTH_SECRET_*`.
-  `jwtauth.go`'s own guidance prefers the `_FILE` form, because a mounted
-  Secret isn't inherited by child processes or left in crash dumps. The
-  SaaS API spawns no children today, so the env var is acceptable, but a
-  `_FILE` variant would be cheap to add.
+- **A tenant stuck `pending` can't be deleted.** Because of the DELETE
+  guard above, a tenant whose provision request was lost (farmer down at
+  dispatch time) stays `pending` and undeletable until the outbox sweeper
+  exists to re-dispatch it. That's one more reason the sweeper is the
+  next piece of work.

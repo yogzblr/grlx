@@ -61,8 +61,13 @@ type ProvisioningJob struct {
 	Status    ProvisioningJobStatus `gorm:"column:status;size:32;not null" json:"status"`
 	Attempts  int                   `gorm:"column:attempts;not null;default:0" json:"attempts"`
 	LastError string                `gorm:"column:last_error;type:text" json:"last_error,omitempty"`
-	CreatedAt time.Time             `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt time.Time             `gorm:"column:updated_at" json:"updated_at"`
+	// Warning qualifies a succeeded job: a fixed, caller-safe message
+	// (controlplane.PublicWarningMessage) for a result that reached its end
+	// state by an unusual path — e.g. deprovisioning a tenant farmer never
+	// provisioned. Surfaced by GET /tenants/{id}/status.
+	Warning   string    `gorm:"column:warning;type:text" json:"warning,omitempty"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 func (ProvisioningJob) TableName() string { return "provisioning_jobs" }

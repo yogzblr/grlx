@@ -77,6 +77,36 @@ func PublicErrorMessage(code ErrorCode) string {
 	return publicErrorMessages[ErrorInternal]
 }
 
+// WarningCode qualifies a successful result: the operation's end state was
+// reached, but not by the usual path. Like ErrorCode it's a fixed code, not
+// text, and the SaaS API displays only PublicWarningMessage for it.
+type WarningCode string
+
+const (
+	// WarningTenantNotProvisioned: a deprovision found no record of the
+	// tenant on farmer (e.g. its provisioning had failed before anything
+	// was created), so there was nothing to tear down. The tenant is
+	// offboarded all the same.
+	WarningTenantNotProvisioned WarningCode = "tenant_not_provisioned"
+)
+
+var publicWarningMessages = map[WarningCode]string{
+	WarningTenantNotProvisioned: "the tenant was never provisioned on the provisioning service; there was nothing to tear down",
+}
+
+// PublicWarningMessage returns the fixed, caller-safe message for code, or
+// "" for no warning. An unrecognized code gets a generic message rather
+// than being echoed back.
+func PublicWarningMessage(code WarningCode) string {
+	if code == "" {
+		return ""
+	}
+	if msg, ok := publicWarningMessages[code]; ok {
+		return msg
+	}
+	return "the operation completed with a warning; contact support for details"
+}
+
 // TenantProvisionRequest is the internal.tenant.provision payload.
 type TenantProvisionRequest struct {
 	JobID    string `json:"job_id"`
@@ -92,12 +122,14 @@ type TenantDeprovisionRequest struct {
 
 // TenantResult is the payload of both internal.tenant.provisioned.{job_id}
 // and internal.tenant.deprovisioned.{job_id}. A failure carries only an
-// ErrorCode, never error text — see ErrorCode.
+// ErrorCode and a qualified success only a WarningCode — never text; see
+// ErrorCode.
 type TenantResult struct {
-	JobID     string    `json:"job_id"`
-	TenantID  string    `json:"tenant_id"`
-	Status    string    `json:"status"`
-	ErrorCode ErrorCode `json:"error_code,omitempty"`
+	JobID       string      `json:"job_id"`
+	TenantID    string      `json:"tenant_id"`
+	Status      string      `json:"status"`
+	ErrorCode   ErrorCode   `json:"error_code,omitempty"`
+	WarningCode WarningCode `json:"warning_code,omitempty"`
 }
 
 // maxJobIDLen matches saas.provisioning_jobs.id's column size.
