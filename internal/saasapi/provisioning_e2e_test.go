@@ -1,0 +1,449 @@
+package saasapi
+
+// End-to-end coverage for the tenant provisioning bridge
+// (docs/design/grlx-internal-api-account.md), with nothing in the chain
+// mocked:
+//
+//   POST /v1/tenants (real router, real two-layer Auth)
+//     -> saas.tenants row (pending) + saas.provisioning_jobs outbox row
+//     -> dispatchProvisioning publishes internal.tenant.provision, over a
+//        real TLS NATS connection authenticated with the SaaS API's scoped
+//        SYS-Account credential (pki.EnsureSaaSAPICredential)
+//     -> a real embedded nats-server configured by pki.ConfigureNats
+//        (operator/SYS/resolver — the production auth shape)
+//     -> farmer's natsapi.RegisterTenantProvisioning handler, on farmer's
+//        SYS connection, calls the real pki.ProvisionTenant (tenant row,
+//        Account keys/JWT on disk, resolver push)
+//     -> farmer publishes internal.tenant.provisioned.{job_id}
+//     -> StartProvisioningResultListener applies it: job succeeded,
+//        tenant pending -> active in the saas schema
+//     -> GET /v1/tenants/{id}/status (real router) reports it.
+//
+// It also proves the side effect is real, not just the status flip: the
+// new tenant's Account is live on the bus (farmer's per-tenant User JWT
+// connects under it), and after DELETE it's gone again.
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/glebarez/sqlite"
+	nats_server "github.com/nats-io/nats-server/v2/server"
+	nats "github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
+	"gorm.io/gorm"
+
+	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/controlplane"
+	"github.com/gogrlx/grlx/v2/internal/natsapi"
+	"github.com/gogrlx/grlx/v2/internal/pki"
+)
+
+// e2eEnv is one fully wired SaaS API + bus + farmer handler stack.
+type e2eEnv struct {
+	mux        *http.ServeMux
+	auth       *testAuthEnv
+	saasDB     *gorm.DB
+	farmerSYS  *nats.Conn
+	farmerSeed []byte
+}
+
+func newE2EEnv(t *testing.T) *e2eEnv {
+	t.Helper()
+	env := &e2eEnv{}
+
+	// saas schema. One connection: the result listener writes from its
+	// own goroutine, and SQLite's shared-cache in-memory mode would
+	// otherwise report "table is locked" under concurrent writers.
+	env.saasDB = newTestDB(t)
+	if sqlDB, err := env.saasDB.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	env.auth = newTestAuthEnv(t)
+	env.mux = NewRouter()
+
+	// farmer schema (pki's store), distinct from the saas one.
+	pkiDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:e2e_pki_%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("opening pki test db: %v", err)
+	}
+	if err := pkiDB.AutoMigrate(pki.Models()...); err != nil {
+		t.Fatalf("migrating pki test db: %v", err)
+	}
+	if sqlDB, err := pkiDB.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	pki.SetDB(pkiDB)
+	t.Cleanup(func() { pki.SetDB(nil) })
+
+	// Farmer's on-disk PKI, TLS material, and NKey — the config values
+	// pki.ConfigureNats/ProvisionTenant/ConnectSystemAccount read.
+	tmp := t.TempDir()
+	config.FarmerPKI = filepath.Join(tmp, "pki") + "/"
+	config.FarmerInterface = "127.0.0.1"
+	config.FarmerBusPort = "0"
+	config.FarmerWSPort = ""
+	config.FarmerOrganization = "grlx-e2e"
+	config.RootCA = filepath.Join(tmp, "rootca.pem")
+	config.CertFile = filepath.Join(tmp, "cert.pem")
+	config.KeyFile = filepath.Join(tmp, "key.pem")
+	writeE2ECerts(t, tmp)
+
+	farmerKP, _ := nkeys.CreateUser()
+	farmerPub, _ := farmerKP.PublicKey()
+	env.farmerSeed, _ = farmerKP.Seed()
+	config.NKeyFarmerPubFile = filepath.Join(tmp, "farmer.pub")
+	if err := os.WriteFile(config.NKeyFarmerPubFile, []byte(farmerPub), 0o600); err != nil {
+		t.Fatalf("writing farmer pub key: %v", err)
+	}
+
+	// The bus, configured exactly as farmerbus configures it.
+	opts := pki.ConfigureNats()
+	srv, err := nats_server.NewServer(&opts)
+	if err != nil {
+		t.Fatalf("creating NATS server: %v", err)
+	}
+	srv.SetLogger(e2eNoopLogger{}, false, false)
+	go srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("NATS server did not become ready")
+	}
+	t.Cleanup(srv.Shutdown)
+	addr := srv.Addr().(*net.TCPAddr)
+	config.FarmerBusURL = fmt.Sprintf("127.0.0.1:%d", addr.Port)
+
+	// Farmer's side: its SYS listener connection with the real handlers.
+	env.farmerSYS, err = pki.ConnectSystemAccount()
+	if err != nil {
+		t.Fatalf("ConnectSystemAccount: %v", err)
+	}
+	t.Cleanup(env.farmerSYS.Close)
+	if err := natsapi.RegisterTenantProvisioning(env.farmerSYS); err != nil {
+		t.Fatalf("RegisterTenantProvisioning: %v", err)
+	}
+	if err := env.farmerSYS.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// The SaaS API's side: the credential farmer minted, delivered the
+	// way the saasapi Deployment gets it (Config from env), connected and
+	// listening exactly as cmd/saasapi/main.go does.
+	userJWT, seed, err := pki.EnsureSaaSAPICredential()
+	if err != nil {
+		t.Fatalf("EnsureSaaSAPICredential: %v", err)
+	}
+	t.Setenv("SAASAPI_NATS_URL", "nats://"+config.FarmerBusURL)
+	t.Setenv("SAASAPI_NATS_CA_FILE", config.RootCA)
+	t.Setenv("SAASAPI_NATS_NKEY_SEED", string(seed))
+	t.Setenv("SAASAPI_NATS_USER_JWT", userJWT)
+	nc, err := ConnectBus(LoadConfig())
+	if err != nil {
+		t.Fatalf("ConnectBus: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	if err := StartProvisioningResultListener(nc); err != nil {
+		t.Fatalf("StartProvisioningResultListener: %v", err)
+	}
+	SetBus(nc)
+	t.Cleanup(func() { SetBus(nil) })
+	return env
+}
+
+// observe subscribes farmer's SYS connection (not a queue member, so it
+// sees a copy of every message) to subject.
+func (e *e2eEnv) observe(t *testing.T, subject string) *nats.Subscription {
+	t.Helper()
+	sub, err := e.farmerSYS.SubscribeSync(subject)
+	if err != nil {
+		t.Fatalf("observing %s: %v", subject, err)
+	}
+	if err := e.farmerSYS.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	return sub
+}
+
+func (e *e2eEnv) do(t *testing.T, method, path, tenantID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	e.auth.setAuthHeaders(r, tenantID)
+	w := httptest.NewRecorder()
+	e.mux.ServeHTTP(w, r)
+	return w
+}
+
+func (e *e2eEnv) createTenant(t *testing.T, name string) string {
+	t.Helper()
+	w := e.do(t, "POST", "/v1/tenants", "no-tenant-path-param", fmt.Sprintf(`{"name":%q}`, name))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("POST /v1/tenants: status %d, body %s", w.Code, w.Body.String())
+	}
+	var resp tenantStatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if resp.Status != TenantStatusPending {
+		t.Fatalf("POST /v1/tenants returned status %q, want pending", resp.Status)
+	}
+	return resp.TenantID
+}
+
+// waitForStatus polls GET /v1/tenants/{id}/status until it leaves from.
+func (e *e2eEnv) waitForStatus(t *testing.T, tenantID string, from TenantStatus) tenantStatusResponse {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		w := e.do(t, "GET", "/v1/tenants/"+tenantID+"/status", tenantID, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET status: %d %s", w.Code, w.Body.String())
+		}
+		var resp tenantStatusResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decoding status: %v", err)
+		}
+		if resp.Status != from {
+			return resp
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant %s still %s after 15s", tenantID, from)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func (e *e2eEnv) jobFor(t *testing.T, tenantID string, jobType ProvisioningJobType) ProvisioningJob {
+	t.Helper()
+	var job ProvisioningJob
+	if err := e.saasDB.Where("tenant_id = ? AND type = ?", tenantID, jobType).First(&job).Error; err != nil {
+		t.Fatalf("loading %s job for %s: %v", jobType, tenantID, err)
+	}
+	return job
+}
+
+func nextJSON[T any](t *testing.T, sub *nats.Subscription, what string) (T, string) {
+	t.Helper()
+	var v T
+	msg, err := sub.NextMsg(10 * time.Second)
+	if err != nil {
+		t.Fatalf("expected %s: %v", what, err)
+	}
+	if err := json.Unmarshal(msg.Data, &v); err != nil {
+		t.Fatalf("decoding %s: %v", what, err)
+	}
+	return v, msg.Subject
+}
+
+// dialTenantAccountAsFarmer connects with farmer's User JWT under
+// tenantID's own Account — the dedicated per-tenant connection
+// cmd/farmer/main.go's dialTenantBus opens. It succeeds only if
+// ProvisionTenant really minted that Account and pushed it to the bus.
+func (e *e2eEnv) dialTenantAccountAsFarmer(t *testing.T, tenantID string) error {
+	t.Helper()
+	farmerJWT, err := pki.FarmerUserJWTForTenant(tenantID)
+	if err != nil {
+		return err
+	}
+	rootPEM, _ := os.ReadFile(config.RootCA)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(rootPEM)
+	nc, err := nats.Connect(config.FarmerBusURL,
+		nats.Secure(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}),
+		nats.UserJWTAndSeed(farmerJWT, string(e.farmerSeed)),
+		nats.Timeout(5*time.Second),
+		nats.NoReconnect(),
+	)
+	if err != nil {
+		return err
+	}
+	nc.Close()
+	return nil
+}
+
+func TestProvisioningBridge_EndToEnd_PendingToActiveToOffboarded(t *testing.T) {
+	env := newE2EEnv(t)
+	requests := env.observe(t, controlplane.SubjectTenantProvision)
+	results := env.observe(t, controlplane.SubjectTenantProvisionedWildcard)
+
+	tenantID := env.createTenant(t, "Acme Bank")
+	job := env.jobFor(t, tenantID, ProvisioningJobProvision)
+
+	// dispatchProvisioning really published, carrying the job's ID.
+	req, _ := nextJSON[controlplane.TenantProvisionRequest](t, requests, "an internal.tenant.provision request")
+	if req.JobID != job.ID || req.TenantID != tenantID || req.Name != "Acme Bank" {
+		t.Fatalf("published request %+v doesn't match job %s / tenant %s", req, job.ID, tenantID)
+	}
+
+	// Farmer's handler ran the real ProvisionTenant and published a result.
+	res, subject := nextJSON[controlplane.TenantResult](t, results, "an internal.tenant.provisioned result")
+	if subject != controlplane.ProvisionedSubject(job.ID) {
+		t.Fatalf("result published on %s, want %s", subject, controlplane.ProvisionedSubject(job.ID))
+	}
+	if res.Status != controlplane.StatusActive || res.Error != "" {
+		t.Fatalf("farmer reported %+v, want active", res)
+	}
+
+	// saasapi's subscriber applied it: pending -> active in the saas schema.
+	status := env.waitForStatus(t, tenantID, TenantStatusPending)
+	if status.Status != TenantStatusActive {
+		t.Fatalf("tenant status = %q (last_error %q), want active", status.Status, status.LastError)
+	}
+	var tenant Tenant
+	if err := env.saasDB.First(&tenant, "id = ?", tenantID).Error; err != nil || tenant.Status != TenantStatusActive {
+		t.Fatalf("saas.tenants row = %+v, err %v; want active", tenant, err)
+	}
+	job = env.jobFor(t, tenantID, ProvisioningJobProvision)
+	if job.Status != ProvisioningJobSucceeded || job.Attempts != 1 || job.LastError != "" {
+		t.Fatalf("provisioning job = %+v, want succeeded after 1 attempt", job)
+	}
+
+	// The side effect is real: pki registered the tenant, and its Account
+	// is live on the bus.
+	ids, err := pki.ListProvisionedTenantIDs()
+	if err != nil {
+		t.Fatalf("ListProvisionedTenantIDs: %v", err)
+	}
+	if !contains(ids, tenantID) {
+		t.Fatalf("pki doesn't list %s as provisioned: %v", tenantID, ids)
+	}
+	if err := env.dialTenantAccountAsFarmer(t, tenantID); err != nil {
+		t.Fatalf("expected farmer to connect under the new tenant's Account: %v", err)
+	}
+
+	// Offboarding: DELETE -> internal.tenant.deprovision -> real
+	// pki.DeprovisionTenant -> offboarded, and the Account is dead on the
+	// bus.
+	deprovResults := env.observe(t, controlplane.SubjectTenantDeprovisionedWildcard)
+	if w := env.do(t, "DELETE", "/v1/tenants/"+tenantID, tenantID, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("DELETE: status %d, body %s", w.Code, w.Body.String())
+	}
+	dres, _ := nextJSON[controlplane.TenantResult](t, deprovResults, "an internal.tenant.deprovisioned result")
+	if dres.Status != controlplane.StatusOffboarded {
+		t.Fatalf("farmer reported %+v, want offboarded", dres)
+	}
+	if status := env.waitForStatus(t, tenantID, TenantStatusOffboarding); status.Status != TenantStatusOffboarded {
+		t.Fatalf("tenant status = %q (last_error %q), want offboarded", status.Status, status.LastError)
+	}
+	if djob := env.jobFor(t, tenantID, ProvisioningJobDeprovision); djob.Status != ProvisioningJobSucceeded {
+		t.Fatalf("deprovisioning job = %+v, want succeeded", djob)
+	}
+	if err := env.dialTenantAccountAsFarmer(t, tenantID); err == nil {
+		t.Fatal("expected the deprovisioned tenant's Account to be rejected by the bus")
+	}
+}
+
+// TestProvisioningBridge_EndToEnd_FarmerFailureMovesTenantToFailed makes
+// the real pki.ProvisionTenant fail — a regular file squatting where the
+// per-tenant Account directory tree must be created, so MkdirAll fails
+// even when running as root — and checks the failure makes it all the way
+// back: the tenant ends up failed with the error recorded, not pending
+// forever.
+func TestProvisioningBridge_EndToEnd_FarmerFailureMovesTenantToFailed(t *testing.T) {
+	env := newE2EEnv(t)
+	blocker := filepath.Join(config.FarmerPKI, "nats-auth", "tenants")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("planting blocker file: %v", err)
+	}
+	results := env.observe(t, controlplane.SubjectTenantProvisionedWildcard)
+
+	tenantID := env.createTenant(t, "Doomed Co")
+	job := env.jobFor(t, tenantID, ProvisioningJobProvision)
+
+	res, subject := nextJSON[controlplane.TenantResult](t, results, "an internal.tenant.provisioned result")
+	if subject != controlplane.ProvisionedSubject(job.ID) || res.Status != controlplane.StatusFailed || res.Error == "" {
+		t.Fatalf("farmer reported %+v on %s, want failed with an error", res, subject)
+	}
+
+	status := env.waitForStatus(t, tenantID, TenantStatusPending)
+	if status.Status != TenantStatusFailed {
+		t.Fatalf("tenant status = %q, want failed", status.Status)
+	}
+	if status.LastError == "" || status.LastError != res.Error {
+		t.Fatalf("GET status last_error = %q, want farmer's error %q", status.LastError, res.Error)
+	}
+	if !strings.Contains(status.LastError, "not a directory") {
+		t.Fatalf("last_error %q doesn't carry the underlying failure", status.LastError)
+	}
+	job = env.jobFor(t, tenantID, ProvisioningJobProvision)
+	if job.Status != ProvisioningJobFailed || job.LastError != res.Error {
+		t.Fatalf("provisioning job = %+v, want failed with farmer's error", job)
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+type e2eNoopLogger struct{}
+
+func (e2eNoopLogger) Noticef(string, ...any) {}
+func (e2eNoopLogger) Warnf(string, ...any)   {}
+func (e2eNoopLogger) Fatalf(string, ...any)  {}
+func (e2eNoopLogger) Errorf(string, ...any)  {}
+func (e2eNoopLogger) Debugf(string, ...any)  {}
+func (e2eNoopLogger) Tracef(string, ...any)  {}
+
+// writeE2ECerts writes a throwaway CA and a 127.0.0.1 server certificate
+// for the embedded bus (the same shape internal/pki's own test scaffolding
+// generates).
+func writeE2ECerts(t *testing.T, dir string) {
+	t.Helper()
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caTmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"grlx-e2e"}},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTmpl, &caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("creating CA: %v", err)
+	}
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leafTmpl := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{Organization: []string{"grlx-e2e"}},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &leafTmpl, &caTmpl, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("creating leaf cert: %v", err)
+	}
+	leafPriv, _ := x509.MarshalPKCS8PrivateKey(leafKey)
+	for path, block := range map[string]*pem.Block{
+		filepath.Join(dir, "rootca.pem"): {Type: "CERTIFICATE", Bytes: caDER},
+		filepath.Join(dir, "cert.pem"):   {Type: "CERTIFICATE", Bytes: leafDER},
+		filepath.Join(dir, "key.pem"):    {Type: "PRIVATE KEY", Bytes: leafPriv},
+	} {
+		if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+			t.Fatalf("writing %s: %v", path, err)
+		}
+	}
+}

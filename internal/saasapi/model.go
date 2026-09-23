@@ -50,10 +50,10 @@ const (
 // writes a row here rather than relying on a bare NATS publish, since NATS
 // core (no JetStream) gives no redelivery guarantee.
 //
-// Nothing in this package currently transitions a job out of "pending" —
-// that requires the internal.tenant.provision/deprovision round trip to
-// farmer (§2.2), which is stubbed in provisioning.go pending workstream
-// B/H. The row exists so that plumbing has somewhere to write its result.
+// provisioning.go's applyProvisioningResult moves a job out of "pending"
+// when farmer's internal.tenant.{de,}provisioned.{job_id} result arrives
+// (§2.2); Attempts counts dispatches, for a future re-dispatch sweeper to
+// bound on (see docs/design/grlx-internal-api-account.md).
 type ProvisioningJob struct {
 	ID        string                `gorm:"column:id;primaryKey;size:36" json:"id"`
 	TenantID  string                `gorm:"column:tenant_id;size:32;not null;index" json:"tenant_id"`

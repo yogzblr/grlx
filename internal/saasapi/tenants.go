@@ -22,9 +22,11 @@ type tenantStatusResponse struct {
 
 // CreateTenant handles POST /tenants (design doc §1.1). It's async: the
 // tenant row is created with status "pending" and a provisioning_jobs
-// outbox row is written in the same transaction, then dispatch to farmer
-// is attempted (currently stubbed — see provisioning.go). The response is
-// 202 Accepted, never 201, since provisioning isn't complete yet.
+// outbox row is written in the same transaction, then the provisioning
+// request is published to farmer over NATS (see provisioning.go). The
+// tenant moves to active/failed when farmer's result comes back. The
+// response is 202 Accepted, never 201, since provisioning isn't complete
+// yet.
 func CreateTenant(w http.ResponseWriter, r *http.Request) {
 	var req createTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -63,7 +65,7 @@ func CreateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dispatchProvisioning(r.Context(), job)
+	dispatchProvisioning(r.Context(), job, tenant.Name)
 
 	writeJSON(w, http.StatusAccepted, tenantStatusResponse{TenantID: tenant.ID, Status: tenant.Status})
 }

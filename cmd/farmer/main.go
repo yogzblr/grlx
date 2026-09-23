@@ -159,6 +159,16 @@ func main() {
 	if err := pki.ReloadNKeys(); err != nil {
 		log.Errorf("Failed to push NATS auth state to the bus: %v", err)
 	}
+	// Mint (or confirm) the SaaS API's own NATS credential — a scoped User
+	// under the SYS Account (docs/design/grlx-internal-api-account.md) —
+	// and persist it to pki.SaaSAPIUserJWTPath() for delivery to the
+	// saasapi Deployment. Not fatal: an error here is either a failed push
+	// of a key-rotation revocation (retried at the next boot; the new
+	// credential is already minted) or a bootstrap problem that
+	// ReloadNKeys above will have surfaced too.
+	if _, _, err := pki.EnsureSaaSAPICredential(); err != nil {
+		log.Errorf("SaaS API NATS credential: %v", err)
+	}
 
 	// ctx is cancelled on SIGINT/SIGTERM, driving a graceful shutdown of the
 	// cohort refresher, job reaper, every tenant's NATS connection, and the
@@ -282,7 +292,7 @@ func initGatewaySigner() {
 
 // initHeartbeatClient connects the Valkey client connection-state reads
 // and writes through (see internal/heartbeat). The $SYS event listener
-// itself is registered separately, by initHeartbeatListener, once the bus
+// itself is registered separately, by initSystemAccountListeners, once the bus
 // is reachable.
 func initHeartbeatClient() {
 	addrs := strings.Split(config.ValkeyAddrs, ",")
@@ -294,16 +304,40 @@ func initHeartbeatClient() {
 	heartbeat.SetClient(client)
 }
 
-// initHeartbeatListener subscribes to the bus's own
-// $SYS.ACCOUNT.*.CONNECT/DISCONNECT events (as the SYS account — see
-// pki.ConnectSystemAccount) and maintains Valkey heartbeat keys from them,
-// replacing the old synchronous ping-based probeSprout. This dials the bus
-// over the network like any other client, so it works whether the bus is a
-// separate process/host (as it is here) or embedded locally.
-func initHeartbeatListener() {
-	nc, err := pki.ConnectSystemAccount()
+// initSystemAccountListeners opens farmer's one persistent SYS-account
+// connection (pki.ConnectSystemAccount) and registers everything that
+// listens on it:
+//   - the heartbeat listener: the bus's own $SYS.ACCOUNT.*.CONNECT/
+//     DISCONNECT events, maintained as Valkey heartbeat keys (replacing the
+//     old synchronous ping-based probeSprout);
+//   - the SaaS API's tenant-provisioning bridge: internal.tenant.provision/
+//     deprovision (natsapi.RegisterTenantProvisioning), platform-level
+//     control-plane subjects that live in the SYS Account — see
+//     docs/design/grlx-internal-api-account.md.
+//
+// This dials the bus over the network like any other client, so it works
+// whether the bus is a separate process/host (as it is here) or embedded
+// locally. The connection retries its initial connect and reconnects
+// indefinitely: with provisioning on it, a bus that's briefly unreachable
+// at boot (or an outage longer than nats.go's default reconnect budget)
+// must not leave farmer permanently without these subscriptions —
+// subscriptions registered before the first successful connect are sent
+// once it connects.
+func initSystemAccountListeners() {
+	nc, err := pki.ConnectSystemAccount(
+		nats.Name("grlx-farmer-sys-listener"),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(5*time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			log.Warnf("SYS listener connection lost (heartbeat, tenant provisioning): %v", err)
+		}),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			log.Info("SYS listener connection re-established")
+		}),
+	)
 	if err != nil {
-		log.Errorf("failed to connect heartbeat listener to the bus as the SYS account: %v", err)
+		log.Errorf("failed to connect the SYS listener to the bus: %v", err)
 		return
 	}
 	if err := heartbeat.RegisterListener(nc); err != nil {
@@ -311,8 +345,13 @@ func initHeartbeatListener() {
 		nc.Close()
 		return
 	}
+	if err := natsapi.RegisterTenantProvisioning(nc); err != nil {
+		log.Errorf("failed to register tenant provisioning handlers: %v", err)
+		nc.Close()
+		return
+	}
 	setHeartbeatConn(nc)
-	log.Info("Heartbeat listener registered")
+	log.Info("SYS listeners registered (heartbeat, tenant provisioning)")
 }
 
 func initAuditLogger() {
@@ -672,13 +711,14 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 		log.Fatalf("%v", err)
 	}
 
-	// Now that the legacy tenant's connection is up, register the
-	// heartbeat listener (its own, separate SYS-account connection) —
-	// process-wide, not per-tenant: the SYS account already observes every
-	// tenant's CONNECT/DISCONNECT events regardless of which Account a
-	// connection authenticated into (see internal/heartbeat's own doc
-	// comment), so one listener is all this ever needs.
-	initHeartbeatListener()
+	// Now that the legacy tenant's connection is up, register the SYS
+	// listeners (heartbeat and tenant provisioning, on their own, separate
+	// SYS-account connection) — process-wide, not per-tenant: the SYS
+	// account already observes every tenant's CONNECT/DISCONNECT events
+	// regardless of which Account a connection authenticated into (see
+	// internal/heartbeat's own doc comment), and tenant provisioning is a
+	// platform-level operation, so one listener is all this ever needs.
+	initSystemAccountListeners()
 
 	ids, err := pki.ListProvisionedTenantIDs()
 	if err != nil {

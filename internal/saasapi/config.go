@@ -26,6 +26,22 @@ import (
 //   - SAASAPI_KEYCLOAK_JWKS_URL / SAASAPI_JWT_ISSUER /
 //     SAASAPI_JWT_AUDIENCE: the Keycloak realm whose end-user JWTs the
 //     BFF forwards (layer 2).
+//
+// The NATS connection to farmer (see bus.go's ConnectBus, and
+// docs/design/grlx-internal-api-account.md) is configured the same way:
+//
+//   - SAASAPI_NATS_NKEY_SEED / SAASAPI_NATS_USER_JWT: this service's own
+//     NATS identity — a narrowly-scoped User under the bus's SYS Account,
+//     minted by farmer (pki.EnsureSaaSAPICredential). Same operational
+//     model as INTERNAL_AUTH_SECRET_*: a Kubernetes Secret kept in sync
+//     with OpenBao by External Secrets Operator, Reloader rolling the
+//     Deployment on rotation, read once here at startup. The seed is the
+//     secret half; the JWT isn't secret but must travel with it.
+//   - SAASAPI_NATS_URL: the bus's client URL (e.g. "nats://farmerbus:4222";
+//     TLS is always required, the scheme notwithstanding).
+//   - SAASAPI_NATS_CA_FILE: path to the root CA PEM that signed the bus's
+//     server certificate — the same config.RootCA farmer's own
+//     connections trust.
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to, e.g. ":8081".
 	ListenAddr string
@@ -52,6 +68,16 @@ type Config struct {
 	JWTIssuer string
 	// JWTAudience is the expected "aud" claim on end-user JWTs.
 	JWTAudience string
+
+	// NATSURL is the farmer bus's client URL.
+	NATSURL string
+	// NATSCAFile is the path to the root CA PEM used to verify the bus's
+	// TLS certificate.
+	NATSCAFile string
+	// NATSNKeySeed is this service's NATS User NKey seed ("SU...").
+	NATSNKeySeed string
+	// NATSUserJWT is this service's signed NATS User JWT.
+	NATSUserJWT string
 }
 
 // LoadConfig reads the saasapi service's configuration from environment
@@ -70,6 +96,11 @@ func LoadConfig() Config {
 		KeycloakJWKSURL: os.Getenv("SAASAPI_KEYCLOAK_JWKS_URL"),
 		JWTIssuer:       os.Getenv("SAASAPI_JWT_ISSUER"),
 		JWTAudience:     os.Getenv("SAASAPI_JWT_AUDIENCE"),
+
+		NATSURL:      os.Getenv("SAASAPI_NATS_URL"),
+		NATSCAFile:   os.Getenv("SAASAPI_NATS_CA_FILE"),
+		NATSNKeySeed: os.Getenv("SAASAPI_NATS_NKEY_SEED"),
+		NATSUserJWT:  os.Getenv("SAASAPI_NATS_USER_JWT"),
 	}
 	return cfg
 }
