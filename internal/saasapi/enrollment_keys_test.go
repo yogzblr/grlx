@@ -204,6 +204,7 @@ func TestDeleteEnrollmentKeyRevokesAndIsTenantScoped(t *testing.T) {
 // not just asserted by reading the code.
 func TestCreateEnrollmentKeyNeverLogsSecret(t *testing.T) {
 	newTestDB(t)
+	auth := newTestAuthEnv(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
 	withVerboseLogging(t)
 
@@ -213,7 +214,7 @@ func TestCreateEnrollmentKeyNeverLogsSecret(t *testing.T) {
 	output := captureStderr(t, func() {
 		body := `{"expires_in_hours":24,"max_uses":50}`
 		r := httptest.NewRequest("POST", "/v1/tenants/"+tenantID+"/enrollment-keys", strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer test-token")
+		auth.setAuthHeaders(r, tenantID)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
 		if w.Code != http.StatusOK {
@@ -260,6 +261,7 @@ func TestCreateEnrollmentKeyNeverLogsSecret(t *testing.T) {
 // its hash (see secretShapedToken/hashShapedToken above).
 func TestCreateEnrollmentKeyNeverLogsSecretOnDBFailure(t *testing.T) {
 	gdb := newTestDB(t)
+	auth := newTestAuthEnv(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
 	withVerboseLogging(t)
 
@@ -278,7 +280,7 @@ func TestCreateEnrollmentKeyNeverLogsSecretOnDBFailure(t *testing.T) {
 	output := captureStderr(t, func() {
 		reqBody := `{"expires_in_hours":24,"max_uses":50}`
 		r := httptest.NewRequest("POST", "/v1/tenants/"+tenantID+"/enrollment-keys", strings.NewReader(reqBody))
-		r.Header.Set("Authorization", "Bearer test-token")
+		auth.setAuthHeaders(r, tenantID)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
 		status = w.Code

@@ -8,6 +8,7 @@ import (
 
 func TestRouterRequiresAuthHeader(t *testing.T) {
 	newTestDB(t)
+	newTestAuthEnv(t)
 	mux := NewRouter()
 
 	r := httptest.NewRequest("GET", "/v1/tenants/t_x", nil)
@@ -21,10 +22,13 @@ func TestRouterRequiresAuthHeader(t *testing.T) {
 
 func TestRouterCreateTenantEndToEnd(t *testing.T) {
 	newTestDB(t)
+	auth := newTestAuthEnv(t)
 	mux := NewRouter()
 
+	// POST /v1/tenants has no {tenant_id} path parameter, so any
+	// otherwise-valid token works — there's no organization to match.
 	r := httptest.NewRequest("POST", "/v1/tenants", strings.NewReader(`{"name":"Acme Bank","plan_id":"plan_std"}`))
-	r.Header.Set("Authorization", "Bearer test-token")
+	auth.setAuthHeaders(r, "irrelevant-since-no-tenant_id-path-param")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, r)
 
