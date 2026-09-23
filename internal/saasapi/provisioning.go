@@ -128,12 +128,23 @@ func handleProvisioningResult(jobType ProvisioningJobType, prefix, subject strin
 
 var errUnexpectedResult = errors.New("unexpected provisioning result")
 
+// publicJobError is what a failed job records as last_error, which
+// GET /tenants/{id}/status returns to external callers: a fixed,
+// caller-safe message for the result's error code, plus the job ID as a
+// reference an operator can match against farmer's logs (where the full
+// error is recorded). Nothing from the result is stored verbatim, so even
+// a farmer that wrongly put detail on the bus couldn't leak it here.
+func publicJobError(jobID string, code controlplane.ErrorCode) string {
+	return fmt.Sprintf("%s (reference %s)", controlplane.PublicErrorMessage(code), jobID)
+}
+
 // applyProvisioningResult moves a pending ProvisioningJob to
 // succeeded/failed and transitions its Tenant accordingly, in one
 // transaction:
 //
 //   - provision succeeded:   tenant pending -> active
-//   - provision failed:      tenant pending -> failed (job.last_error set)
+//   - provision failed:      tenant pending -> failed (job.last_error set
+//     to a fixed public message, see publicJobError)
 //   - deprovision succeeded: tenant offboarding -> offboarded
 //   - deprovision failed:    tenant stays offboarding; GetTenantStatus
 //     surfaces the failed job's last_error
@@ -169,7 +180,7 @@ func applyProvisioningResult(jobType ProvisioningJobType, res controlplane.Tenan
 
 		jobUpdate := map[string]any{"status": ProvisioningJobSucceeded, "last_error": ""}
 		if !succeeded {
-			jobUpdate = map[string]any{"status": ProvisioningJobFailed, "last_error": controlplane.TruncateError(res.Error)}
+			jobUpdate = map[string]any{"status": ProvisioningJobFailed, "last_error": publicJobError(job.ID, res.ErrorCode)}
 		}
 		r := tx.Model(&ProvisioningJob{}).Where("id = ? AND status = ?", job.ID, ProvisioningJobPending).Updates(jobUpdate)
 		if r.Error != nil {
@@ -189,7 +200,7 @@ func applyProvisioningResult(jobType ProvisioningJobType, res controlplane.Tenan
 		case succeeded:
 			from, to = TenantStatusOffboarding, TenantStatusOffboarded
 		default:
-			log.Warnf("saasapi: deprovisioning tenant %s failed (job %s): %s", job.TenantID, job.ID, res.Error)
+			log.Warnf("saasapi: deprovisioning tenant %s failed (job %s): %s", job.TenantID, job.ID, res.ErrorCode)
 			return nil
 		}
 		if err := tx.Model(&Tenant{}).Where("id = ? AND status = ?", job.TenantID, from).Update("status", to).Error; err != nil {

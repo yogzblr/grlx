@@ -41,10 +41,41 @@ const (
 	StatusFailed     = "failed"
 )
 
-// MaxErrorLen bounds TenantResult.Error, so a pathological error string
-// can't bloat a NATS message or the saas.provisioning_jobs row it's
-// recorded into.
-const MaxErrorLen = 1024
+// ErrorCode classifies a failed provisioning result. Farmer never puts raw
+// error text on the bus: a pki error can carry filesystem paths, key file
+// names, or database detail, and the SaaS API relays a failed job's error
+// to its external callers (GET /tenants/{id}/status). Farmer logs the full
+// error locally, keyed by job ID; only one of these fixed codes crosses the
+// service boundary, and the SaaS API only ever displays PublicErrorMessage
+// for it.
+type ErrorCode string
+
+const (
+	// ErrorInvalidTenantID: farmer rejected the tenant ID's format.
+	ErrorInvalidTenantID ErrorCode = "invalid_tenant_id"
+	// ErrorTenantNotFound: farmer has no record of the tenant (e.g. a
+	// deprovision for a tenant that was never provisioned).
+	ErrorTenantNotFound ErrorCode = "tenant_not_found"
+	// ErrorInternal: anything else. The detail stays in farmer's logs.
+	ErrorInternal ErrorCode = "internal_error"
+)
+
+var publicErrorMessages = map[ErrorCode]string{
+	ErrorInvalidTenantID: "the tenant ID was rejected by the provisioning service",
+	ErrorTenantNotFound:  "the tenant is not known to the provisioning service",
+	ErrorInternal:        "an internal error occurred during provisioning; retry or contact support",
+}
+
+// PublicErrorMessage returns the fixed, caller-safe message for code. An
+// unrecognized code (a newer farmer, or a malformed result) maps to the
+// ErrorInternal message rather than being echoed back, so nothing a
+// result carries is ever displayed verbatim.
+func PublicErrorMessage(code ErrorCode) string {
+	if msg, ok := publicErrorMessages[code]; ok {
+		return msg
+	}
+	return publicErrorMessages[ErrorInternal]
+}
 
 // TenantProvisionRequest is the internal.tenant.provision payload.
 type TenantProvisionRequest struct {
@@ -60,12 +91,13 @@ type TenantDeprovisionRequest struct {
 }
 
 // TenantResult is the payload of both internal.tenant.provisioned.{job_id}
-// and internal.tenant.deprovisioned.{job_id}.
+// and internal.tenant.deprovisioned.{job_id}. A failure carries only an
+// ErrorCode, never error text — see ErrorCode.
 type TenantResult struct {
-	JobID    string `json:"job_id"`
-	TenantID string `json:"tenant_id"`
-	Status   string `json:"status"`
-	Error    string `json:"error,omitempty"`
+	JobID     string    `json:"job_id"`
+	TenantID  string    `json:"tenant_id"`
+	Status    string    `json:"status"`
+	ErrorCode ErrorCode `json:"error_code,omitempty"`
 }
 
 // maxJobIDLen matches saas.provisioning_jobs.id's column size.
@@ -109,18 +141,3 @@ func JobIDFromSubject(subject, prefix string) (string, bool) {
 	}
 	return id, true
 }
-
-// TruncateError bounds an error message to MaxErrorLen bytes, never
-// splitting a multi-byte UTF-8 sequence.
-func TruncateError(msg string) string {
-	if len(msg) <= MaxErrorLen {
-		return msg
-	}
-	cut := MaxErrorLen
-	for cut > 0 && !isRuneStart(msg[cut]) {
-		cut--
-	}
-	return msg[:cut]
-}
-
-func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }

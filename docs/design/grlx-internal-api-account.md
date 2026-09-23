@@ -300,6 +300,30 @@ so:
   reconnect are buffered by nats.go. If one fails outright, the job stays
   `pending` with its attempt counted, which is the outbox's job.
 
+## Error handling: no internal detail crosses the boundary
+
+`GET /tenants/{id}/status` returns the latest failed job's `last_error` to
+external callers (pre-existing behavior), and a pki error's text can name
+farmer filesystem paths, key files, or database detail. So raw error text
+never leaves farmer:
+
+- **Farmer** logs the full error locally, keyed by job ID, and publishes
+  only a fixed `controlplane.ErrorCode`: `invalid_tenant_id` or
+  `tenant_not_found` for pki's own sentinel errors, and `internal_error`
+  for everything else (`natsapi.tenantErrorCode`). No free-text error
+  field exists on `TenantResult`.
+- **The SaaS API** stores and displays only
+  `controlplane.PublicErrorMessage(code)`, a fixed caller-safe string,
+  plus the job ID as a reference an operator can match against farmer's
+  logs (`saasapi.publicJobError`). An unrecognized code maps to the
+  generic message rather than being echoed, so even a farmer bug that put
+  detail in `error_code` couldn't surface it.
+
+The end-to-end failure test provokes a real pki error whose text contains
+a farmer path, and asserts that the text appears in none of the published
+result, `saas.provisioning_jobs.last_error`, or the `GET` status
+response. Putting `err.Error()` back on the bus makes that test fail.
+
 ## Deferred / open questions
 
 - **Outbox re-dispatch sweeper.** NATS core gives no redelivery guarantee
@@ -323,12 +347,6 @@ so:
   mark a tenant `offboarded` in `saas` while its Account is still live on
   the bus. We left it failing closed until `getTenantRow` separates the
   two cases.
-- **`last_error` exposure.** Farmer publishes `err.Error()` (bounded to
-  1 KiB), and `GET /tenants/{id}/status` already returns the latest failed
-  job's `last_error` to the caller (pre-existing behavior). A pki error can
-  include a filesystem path. Should the external status response carry a
-  generic message instead, with the detail kept in `saas.provisioning_jobs`
-  only?
 - **DELETE racing provisioning.** Farmer's queue group can hand a
   tenant's provision and deprovision requests to different replicas, so
   they may run in either order. The SaaS API side is safe either way:

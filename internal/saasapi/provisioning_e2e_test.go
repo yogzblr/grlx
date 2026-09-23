@@ -297,7 +297,7 @@ func TestProvisioningBridge_EndToEnd_PendingToActiveToOffboarded(t *testing.T) {
 	if subject != controlplane.ProvisionedSubject(job.ID) {
 		t.Fatalf("result published on %s, want %s", subject, controlplane.ProvisionedSubject(job.ID))
 	}
-	if res.Status != controlplane.StatusActive || res.Error != "" {
+	if res.Status != controlplane.StatusActive || res.ErrorCode != "" {
 		t.Fatalf("farmer reported %+v, want active", res)
 	}
 
@@ -354,8 +354,10 @@ func TestProvisioningBridge_EndToEnd_PendingToActiveToOffboarded(t *testing.T) {
 // the real pki.ProvisionTenant fail — a regular file squatting where the
 // per-tenant Account directory tree must be created, so MkdirAll fails
 // even when running as root — and checks the failure makes it all the way
-// back: the tenant ends up failed with the error recorded, not pending
-// forever.
+// back: the tenant ends up failed with an error recorded, not pending
+// forever. It also checks that the underlying error, whose text names a
+// farmer filesystem path, never reaches the bus, the saas schema, or the
+// external status response — only the fixed public message does.
 func TestProvisioningBridge_EndToEnd_FarmerFailureMovesTenantToFailed(t *testing.T) {
 	env := newE2EEnv(t)
 	blocker := filepath.Join(config.FarmerPKI, "nats-auth", "tenants")
@@ -367,24 +369,44 @@ func TestProvisioningBridge_EndToEnd_FarmerFailureMovesTenantToFailed(t *testing
 	tenantID := env.createTenant(t, "Doomed Co")
 	job := env.jobFor(t, tenantID, ProvisioningJobProvision)
 
-	res, subject := nextJSON[controlplane.TenantResult](t, results, "an internal.tenant.provisioned result")
-	if subject != controlplane.ProvisionedSubject(job.ID) || res.Status != controlplane.StatusFailed || res.Error == "" {
-		t.Fatalf("farmer reported %+v on %s, want failed with an error", res, subject)
+	msg, err := results.NextMsg(10 * time.Second)
+	if err != nil {
+		t.Fatalf("expected an internal.tenant.provisioned result: %v", err)
+	}
+	assertNoInternalDetail(t, "the published result", string(msg.Data))
+	var res controlplane.TenantResult
+	if err := json.Unmarshal(msg.Data, &res); err != nil {
+		t.Fatalf("decoding result: %v", err)
+	}
+	if msg.Subject != controlplane.ProvisionedSubject(job.ID) || res.Status != controlplane.StatusFailed || res.ErrorCode != controlplane.ErrorInternal {
+		t.Fatalf("farmer reported %+v on %s, want failed/internal_error", res, msg.Subject)
 	}
 
 	status := env.waitForStatus(t, tenantID, TenantStatusPending)
 	if status.Status != TenantStatusFailed {
 		t.Fatalf("tenant status = %q, want failed", status.Status)
 	}
-	if status.LastError == "" || status.LastError != res.Error {
-		t.Fatalf("GET status last_error = %q, want farmer's error %q", status.LastError, res.Error)
+	want := publicJobError(job.ID, controlplane.ErrorInternal)
+	if status.LastError != want {
+		t.Fatalf("GET status last_error = %q, want %q", status.LastError, want)
 	}
-	if !strings.Contains(status.LastError, "not a directory") {
-		t.Fatalf("last_error %q doesn't carry the underlying failure", status.LastError)
-	}
+	assertNoInternalDetail(t, "GET status last_error", status.LastError)
 	job = env.jobFor(t, tenantID, ProvisioningJobProvision)
-	if job.Status != ProvisioningJobFailed || job.LastError != res.Error {
-		t.Fatalf("provisioning job = %+v, want failed with farmer's error", job)
+	if job.Status != ProvisioningJobFailed || job.LastError != want {
+		t.Fatalf("provisioning job = %+v, want failed with %q", job, want)
+	}
+	assertNoInternalDetail(t, "saas.provisioning_jobs.last_error", job.LastError)
+}
+
+// assertNoInternalDetail fails if s carries the farmer-side error detail
+// the failure test provokes (its text: "mkdir <FarmerPKI>/nats-auth/tenants:
+// not a directory").
+func assertNoInternalDetail(t *testing.T, where, s string) {
+	t.Helper()
+	for _, leak := range []string{"not a directory", "mkdir", "nats-auth", config.FarmerPKI} {
+		if strings.Contains(s, leak) {
+			t.Fatalf("%s leaked internal error detail (%q): %s", where, leak, s)
+		}
 	}
 }
 

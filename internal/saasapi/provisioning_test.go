@@ -8,6 +8,7 @@ package saasapi
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ func TestApplyProvisioningResult_DeprovisionFailureKeepsOffboarding(t *testing.T
 	tenant, job := seedTenantAndJob(t, gdb, TenantStatusOffboarding, ProvisioningJobDeprovision)
 
 	err := applyProvisioningResult(ProvisioningJobDeprovision, controlplane.TenantResult{
-		JobID: job.ID, TenantID: tenant.ID, Status: controlplane.StatusFailed, Error: "push failed",
+		JobID: job.ID, TenantID: tenant.ID, Status: controlplane.StatusFailed, ErrorCode: controlplane.ErrorInternal,
 	})
 	if err != nil {
 		t.Fatalf("applyProvisioningResult: %v", err)
@@ -61,14 +62,15 @@ func TestApplyProvisioningResult_DeprovisionFailureKeepsOffboarding(t *testing.T
 	if gotTenant.Status != TenantStatusOffboarding {
 		t.Fatalf("tenant status = %q, want offboarding", gotTenant.Status)
 	}
-	if gotJob.Status != ProvisioningJobFailed || gotJob.LastError != "push failed" {
-		t.Fatalf("job = %+v, want failed with error", gotJob)
+	wantErr := publicJobError(job.ID, controlplane.ErrorInternal)
+	if gotJob.Status != ProvisioningJobFailed || gotJob.LastError != wantErr {
+		t.Fatalf("job = %+v, want failed with %q", gotJob, wantErr)
 	}
 	// GetTenantStatus surfaces it.
 	w := doRequest(t, GetTenantStatus, "GET", "/v1/tenants/"+tenant.ID+"/status", map[string]string{"tenant_id": tenant.ID}, nil)
 	var resp tenantStatusResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Status != TenantStatusOffboarding || resp.LastError != "push failed" {
+	if resp.Status != TenantStatusOffboarding || resp.LastError != wantErr {
 		t.Fatalf("GET status = %+v", resp)
 	}
 }
@@ -101,7 +103,7 @@ func TestApplyProvisioningResult_DuplicateIsNoOp(t *testing.T) {
 		t.Fatalf("first apply: %v", err)
 	}
 	// A later, contradictory duplicate must not flip anything.
-	dup := controlplane.TenantResult{JobID: job.ID, TenantID: tenant.ID, Status: controlplane.StatusFailed, Error: "late"}
+	dup := controlplane.TenantResult{JobID: job.ID, TenantID: tenant.ID, Status: controlplane.StatusFailed, ErrorCode: controlplane.ErrorInternal}
 	if err := applyProvisioningResult(ProvisioningJobProvision, dup); err != nil {
 		t.Fatalf("duplicate apply: %v", err)
 	}
@@ -240,5 +242,31 @@ func TestConnectBus_FailsClosedOnMissingOrMismatchedCredential(t *testing.T) {
 	cfg.NATSUserJWT = "not-a-jwt"
 	if _, err := ConnectBus(cfg); err == nil {
 		t.Fatal("expected a malformed JWT to be rejected")
+	}
+}
+
+// TestApplyProvisioningResult_NeverDisplaysResultText: whatever arrives in
+// error_code — here, text that looks like a leaked internal error — the
+// stored/displayed last_error is only ever one of the fixed public
+// messages plus the job reference.
+func TestApplyProvisioningResult_NeverDisplaysResultText(t *testing.T) {
+	gdb := newTestDB(t)
+	tenant, job := seedTenantAndJob(t, gdb, TenantStatusPending, ProvisioningJobProvision)
+	leaky := controlplane.ErrorCode("open /etc/grlx/pki/nats-auth/operator.nk: permission denied")
+
+	if err := applyProvisioningResult(ProvisioningJobProvision, controlplane.TenantResult{
+		JobID: job.ID, TenantID: tenant.ID, Status: controlplane.StatusFailed, ErrorCode: leaky,
+	}); err != nil {
+		t.Fatalf("applyProvisioningResult: %v", err)
+	}
+	gotTenant, gotJob := reload(t, gdb, tenant.ID, job.ID)
+	if gotTenant.Status != TenantStatusFailed {
+		t.Fatalf("tenant status = %q, want failed", gotTenant.Status)
+	}
+	if want := publicJobError(job.ID, controlplane.ErrorInternal); gotJob.LastError != want {
+		t.Fatalf("last_error = %q, want %q", gotJob.LastError, want)
+	}
+	if strings.Contains(gotJob.LastError, "/etc/grlx") || strings.Contains(gotJob.LastError, "operator.nk") {
+		t.Fatalf("last_error leaked result text: %q", gotJob.LastError)
 	}
 }

@@ -9,6 +9,8 @@ package natsapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/gogrlx/grlx/v2/internal/controlplane"
+	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
 func stubTenantProvisioning(t *testing.T, provision func(string, string) error, deprovision func(string) error) {
@@ -62,7 +65,7 @@ func TestTenantProvision_SuccessPublishesActive(t *testing.T) {
 	publishJSON(t, nc, controlplane.SubjectTenantProvision, controlplane.TenantProvisionRequest{JobID: "pj_ok", TenantID: "t_1", Name: "Acme"})
 
 	res := nextResult(t, sub)
-	if res.Status != controlplane.StatusActive || res.JobID != "pj_ok" || res.TenantID != "t_1" || res.Error != "" {
+	if res.Status != controlplane.StatusActive || res.JobID != "pj_ok" || res.TenantID != "t_1" || res.ErrorCode != "" {
 		t.Fatalf("unexpected result %+v", res)
 	}
 	if gotID != "t_1" || gotName != "Acme" {
@@ -73,7 +76,10 @@ func TestTenantProvision_SuccessPublishesActive(t *testing.T) {
 func TestTenantProvision_FailurePublishesFailedWithError(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
-	stubTenantProvisioning(t, func(string, string) error { return errors.New("resolver unreachable") }, nil)
+	// An error whose text carries internal detail (a filesystem path).
+	stubTenantProvisioning(t, func(string, string) error {
+		return errors.New("mkdir /etc/grlx/pki/nats-auth/tenants: not a directory")
+	}, nil)
 
 	if err := RegisterTenantProvisioning(nc); err != nil {
 		t.Fatalf("RegisterTenantProvisioning: %v", err)
@@ -81,8 +87,18 @@ func TestTenantProvision_FailurePublishesFailedWithError(t *testing.T) {
 	sub, _ := nc.SubscribeSync(controlplane.ProvisionedSubject("pj_bad"))
 	publishJSON(t, nc, controlplane.SubjectTenantProvision, controlplane.TenantProvisionRequest{JobID: "pj_bad", TenantID: "t_1"})
 
-	res := nextResult(t, sub)
-	if res.Status != controlplane.StatusFailed || res.Error != "resolver unreachable" {
+	msg, err := sub.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("waiting for result: %v", err)
+	}
+	if strings.Contains(string(msg.Data), "/etc/grlx") || strings.Contains(string(msg.Data), "not a directory") {
+		t.Fatalf("raw error text leaked onto the bus: %s", msg.Data)
+	}
+	var res controlplane.TenantResult
+	if err := json.Unmarshal(msg.Data, &res); err != nil {
+		t.Fatalf("decoding result: %v", err)
+	}
+	if res.Status != controlplane.StatusFailed || res.ErrorCode != controlplane.ErrorInternal {
 		t.Fatalf("unexpected result %+v", res)
 	}
 }
@@ -92,7 +108,7 @@ func TestTenantDeprovision_SuccessAndFailure(t *testing.T) {
 	defer cleanup()
 	stubTenantProvisioning(t, nil, func(id string) error {
 		if id == "t_missing" {
-			return errors.New("no such tenant")
+			return fmt.Errorf("looking up tenant: %w", pki.ErrTenantNotFound)
 		}
 		return nil
 	})
@@ -107,7 +123,7 @@ func TestTenantDeprovision_SuccessAndFailure(t *testing.T) {
 		t.Fatalf("unexpected result %+v", res)
 	}
 	publishJSON(t, nc, controlplane.SubjectTenantDeprovision, controlplane.TenantDeprovisionRequest{JobID: "pj_d2", TenantID: "t_missing"})
-	if res := nextResult(t, sub); res.Status != controlplane.StatusFailed || res.Error != "no such tenant" {
+	if res := nextResult(t, sub); res.Status != controlplane.StatusFailed || res.ErrorCode != controlplane.ErrorTenantNotFound {
 		t.Fatalf("unexpected result %+v", res)
 	}
 }
@@ -179,5 +195,22 @@ func TestTenantProvision_QueueGroupDeliversOnce(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("ProvisionTenant called %d times, want 1", calls.Load())
+	}
+}
+
+func TestTenantErrorCode(t *testing.T) {
+	cases := []struct {
+		err  error
+		want controlplane.ErrorCode
+	}{
+		{pki.ErrTenantIDInvalid, controlplane.ErrorInvalidTenantID},
+		{fmt.Errorf("wrapped: %w", pki.ErrTenantIDInvalid), controlplane.ErrorInvalidTenantID},
+		{pki.ErrTenantNotFound, controlplane.ErrorTenantNotFound},
+		{errors.New("open /var/lib/grlx/pki/nats-auth/sys-account.nk: permission denied"), controlplane.ErrorInternal},
+	}
+	for _, c := range cases {
+		if got := tenantErrorCode(c.err); got != c.want {
+			t.Errorf("tenantErrorCode(%v) = %q, want %q", c.err, got, c.want)
+		}
 	}
 }

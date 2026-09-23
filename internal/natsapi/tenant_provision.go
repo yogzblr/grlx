@@ -20,6 +20,7 @@ package natsapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/nats-io/nats.go"
@@ -82,9 +83,11 @@ func handleTenantProvision(nc *nats.Conn, data []byte) {
 	res := controlplane.TenantResult{JobID: req.JobID, TenantID: req.TenantID, Status: controlplane.StatusActive}
 	err := provisionTenant(req.TenantID, req.Name)
 	if err != nil {
+		// The full error stays here, keyed by job ID; only a fixed code
+		// goes on the bus (see controlplane.ErrorCode).
 		log.Errorf("natsapi: provisioning tenant %q (job %s) failed: %v", req.TenantID, req.JobID, err)
 		res.Status = controlplane.StatusFailed
-		res.Error = controlplane.TruncateError(err.Error())
+		res.ErrorCode = tenantErrorCode(err)
 	}
 	auditTenantAction(auditActionTenantProvision, data, res, err)
 	publishTenantResult(nc, controlplane.ProvisionedSubject(req.JobID), res)
@@ -106,10 +109,26 @@ func handleTenantDeprovision(nc *nats.Conn, data []byte) {
 	if err != nil {
 		log.Errorf("natsapi: deprovisioning tenant %q (job %s) failed: %v", req.TenantID, req.JobID, err)
 		res.Status = controlplane.StatusFailed
-		res.Error = controlplane.TruncateError(err.Error())
+		res.ErrorCode = tenantErrorCode(err)
 	}
 	auditTenantAction(auditActionTenantDeprovision, data, res, err)
 	publishTenantResult(nc, controlplane.DeprovisionedSubject(req.JobID), res)
+}
+
+// tenantErrorCode maps a pki provisioning error to the fixed code
+// published on the bus. Only pki's own sentinel errors get a specific
+// code; everything else — wrapped filesystem, database and resolver-push
+// errors, whose text can carry paths and internal detail — is
+// ErrorInternal.
+func tenantErrorCode(err error) controlplane.ErrorCode {
+	switch {
+	case errors.Is(err, pki.ErrTenantIDInvalid):
+		return controlplane.ErrorInvalidTenantID
+	case errors.Is(err, pki.ErrTenantNotFound):
+		return controlplane.ErrorTenantNotFound
+	default:
+		return controlplane.ErrorInternal
+	}
 }
 
 func publishTenantResult(nc *nats.Conn, subject string, res controlplane.TenantResult) {

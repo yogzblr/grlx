@@ -3,7 +3,6 @@ package controlplane
 import (
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func TestValidJobID(t *testing.T) {
@@ -41,18 +40,19 @@ func TestResultSubjectsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestTruncateError(t *testing.T) {
-	short := "boom"
-	if got := TruncateError(short); got != short {
-		t.Fatalf("TruncateError(short) = %q", got)
+func TestPublicErrorMessage(t *testing.T) {
+	for _, code := range []ErrorCode{ErrorInvalidTenantID, ErrorTenantNotFound, ErrorInternal} {
+		if PublicErrorMessage(code) == "" {
+			t.Errorf("no public message for %q", code)
+		}
 	}
-	// 'é' is two bytes; make the MaxErrorLen boundary land mid-rune.
-	long := "x" + strings.Repeat("é", MaxErrorLen)
-	got := TruncateError(long)
-	if len(got) > MaxErrorLen {
-		t.Fatalf("len = %d, want <= %d", len(got), MaxErrorLen)
+	// Anything unrecognized — including text that looks like a leaked
+	// error — maps to the generic message, never echoed back.
+	leaked := ErrorCode("mkdir /etc/grlx/pki/nats-auth/tenants: not a directory")
+	if got := PublicErrorMessage(leaked); got != PublicErrorMessage(ErrorInternal) {
+		t.Fatalf("PublicErrorMessage(unknown) = %q, want the internal-error message", got)
 	}
-	if !utf8.ValidString(got) {
-		t.Fatal("truncation split a UTF-8 sequence")
+	if got := PublicErrorMessage(""); got != PublicErrorMessage(ErrorInternal) {
+		t.Fatalf("PublicErrorMessage(\"\") = %q", got)
 	}
 }
