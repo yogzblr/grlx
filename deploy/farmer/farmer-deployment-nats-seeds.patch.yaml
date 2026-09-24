@@ -1,0 +1,50 @@
+# Reference strategic-merge patch for farmer's Deployment (and, for the
+# SYS seed, farmerbus's — see README.md). NOT applied by anything in this
+# repo: farmer's real Deployment/Helm chart lives in the separate ops repo.
+# This file is the exact volume / mount / env-var set to add there.
+#
+# What it does: hands farmer the SYS Account NKey seed (and the SaaS API
+# User seed, which the design doc already sources this way) from OpenBao,
+# via the Kubernetes Secret External Secrets Operator keeps in sync
+# (externalsecrets.yaml, "grlx-farmer-nats-seeds"). No code change is
+# needed: internal/pki/jwtauth.go's loadOrCreateSeed(path, "SYS_ACCOUNT",
+# nkeys.CreateAccount) already prefers GRLX_NATS_SYS_ACCOUNT_SEED_FILE over
+# {FarmerPKI}/nats-auth/sys-account.nk, and never writes an externally
+# supplied seed back to disk.
+#
+# !! Before rolling this out on an existing install, store farmer's CURRENT
+# {FarmerPKI}/nats-auth/sys-account.nk in OpenBao — do not generate a new
+# one. A different SYS seed means a different SYS Account public key, which
+# re-mints operator.jwt (it names the system account) and breaks trust with
+# every bus node still configured with the old one. See README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grlx-farmer
+spec:
+  template:
+    spec:
+      containers:
+        - name: farmer
+          env:
+            - name: GRLX_NATS_SYS_ACCOUNT_SEED_FILE
+              value: /var/run/secrets/grlx/nats/sys-account.nk
+            - name: GRLX_NATS_SAASAPI_USER_SEED_FILE
+              value: /var/run/secrets/grlx/nats/saasapi-user.nk
+            # Deliberately absent: every GRLX_SAASAPI_CRED_OPENBAO_* var.
+            # farmer's long-running process must never be configured with
+            # (or able to log in as) the KV-write identity — see README.md.
+          volumeMounts:
+            - name: nats-seeds
+              mountPath: /var/run/secrets/grlx/nats
+              readOnly: true
+      volumes:
+        - name: nats-seeds
+          secret:
+            secretName: grlx-farmer-nats-seeds
+            defaultMode: 0440
+            items:
+              - key: sys-account.nk
+                path: sys-account.nk
+              - key: saasapi-user.nk
+                path: saasapi-user.nk
