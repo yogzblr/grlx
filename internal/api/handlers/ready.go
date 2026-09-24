@@ -1,12 +1,13 @@
 package handlers
 
 // GET /ready — farmer's Kubernetes readiness signal, the counterpart to
-// GetHealth's liveness-only GET /health (health.go). /health stays cheap
-// and dependency-free on purpose: a liveness probe that checked PXC or
-// Valkey would get every replica restarted during a shared-dependency
-// outage, which fixes nothing. /ready is what should flip instead — it
-// tells Kubernetes whether to route to this replica, and whether a rolling
-// deployment's new pod is safe to proceed on.
+// GetHealth's liveness GET /health (health.go). /health stays cheap and
+// never checks whether a dependency is reachable: a liveness probe that
+// pinged PXC or Valkey would get every replica restarted during a
+// shared-dependency outage, which fixes nothing. (It does check that a
+// Valkey client exists at all; see GetHealth.) /ready is what should flip
+// instead — it tells Kubernetes whether to route to this replica, and
+// whether a rolling deployment's new pod is safe to proceed on.
 
 import (
 	"context"
@@ -78,7 +79,8 @@ func SetReadinessDB(db *gorm.DB) {
 }
 
 // SetReadinessValkey installs the Valkey client GET /ready pings — the
-// same client heartbeat.SetClient was given.
+// same client heartbeat.SetClient was given. Whether it's been called with
+// a non-nil client is also what GET /health's liveness check looks at.
 func SetReadinessValkey(c valkey.Client) {
 	if c == nil {
 		valkeyPing = nil
@@ -88,6 +90,9 @@ func SetReadinessValkey(c valkey.Client) {
 		return c.Do(ctx, c.B().Ping().Build()).Error()
 	}
 }
+
+// valkeyConfigured reports whether a Valkey client has been installed.
+func valkeyConfigured() bool { return valkeyPing != nil }
 
 // SetTenantConnStats installs the function GET /ready reads per-tenant NATS
 // connection state from.

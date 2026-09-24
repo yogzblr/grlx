@@ -176,9 +176,10 @@ func TestGetReady_NotConfigured(t *testing.T) {
 	}
 }
 
-// /health must stay dependency-free: it reports ok even when every
-// readiness dependency is down or missing.
-func TestGetHealth_IgnoresReadinessDependencies(t *testing.T) {
+// /health never checks reachability: with a Valkey client installed it
+// reports ok even when Valkey, PXC, and every tenant connection are down,
+// so a shared-dependency outage can't restart every replica at once.
+func TestGetHealth_IgnoresDependencyReachability(t *testing.T) {
 	setReadyDeps(t, nil, valkeyDown, func() TenantConnStats { return TenantConnStats{} })
 
 	w := httptest.NewRecorder()
@@ -190,7 +191,7 @@ func TestGetHealth_IgnoresReadinessDependencies(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Status != "ok" {
-		t.Errorf("status = %q, want ok", body.Status)
+	if body.Status != "ok" || body.Valkey != "ok" {
+		t.Errorf("status/valkey = %q/%q, want ok/ok", body.Status, body.Valkey)
 	}
 }

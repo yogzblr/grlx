@@ -7,10 +7,25 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/valkey-io/valkey-go"
+
+	"github.com/gogrlx/grlx/v2/internal/api/handlers"
 	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
+// installedValkey stands in for a Valkey client that exists. GET /health
+// only checks that one was installed and never calls it, so the embedded
+// nil valkey.Client is never used.
+type installedValkey struct{ valkey.Client }
+
+func withValkeyClient(t *testing.T) {
+	t.Helper()
+	handlers.SetReadinessValkey(installedValkey{})
+	t.Cleanup(func() { handlers.SetReadinessValkey(nil) })
+}
+
 func TestNewRouterHealthEndpoint(t *testing.T) {
+	withValkeyClient(t)
 	// Set up a temporary recipe directory so the file server has
 	// a valid root (NewRouter reads config.RecipeDir).
 	tmpDir := t.TempDir()
