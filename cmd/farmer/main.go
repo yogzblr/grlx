@@ -255,17 +255,31 @@ func initStorage() {
 // replica needs to be able to serve any recipe. Git remains the source of
 // truth; syncing a merged commit into this bucket is a deploy-time
 // concern, not something farmer does at runtime.
+//
+// The store is checked before boot continues, retrying with exponential
+// backoff (objectstore.DefaultRetryPolicy, about 90s) so a MinIO that's
+// still starting alongside farmer doesn't fail it. If the store is still
+// unreachable after that, startup fails and Kubernetes' restart backoff
+// takes over, as with the other backends here. SIGINT/SIGTERM during the
+// wait aborts it.
 func initRecipeStore() {
-	store, err := objectstore.Open(objectstore.Config{
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	policy := objectstore.DefaultRetryPolicy()
+	policy.OnRetry = func(attempt int, wait time.Duration, err error) {
+		log.Errorf("recipe object store not ready (attempt %d/%d), retrying in %s: %v", attempt, policy.MaxAttempts, wait.Round(time.Millisecond), err)
+	}
+	store, err := objectstore.Connect(ctx, objectstore.Config{
 		Endpoint:        config.S3Endpoint,
 		AccessKeyID:     config.S3AccessKeyID,
 		SecretAccessKey: config.S3SecretAccessKey,
 		UseSSL:          config.S3UseSSL,
 		Bucket:          config.S3Bucket,
-	})
+	}, policy)
 	if err != nil {
-		log.Fatalf("failed to open recipe object store: %v", err)
+		log.Fatalf("failed to connect to recipe object store: %v", err)
 	}
+	log.Infof("Connected to recipe object store %s (bucket %s)", config.S3Endpoint, config.S3Bucket)
 	cook.SetStore(store)
 	handlers.SetRecipeStore(store)
 }

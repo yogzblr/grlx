@@ -22,6 +22,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
 // Store is a thin, bucket-scoped wrapper around a minio-go client.
@@ -41,16 +42,18 @@ type Config struct {
 	Bucket string
 }
 
-// Open connects to the configured S3/MinIO endpoint. It does not verify
-// the bucket exists — callers find that out on first use, the same way a
-// misconfigured RecipeDir only surfaced on first read under the old
-// local-disk store.
+// Open builds a client for the configured S3/MinIO endpoint. It makes no
+// network calls, so it does not verify the endpoint is reachable or the
+// bucket exists — use Connect for that (with retries), or Ping.
 func Open(cfg Config) (*Store, error) {
 	if cfg.Endpoint == "" {
 		return nil, fmt.Errorf("objectstore: empty endpoint")
 	}
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("objectstore: empty bucket")
+	}
+	if err := s3utils.CheckValidBucketName(cfg.Bucket); err != nil {
+		return nil, fmt.Errorf("objectstore: invalid bucket %q: %w", cfg.Bucket, err)
 	}
 	client, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),

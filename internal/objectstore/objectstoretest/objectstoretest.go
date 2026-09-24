@@ -7,9 +7,10 @@
 // and internal/cook's both need it.
 //
 // It doesn't validate request signing, and understands just enough of
-// the protocol (GET/PUT/HEAD, ListObjectsV2, GetBucketLocation, and
-// aws-chunked streaming-signature bodies) for minio-go's client to
-// consider it a working single-node endpoint.
+// the protocol (GET/PUT/HEAD on objects, HEAD on the bucket,
+// ListObjectsV2, GetBucketLocation, and aws-chunked streaming-signature
+// bodies) for minio-go's client to consider it a working single-node
+// endpoint.
 package objectstoretest
 
 import (
@@ -31,6 +32,54 @@ const bucket = "test-bucket"
 type fakeS3 struct {
 	mu   sync.Mutex
 	data map[string][]byte // key -> content, within the fixed test bucket
+
+	// failures queues injected error responses (see Server.FailNext),
+	// consumed one per request.
+	failures []failure
+}
+
+type failure struct {
+	status int
+	code   string
+}
+
+// Server is a handle on a fake S3 server, for tests that open their own
+// clients against it (e.g. objectstore.Connect) or inject failures.
+type Server struct {
+	f   *fakeS3
+	srv *httptest.Server
+}
+
+// NewServer starts an in-process fake S3 server, closed automatically via
+// t.Cleanup.
+func NewServer(t *testing.T) *Server {
+	t.Helper()
+	s := startServer()
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+// Config returns an objectstore.Config pointing at this server's bucket.
+func (s *Server) Config() objectstore.Config {
+	return objectstore.Config{
+		Endpoint:        strings.TrimPrefix(s.srv.URL, "http://"),
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		Bucket:          bucket,
+	}
+}
+
+// FailNext makes the next n requests fail with the given HTTP status and
+// S3 error code (e.g. 404/"NoSuchBucket", 403/"AccessDenied"). Bucket
+// location lookups aren't counted: minio-go makes them only on some calls
+// and treats some of their errors as non-fatal, so counting them would
+// make tests depend on minio-go internals.
+func (s *Server) FailNext(n int, status int, code string) {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	for range n {
+		s.f.failures = append(s.f.failures, failure{status: status, code: code})
+	}
 }
 
 // NewStore starts an in-process fake S3 server and returns an
@@ -61,11 +110,10 @@ func NewStoreForBinary() (store *objectstore.Store, closeFn func(), err error) {
 // other. The server is closed automatically via t.Cleanup.
 func NewSharedStores(t *testing.T, n int) []*objectstore.Store {
 	t.Helper()
-	srv := startServer()
-	t.Cleanup(srv.Close)
+	srv := NewServer(t)
 	stores := make([]*objectstore.Store, n)
 	for i := range stores {
-		s, err := openStore(srv)
+		s, err := objectstore.Open(srv.Config())
 		if err != nil {
 			t.Fatalf("objectstoretest: opening shared fake store %d: %v", i, err)
 		}
@@ -76,24 +124,17 @@ func NewSharedStores(t *testing.T, n int) []*objectstore.Store {
 
 func newStore() (*objectstore.Store, func(), error) {
 	srv := startServer()
-	store, err := openStore(srv)
+	store, err := objectstore.Open(srv.Config())
 	if err != nil {
-		srv.Close()
+		srv.srv.Close()
 		return nil, nil, err
 	}
-	return store, srv.Close, nil
+	return store, srv.srv.Close, nil
 }
 
-func startServer() *httptest.Server {
+func startServer() *Server {
 	f := &fakeS3{data: make(map[string][]byte)}
-	return httptest.NewServer(http.HandlerFunc(f.handle))
-}
-
-func openStore(srv *httptest.Server) (*objectstore.Store, error) {
-	endpoint := strings.TrimPrefix(srv.URL, "http://")
-	return objectstore.Open(objectstore.Config{
-		Endpoint: endpoint, AccessKeyID: "test", SecretAccessKey: "test", Bucket: bucket,
-	})
+	return &Server{f: f, srv: httptest.NewServer(http.HandlerFunc(f.handle))}
 }
 
 // Seed uploads files (key -> content) directly into the fake server's
@@ -110,8 +151,9 @@ func Seed(t *testing.T, store *objectstore.Store, files map[string]string) {
 
 func (f *fakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
-	// parts[0] is always the bucket name; every request in this test
-	// harness targets the same fixed bucket, so it's read but not checked.
+	// parts[0] is the bucket name. Object requests aren't checked against
+	// it (every test targets the same fixed bucket); a bucket-level HEAD
+	// (objectstore.Ping) is, so tests can exercise a missing bucket.
 	var key string
 	if len(parts) > 1 {
 		key = parts[1]
@@ -119,6 +161,25 @@ func (f *fakeS3) handle(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if _, isLocation := r.URL.Query()["location"]; !isLocation && len(f.failures) > 0 {
+		fail := f.failures[0]
+		f.failures = f.failures[1:]
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(fail.status)
+		w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` +
+			`<Error><Code>` + fail.code + `</Code><Message>injected failure</Message></Error>`))
+		return
+	}
+
+	if r.Method == http.MethodHead && key == "" {
+		if parts[0] == bucket {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPut:
