@@ -365,12 +365,12 @@ func ProvisionTenant(tenantID, name string) error {
 }
 
 // DeprovisionTenant reverses ProvisionTenant: it marks tenantID deleted in
-// the pki_tenants registry and pushes an already-expired Account JWT to the
-// resolver so the bus stops trusting any User JWT issued under it,
-// effective immediately (NATS enforces an Account's own Expires the same
-// way it enforces a revoked User). It does not delete on-disk key material
-// or sprout state — only ProvisionTenant re-establishing trust can bring a
-// deprovisioned tenant back, deliberately (see ensureTenantAccount).
+// the pki_tenants registry and pushes a locked-out Account JWT to the
+// resolver (see lockOutAccount), so the bus closes the tenant's live
+// connections and refuses new ones, effective immediately. It does not
+// delete on-disk key material or sprout state — only ProvisionTenant
+// re-establishing trust can bring a deprovisioned tenant back,
+// deliberately (see ensureTenantAccount).
 func DeprovisionTenant(tenantID string) error {
 	if !IsValidTenantID(tenantID) {
 		return ErrTenantIDInvalid
@@ -390,10 +390,10 @@ func DeprovisionTenant(tenantID string) error {
 		return nil
 	}
 	if err := pushAccountUpdate(mat, signedJWT); err != nil {
-		log.Errorf("failed to push tenant %q's expired Account JWT to the bus resolver: %v", tenantID, err)
+		log.Errorf("failed to push tenant %q's locked-out Account JWT to the bus resolver: %v", tenantID, err)
 		return err
 	}
-	log.Infof("Deprovisioned tenant %q: Account JWT expired and pushed to the bus resolver.", tenantID)
+	log.Infof("Deprovisioned tenant %q: locked-out Account JWT pushed to the bus resolver.", tenantID)
 	// See OnTenantDeprovisioned's doc comment: lets cmd/farmer/main.go close
 	// this tenant's NATS connection and unregister its handlers.
 	if tenantDeprovisionedHook != nil {
@@ -403,9 +403,9 @@ func DeprovisionTenant(tenantID string) error {
 }
 
 // deprovisionTenantLocked is DeprovisionTenant's tenantAuthMu-guarded body:
-// it marks tenantID deleted and re-signs its Account JWT with Expires set
-// to now, but leaves the actual bus push to the caller (network I/O
-// shouldn't happen while holding this lock).
+// it marks tenantID deleted and re-signs its Account JWT locked out (see
+// lockOutAccount), but leaves the actual bus push to the caller (network
+// I/O shouldn't happen while holding this lock).
 func deprovisionTenantLocked(mat *natsAuthMaterial, tenantID string) (signedJWT string, alreadyDeleted bool, err error) {
 	tenantAuthMu.Lock()
 	defer tenantAuthMu.Unlock()
@@ -425,10 +425,10 @@ func deprovisionTenantLocked(mat *natsAuthMaterial, tenantID string) (signedJWT 
 	if err != nil {
 		return "", false, fmt.Errorf("pki: decoding tenant %q's Account JWT: %w", tenantID, err)
 	}
-	ac.Expires = time.Now().Unix()
+	lockOutAccount(ac, time.Now())
 	signed, err := ac.Encode(mat.operatorSigningKP)
 	if err != nil {
-		return "", false, fmt.Errorf("pki: re-signing tenant %q's Account JWT with Expires set: %w", tenantID, err)
+		return "", false, fmt.Errorf("pki: re-signing tenant %q's Account JWT locked out: %w", tenantID, err)
 	}
 	if err := os.WriteFile(tenantAccountJWTPath(tenantID), []byte(signed), 0o600); err != nil {
 		return "", false, err
@@ -437,6 +437,30 @@ func deprovisionTenantLocked(mat *natsAuthMaterial, tenantID string) (signedJWT 
 		return "", false, err
 	}
 	return signed, false, nil
+}
+
+// lockOutAccount edits ac so that, once pushed, the bus closes every
+// connection under the Account and accepts no new ones:
+//
+//   - Every User JWT issued up to now is revoked (jwt.All). The server
+//     closes live connections that use a revoked JWT when it applies the
+//     update, and rejects them at connect time afterwards.
+//   - The connection limits drop to 0, which also kicks any remaining
+//     client and refuses connections with a User JWT minted after now,
+//     which the revocation alone wouldn't cover.
+//
+// It deliberately does not set Expires, which is what deprovisioning used
+// to do (Expires = now). A running nats-server validates an update to an
+// Account it already has loaded with time checks included, and rejects a
+// claim whose exp is already in the past. So a push that reached the bus
+// even one second after signing was dropped, and the tenant's old,
+// unlocked claims stayed live. Revocations and limits have no such time
+// check, so a late push still takes effect.
+func lockOutAccount(ac *jwt.AccountClaims, now time.Time) {
+	ac.Expires = 0
+	ac.RevokeAt(jwt.All, now)
+	ac.Limits.Conn = 0
+	ac.Limits.LeafNodeConn = 0
 }
 
 // syncTenantSprouts is syncNatsAuth (jwtusers.go) parameterized by an

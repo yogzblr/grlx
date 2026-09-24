@@ -10,7 +10,10 @@ package pki
 
 import (
 	"testing"
+	"time"
 
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
@@ -147,5 +150,93 @@ func TestDeprovisionTenant_RevokesLiveBusAccess(t *testing.T) {
 
 	if _, err := dialAsSprout(t, sproutJWT, sproutSeed); err == nil {
 		t.Fatal("expected the same sprout JWT to be rejected after its tenant was deprovisioned")
+	}
+}
+
+// TestDeprovisionTenant_LatePushStillLocksOut is the regression test for
+// deprovisioning by Expires = now: a running nats-server rejects an update
+// to an already-loaded Account whose exp is in the past, so a push that
+// reached the bus a second or more after signing was dropped and the
+// tenant stayed connected. This signs the lockout, waits past the next
+// second boundary, and only then pushes it. The bus must still close the
+// sprout's live connection, refuse that sprout reconnecting, and refuse a
+// User JWT minted under the Account after deprovisioning.
+func TestDeprovisionTenant_LatePushStillLocksOut(t *testing.T) {
+	setupTestPKI(t)
+	useRealFarmerKey(t)
+	defer startTestBus(t)()
+
+	const tenantID = "t_late_push"
+	if err := ProvisionTenant(tenantID, "Late Push Co"); err != nil {
+		t.Fatalf("ProvisionTenant: %v", err)
+	}
+	sproutKP, _ := nkeys.CreateUser()
+	sproutPub, _ := sproutKP.PublicKey()
+	sproutSeed, _ := sproutKP.Seed()
+	if err := upsertNKeyRow(nkeyRow{TenantID: tenantID, SproutID: "web-01", NKey: sproutPub, State: stateAccepted}); err != nil {
+		t.Fatalf("upsertNKeyRow: %v", err)
+	}
+	if err := ReloadNKeysForTenant(tenantID); err != nil {
+		t.Fatalf("ReloadNKeysForTenant: %v", err)
+	}
+	sproutJWT, err := GetSproutUserJWTForTenant(tenantID, "web-01")
+	if err != nil {
+		t.Fatalf("GetSproutUserJWTForTenant: %v", err)
+	}
+
+	// A sprout that stays connected across the deprovisioning.
+	closed := make(chan struct{})
+	live, err := dialAsSprout(t, sproutJWT, sproutSeed,
+		nats.NoReconnect(),
+		nats.ClosedHandler(func(*nats.Conn) { close(closed) }),
+	)
+	if err != nil {
+		t.Fatalf("expected sprout to connect before deprovisioning: %v", err)
+	}
+	defer live.Close()
+
+	mat, err := ensureNatsAuth()
+	if err != nil {
+		t.Fatalf("ensureNatsAuth: %v", err)
+	}
+	signed, _, err := deprovisionTenantLocked(mat, tenantID)
+	if err != nil {
+		t.Fatalf("deprovisionTenantLocked: %v", err)
+	}
+	// The failure mode needs the push to land in a later wall-clock second
+	// than the signing; 1.1s guarantees that.
+	time.Sleep(1100 * time.Millisecond)
+	if err := pushAccountUpdate(mat, signed); err != nil {
+		t.Fatalf("pushAccountUpdate: %v", err)
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the bus to close the sprout's live connection after a late push")
+	}
+	if nc, err := dialAsSprout(t, sproutJWT, sproutSeed); err == nil {
+		nc.Close()
+		t.Fatal("expected the sprout's JWT to be rejected after its tenant was deprovisioned")
+	}
+
+	// A User JWT issued after the revocation isn't covered by it; the
+	// Account's connection limit of 0 must refuse it anyway.
+	tam, err := loadTenantAccountMaterial(tenantID)
+	if err != nil {
+		t.Fatalf("loadTenantAccountMaterial: %v", err)
+	}
+	freshKP, _ := nkeys.CreateUser()
+	freshPub, _ := freshKP.PublicKey()
+	freshSeed, _ := freshKP.Seed()
+	uc := jwt.NewUserClaims(freshPub)
+	uc.IssuerAccount = tam.pub
+	freshJWT, err := uc.Encode(tam.signingKP)
+	if err != nil {
+		t.Fatalf("minting fresh User JWT: %v", err)
+	}
+	if nc, err := dialAsSprout(t, freshJWT, freshSeed); err == nil {
+		nc.Close()
+		t.Fatal("expected a User JWT minted after deprovisioning to be rejected too")
 	}
 }

@@ -109,7 +109,7 @@ func (testNoopLogger) Tracef(string, ...any)  {}
 // dialAsSprout attempts to connect to the test bus authenticated with the
 // given sprout User JWT + NKey seed. It never fatals: callers assert on the
 // returned error so both the happy and the revoked path can be tested.
-func dialAsSprout(t *testing.T, sproutJWT string, seed []byte) (*nats.Conn, error) {
+func dialAsSprout(t *testing.T, sproutJWT string, seed []byte, extra ...nats.Option) (*nats.Conn, error) {
 	t.Helper()
 	rootPEM, err := os.ReadFile(config.RootCA)
 	if err != nil {
@@ -120,12 +120,13 @@ func dialAsSprout(t *testing.T, sproutJWT string, seed []byte) (*nats.Conn, erro
 		t.Fatalf("failed to parse root CA")
 	}
 	tlsCfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
-	return nats.Connect(config.FarmerBusURL,
+	opts := append([]nats.Option{
 		nats.Secure(tlsCfg),
 		nats.UserJWTAndSeed(sproutJWT, string(seed)),
-		nats.Timeout(5*time.Second),
+		nats.Timeout(5 * time.Second),
 		nats.RetryOnFailedConnect(false),
-	)
+	}, extra...)
+	return nats.Connect(config.FarmerBusURL, opts...)
 }
 
 func TestJWTLifecycle_AcceptGrantsDenyRevokesReacceptRestores(t *testing.T) {

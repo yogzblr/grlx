@@ -4,6 +4,10 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nkeys"
 
 	"github.com/gogrlx/grlx/v2/internal/config"
 )
@@ -167,5 +171,40 @@ func TestTenantLookup_NotFoundVsDBError(t *testing.T) {
 	}
 	if err := ProvisionTenant("t_absent", "x"); err == nil || errors.Is(err, ErrTenantNotFound) {
 		t.Fatalf("ProvisionTenant with a broken DB = %v, want a real lookup error", err)
+	}
+}
+
+func TestLockOutAccount(t *testing.T) {
+	kp, _ := nkeys.CreateAccount()
+	pub, _ := kp.PublicKey()
+	ac := jwt.NewAccountClaims(pub)
+	ac.Expires = 123
+	now := time.Unix(1_700_000_000, 0)
+
+	lockOutAccount(ac, now)
+
+	if ac.Expires != 0 {
+		t.Errorf("Expires = %d, want 0 (a past exp makes a live server drop the update)", ac.Expires)
+	}
+	if got := ac.Revocations[jwt.All]; got != now.Unix() {
+		t.Errorf("Revocations[*] = %d, want %d", got, now.Unix())
+	}
+	if ac.Limits.Conn != 0 || ac.Limits.LeafNodeConn != 0 {
+		t.Errorf("connection limits = %d/%d, want 0/0", ac.Limits.Conn, ac.Limits.LeafNodeConn)
+	}
+
+	// The lockout survives an encode/decode round trip (Conn is omitempty,
+	// so 0 must still decode as 0, not as "no limit").
+	opKP, _ := nkeys.CreateOperator()
+	signed, err := ac.Encode(opKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := jwt.DecodeAccountClaims(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Limits.Conn != 0 || back.Revocations[jwt.All] != now.Unix() || back.Expires != 0 {
+		t.Errorf("decoded lockout = conn %d, revoked-at %d, exp %d", back.Limits.Conn, back.Revocations[jwt.All], back.Expires)
 	}
 }
