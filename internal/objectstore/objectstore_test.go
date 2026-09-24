@@ -108,4 +108,7 @@ func TestOpenValidation(t *testing.T) {
 	if _, err := objectstore.Open(objectstore.Config{Endpoint: "localhost:9000"}); err == nil {
 		t.Error("expected an error for an empty bucket")
 	}
+	if _, err := objectstore.Open(objectstore.Config{Endpoint: "localhost:9000", Bucket: "x"}); err == nil {
+		t.Error("expected an error for an invalid bucket name")
+	}
 }

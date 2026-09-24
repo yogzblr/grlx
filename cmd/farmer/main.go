@@ -131,7 +131,7 @@ func main() {
 	fmt.Printf("Starting Farmer (core) with bus URL %s\n", config.FarmerBusURL)
 	defer log.Flush()
 	initStorage()
-	initRecipeStore()
+	recipeStore := initRecipeStore()
 	initGatewaySigner()
 	initHeartbeatClient()
 	props.LoadStaticProps(config.StaticProps())
@@ -179,6 +179,9 @@ func main() {
 	// ReloadNKeysForTenant's lazy provisioning path).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if recipeStore != nil {
+		go waitForRecipeStore(ctx, recipeStore)
+	}
 	// See docs/design/grlx-tenant-context-threading.md's Option A: a
 	// newly-provisioned tenant (explicit ProvisionTenant, or enroll.go's
 	// lazy ReloadNKeysForTenant path) gets its own dedicated NATS
@@ -255,7 +258,14 @@ func initStorage() {
 // replica needs to be able to serve any recipe. Git remains the source of
 // truth; syncing a merged commit into this bucket is a deploy-time
 // concern, not something farmer does at runtime.
-func initRecipeStore() {
+//
+// The object store is never a reason for farmer to exit or wait. Open
+// makes no network calls, so the store is installed immediately and
+// returned for waitForRecipeStore to check in the background. Until it's
+// reachable, recipe requests fail individually, then succeed without a
+// restart. If it isn't configured at all, this logs, returns nil, and
+// recipe requests fail with "recipe store not configured".
+func initRecipeStore() *objectstore.Store {
 	store, err := objectstore.Open(objectstore.Config{
 		Endpoint:        config.S3Endpoint,
 		AccessKeyID:     config.S3AccessKeyID,
@@ -264,10 +274,33 @@ func initRecipeStore() {
 		Bucket:          config.S3Bucket,
 	})
 	if err != nil {
-		log.Fatalf("failed to open recipe object store: %v", err)
+		log.Errorf("recipe object store not configured (recipe requests will fail until it is): %v", err)
+		return nil
 	}
 	cook.SetStore(store)
 	handlers.SetRecipeStore(store)
+	return store
+}
+
+// waitForRecipeStore checks the recipe store with exponential backoff
+// (objectstore.DefaultRetryPolicy, about 90s) and logs the outcome, so an
+// unreachable store or missing bucket shows up in the logs at boot rather
+// than on the first cook. It only reports: it doesn't block anything, and
+// giving up changes nothing about how requests are served. It stops
+// quietly when ctx (farmer's shutdown context) is cancelled.
+func waitForRecipeStore(ctx context.Context, store *objectstore.Store) {
+	policy := objectstore.DefaultRetryPolicy()
+	policy.OnRetry = func(attempt int, wait time.Duration, err error) {
+		log.Errorf("recipe object store not ready (attempt %d/%d), retrying in %s: %v", attempt, policy.MaxAttempts, wait.Round(time.Millisecond), err)
+	}
+	if err := store.WaitReady(ctx, policy); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		log.Errorf("recipe object store still unreachable after retries (recipe requests will fail until it's back): %v", err)
+		return
+	}
+	log.Infof("Connected to recipe object store %s (bucket %s)", config.S3Endpoint, config.S3Bucket)
 }
 
 // initGatewaySigner wires up the OpenBao Transit-backed signer for

@@ -90,3 +90,47 @@ func seedRecipeFixtures(store *objectstore.Store, dir string) error {
 		return store.Put(context.Background(), path, data)
 	})
 }
+
+// useRecipeStore installs s as this package's recipe store for the rest of
+// t, restoring the binary-wide fixture store (see TestMain) afterwards —
+// the same swap-and-restore pattern internal/api/handlers/recipes_test.go
+// uses for its recipeStore.
+func useRecipeStore(t *testing.T, s *objectstore.Store) {
+	t.Helper()
+	orig := store
+	SetStore(s)
+	t.Cleanup(func() { SetStore(orig) })
+}
+
+// newRecipeTestStore gives t its own empty objectstoretest-backed recipe
+// store, with config.RecipeDir (the recipe key prefix, see getBasePath)
+// pointed at a fixed prefix within it, and returns that prefix. Tests write
+// recipes with writeRecipe and read them back with mustReadRecipe — both
+// go through the store, never local disk.
+func newRecipeTestStore(t *testing.T) string {
+	t.Helper()
+	useRecipeStore(t, objectstoretest.NewStore(t))
+	const prefix = "recipes"
+	orig := config.RecipeDir
+	config.RecipeDir = prefix
+	t.Cleanup(func() { config.RecipeDir = orig })
+	t.Setenv(RecipeDirEnvVar, "")
+	return prefix
+}
+
+// writeRecipe puts content at key in the current recipe store.
+func writeRecipe(t *testing.T, key, content string) {
+	t.Helper()
+	objectstoretest.Seed(t, store, map[string]string{key: content})
+}
+
+// mustReadRecipe reads key back through readRecipe — the same read path
+// recipe resolution itself uses.
+func mustReadRecipe(t *testing.T, key string) []byte {
+	t.Helper()
+	data, err := readRecipe(context.Background(), key)
+	if err != nil {
+		t.Fatalf("read recipe %s: %v", key, err)
+	}
+	return data
+}

@@ -1447,27 +1447,33 @@ func TestSendCookEventInvalidRecipe(t *testing.T) {
 // since deleting an exported error is its own compatibility break.
 
 func TestResolveRecipeFilePathDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	_, err := ResolveRecipeFilePath(tmpDir, RecipeName("test.grlx"))
+	// A prefix with nothing under it — the object-storage analogue of an
+	// empty recipe directory.
+	_, err := ResolveRecipeFilePath(context.Background(), "empty-prefix", RecipeName("test.grlx"))
 	if !errors.Is(err, ErrNoRecipe) {
 		t.Errorf("expected ErrNoRecipe, got %v", err)
 	}
 }
 
 func TestResolveRecipeFilePathInitIsDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
+	// Only a deeper key exists under "<name>/init.grlx/" — on local disk
+	// init.grlx would have been a directory; in a bucket it's simply not
+	// a key.
+	recipeDir := newRecipeTestStore(t)
+	writeRecipe(t, filepath.Join(recipeDir, "myrecipe", "init.grlx", "nested.grlx"), "steps: {}\n")
 
-	_, err := ResolveRecipeFilePath(tmpDir, RecipeName("myrecipe"))
+	_, err := ResolveRecipeFilePath(context.Background(), recipeDir, RecipeName("myrecipe"))
 	if !errors.Is(err, ErrNoRecipe) {
 		t.Errorf("expected ErrNoRecipe, got %v", err)
 	}
 }
 
 func TestResolveRecipeFilePathExtIsDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
+	// Likewise for "<name>.grlx" existing only as a prefix of deeper keys.
+	recipeDir := newRecipeTestStore(t)
+	writeRecipe(t, filepath.Join(recipeDir, "myrecipe.grlx", "nested.grlx"), "steps: {}\n")
 
-	_, err := ResolveRecipeFilePath(tmpDir, RecipeName("myrecipe"))
+	_, err := ResolveRecipeFilePath(context.Background(), recipeDir, RecipeName("myrecipe"))
 	if !errors.Is(err, ErrNoRecipe) {
 		t.Errorf("expected ErrNoRecipe, got %v", err)
 	}

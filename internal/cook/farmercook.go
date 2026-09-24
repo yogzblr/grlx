@@ -97,66 +97,18 @@ func populateFuncMap(tenantID, sproutID string) template.FuncMap {
 // SendCookEvent triggers a recipe cook on sproutID, over tenantID's
 // dedicated NATS connection (see RegisterFarmerNatsConn) — the sprout's own
 // tenant, not necessarily whichever tenant happens to be "current" for the
-// process.
+// process. It is SendCookEventContext with context.Background().
 func SendCookEvent(tenantID, sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
-	basepath := getBasePath()
-	includes, err := collectAllIncludes(tenantID, sproutID, basepath, recipeID)
-	if err != nil {
-		return err
-	}
-	recipesteps := make(map[string]interface{})
-	for _, inc := range includes {
-		// load all imported files into recipefile list
-		fp, fpErr := ResolveRecipeFilePath(basepath, inc)
-		if fpErr != nil {
-			log.Errorf("could not find include %s: %v", inc, err)
-			return errors.Join(ErrNoRecipe, fpErr)
-		}
-		f, fpErr := store.Get(context.Background(), fp)
-		if fpErr != nil {
-			return fpErr
-		}
-		b, renderErr := renderRecipeTemplate(tenantID, sproutID, fp, f)
-		if renderErr != nil {
-			return renderErr
-		}
-		var recipe map[string]interface{}
-		marshallErr := yaml.Unmarshal(b, &recipe)
-		if marshallErr != nil {
-			return marshallErr
-		}
-		m, loadErr := stepsFromMap(recipe)
-		if loadErr != nil {
-			return loadErr
-		}
-		// range over all keys under each recipe ID for matching ingredients
-		recipesteps, err = joinMaps(recipesteps, m)
-		if err != nil {
-			return err
-		}
-	}
-	for id, step := range recipesteps {
-		switch s := step.(type) {
-		case map[string]interface{}:
-			if len(s) != 1 {
-				return errors.Join(ErrInvalidFormat, fmt.Errorf("recipe %s must have one directive, but has %d", id, len(s)))
-			}
+	return SendCookEventContext(context.Background(), tenantID, sproutID, recipeID, JID, test, opts...)
+}
 
-		default:
-			return errors.Join(ErrInvalidFormat, fmt.Errorf("recipe %s must me a map[string]interface{} but found %T", id, step))
-		}
-	}
-	steps, err := makeRecipeSteps(recipesteps)
+// SendCookEventContext is SendCookEvent with a caller-supplied context,
+// which bounds the recipe reads from object storage that prepare the
+// dispatch.
+func SendCookEventContext(ctx context.Context, tenantID, sproutID string, recipeID RecipeName, JID string, test bool, opts ...CookOption) error {
+	validSteps, err := resolveRecipeSteps(ctx, tenantID, sproutID, recipeID)
 	if err != nil {
 		return err
-	}
-	tree, err := validateRecipeTree(steps)
-	if err != nil {
-		return err
-	}
-	validSteps := []Step{}
-	for _, step := range tree {
-		validSteps = append(validSteps, *step)
 	}
 	var co cookOptions
 	for _, opt := range opts {
@@ -201,6 +153,77 @@ func SendCookEvent(tenantID, sproutID string, recipeID RecipeName, JID string, t
 	return nil
 }
 
+// resolveRecipeSteps reads recipeID and everything it (transitively)
+// includes from the object store, renders each for sproutID, and returns
+// the validated step list a cook dispatch is built from. Every byte comes
+// from the shared bucket (see store.go), never replica-local disk, so any
+// farmer replica resolves the same recipe to the same steps.
+func resolveRecipeSteps(ctx context.Context, tenantID, sproutID string, recipeID RecipeName) ([]Step, error) {
+	basepath := getBasePath()
+	includes, err := collectAllIncludes(ctx, tenantID, sproutID, basepath, recipeID)
+	if err != nil {
+		return nil, err
+	}
+	recipesteps := make(map[string]interface{})
+	for _, inc := range includes {
+		// load all imported files into recipefile list
+		fp, fpErr := ResolveRecipeFilePath(ctx, basepath, inc)
+		if fpErr != nil {
+			log.Errorf("could not find include %s: %v", inc, fpErr)
+			if errors.Is(fpErr, ErrRecipeStoreNotConfigured) {
+				return nil, fpErr
+			}
+			return nil, errors.Join(ErrNoRecipe, fpErr)
+		}
+		f, fpErr := readRecipe(ctx, fp)
+		if fpErr != nil {
+			return nil, fpErr
+		}
+		b, renderErr := renderRecipeTemplate(tenantID, sproutID, fp, f)
+		if renderErr != nil {
+			return nil, renderErr
+		}
+		var recipe map[string]interface{}
+		marshallErr := yaml.Unmarshal(b, &recipe)
+		if marshallErr != nil {
+			return nil, marshallErr
+		}
+		m, loadErr := stepsFromMap(recipe)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		// range over all keys under each recipe ID for matching ingredients
+		recipesteps, err = joinMaps(recipesteps, m)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for id, step := range recipesteps {
+		switch s := step.(type) {
+		case map[string]interface{}:
+			if len(s) != 1 {
+				return nil, errors.Join(ErrInvalidFormat, fmt.Errorf("recipe %s must have one directive, but has %d", id, len(s)))
+			}
+
+		default:
+			return nil, errors.Join(ErrInvalidFormat, fmt.Errorf("recipe %s must me a map[string]interface{} but found %T", id, step))
+		}
+	}
+	steps, err := makeRecipeSteps(recipesteps)
+	if err != nil {
+		return nil, err
+	}
+	tree, err := validateRecipeTree(steps)
+	if err != nil {
+		return nil, err
+	}
+	validSteps := []Step{}
+	for _, step := range tree {
+		validSteps = append(validSteps, *step)
+	}
+	return validSteps, nil
+}
+
 func GenerateJobID() string {
 	return uuid.New().String()
 }
@@ -214,11 +237,13 @@ func GenerateJobID() string {
 // existence check moved from os.Stat to a bucket lookup. Object storage
 // has no directory concept, so the old "resolved path is a directory"
 // case (ErrRecipePathIsDirectory) can no longer happen and is gone.
-func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error) {
+//
+// With no store configured it returns ErrRecipeStoreNotConfigured, not
+// ErrNoRecipe — there is no local-disk fallback.
+func ResolveRecipeFilePath(ctx context.Context, basepath string, recipeID RecipeName) (string, error) {
 	if store == nil {
-		return "", ErrNoRecipe
+		return "", ErrRecipeStoreNotConfigured
 	}
-	ctx := context.Background()
 	path := string(recipeID)
 	basepath = filepath.Clean(basepath)
 	path = filepath.Clean(path)
@@ -230,7 +255,7 @@ func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error)
 		path = strings.ReplaceAll(path, ".", string(filepath.Separator))
 		path = path + "." + config.GrlxExt
 
-		ok, err := store.Exists(ctx, path)
+		ok, err := recipeExists(ctx, path)
 		if err != nil {
 			return "", err
 		}
@@ -244,7 +269,7 @@ func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error)
 	path = strings.ReplaceAll(path, ".", string(filepath.Separator))
 	// check if path is a directory and contains init.grlx
 	initFile := filepath.Join(path, "init."+config.GrlxExt)
-	if ok, err := store.Exists(ctx, initFile); err != nil {
+	if ok, err := recipeExists(ctx, initFile); err != nil {
 		return "", err
 	} else if ok {
 		return initFile, nil
@@ -252,7 +277,7 @@ func ResolveRecipeFilePath(basepath string, recipeID RecipeName) (string, error)
 
 	// check if path is a valid .grlx file
 	extPath := path + "." + config.GrlxExt
-	ok, err := store.Exists(ctx, extPath)
+	ok, err := recipeExists(ctx, extPath)
 	if err != nil {
 		return "", err
 	}

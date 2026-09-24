@@ -2,33 +2,16 @@ package cook
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/props"
 )
 
-// writeRecipe writes content to both local disk (for this file's own
-// direct os.ReadFile calls) and the shared test object store (see
-// testmain_test.go's SetStore) at the same path, since recipe resolution
-// itself (collectAllIncludes, ResolveRecipeFilePath) now reads through
-// the store — see store.go.
-func writeRecipe(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write recipe %s: %v", path, err)
-	}
-	if err := store.Put(context.Background(), path, []byte(content)); err != nil {
-		t.Fatalf("seed recipe store %s: %v", path, err)
-	}
-}
-
 // TestPropsInFileBasedRecipe verifies the full file-based pipeline:
-// write a recipe with props to disk → collectAllIncludes resolves it →
-// props render in the final step extraction.
+// write a recipe with props to the recipe store → collectAllIncludes
+// resolves it → props render in the final step extraction.
 func TestPropsInFileBasedRecipe(t *testing.T) {
 	props.ClearStaticProps()
 
@@ -36,11 +19,8 @@ func TestPropsInFileBasedRecipe(t *testing.T) {
 	props.SetProp("file-sprout", "app_user", "webadmin")
 	props.SetProp("file-sprout", "app_port", "9090")
 
-	// Create recipe file in temp dir.
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	// Create the recipe in a fresh, test-scoped recipe store.
+	recipeDir := newRecipeTestStore(t)
 
 	recipeContent := `steps:
   deploy config:
@@ -54,11 +34,11 @@ func TestPropsInFileBasedRecipe(t *testing.T) {
       - requisites:
         - require: deploy config
 `
-	recipeFile := filepath.Join(tmpDir, "deploy.grlx")
+	recipeFile := filepath.Join(recipeDir, "deploy.grlx")
 	writeRecipe(t, recipeFile, recipeContent)
 
 	// Collect includes (which also renders templates).
-	includes, err := collectAllIncludes(testPropsTenantID, "file-sprout", tmpDir, "deploy")
+	includes, err := collectAllIncludes(context.Background(), testPropsTenantID, "file-sprout", recipeDir, "deploy")
 	if err != nil {
 		t.Fatalf("collectAllIncludes: %v", err)
 	}
@@ -67,10 +47,7 @@ func TestPropsInFileBasedRecipe(t *testing.T) {
 	}
 
 	// Read and render the recipe.
-	f, err := os.ReadFile(recipeFile)
-	if err != nil {
-		t.Fatalf("read recipe: %v", err)
-	}
+	f := mustReadRecipe(t, recipeFile)
 
 	rendered, err := renderRecipeTemplate(testPropsTenantID, "file-sprout", recipeFile, f)
 	if err != nil {
@@ -112,10 +89,7 @@ func TestPropsInRecipeWithIncludes(t *testing.T) {
 	props.SetProp("include-sprout", "db_host", "db.internal")
 	props.SetProp("include-sprout", "cache_host", "redis.internal")
 
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	recipeDir := newRecipeTestStore(t)
 
 	// Base recipe that's included.
 	baseContent := `steps:
@@ -125,7 +99,7 @@ func TestPropsInRecipeWithIncludes(t *testing.T) {
       - source: grlx://configs/db.conf
       - user: root
 `
-	baseFile := filepath.Join(tmpDir, "base.grlx")
+	baseFile := filepath.Join(recipeDir, "base.grlx")
 	writeRecipe(t, baseFile, baseContent)
 
 	// Main recipe with include and props.
@@ -139,10 +113,10 @@ steps:
       - source: grlx://configs/cache.conf
       - user: {{ props "db_host" }}
 `
-	mainFile := filepath.Join(tmpDir, "main.grlx")
+	mainFile := filepath.Join(recipeDir, "main.grlx")
 	writeRecipe(t, mainFile, mainContent)
 
-	includes, err := collectAllIncludes(testPropsTenantID, "include-sprout", tmpDir, "main")
+	includes, err := collectAllIncludes(context.Background(), testPropsTenantID, "include-sprout", recipeDir, "main")
 	if err != nil {
 		t.Fatalf("collectAllIncludes: %v", err)
 	}
@@ -153,7 +127,7 @@ steps:
 	}
 
 	// Render main recipe and verify props resolved.
-	f, _ := os.ReadFile(mainFile)
+	f := mustReadRecipe(t, mainFile)
 	rendered, err := renderRecipeTemplate(testPropsTenantID, "include-sprout", mainFile, f)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
@@ -178,20 +152,17 @@ func TestStaticPropsInFileBasedRecipe(t *testing.T) {
 	props.LoadStaticProps(cfg)
 	t.Cleanup(props.ClearStaticProps)
 
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	recipeDir := newRecipeTestStore(t)
 
 	recipeContent := `steps:
   tag node:
     cmd.run:
       - name: "node-tagger --cluster={{ props "cluster" }} --tier={{ props "tier" }}"
 `
-	recipeFile := filepath.Join(tmpDir, "tagging.grlx")
+	recipeFile := filepath.Join(recipeDir, "tagging.grlx")
 	writeRecipe(t, recipeFile, recipeContent)
 
-	f, _ := os.ReadFile(recipeFile)
+	f := mustReadRecipe(t, recipeFile)
 	rendered, err := renderRecipeTemplate(testPropsTenantID, "static-file-sprout", recipeFile, f)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
@@ -223,10 +194,7 @@ func TestStaticPropsInFileBasedRecipe(t *testing.T) {
 // TestPropsWithHostnameAndSproutIDInFile verifies the hostname and
 // sproutID template functions work in file-based recipes.
 func TestPropsWithHostnameAndSproutIDInFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	recipeDir := newRecipeTestStore(t)
 
 	recipeContent := `steps:
   set banner:
@@ -234,10 +202,10 @@ func TestPropsWithHostnameAndSproutIDInFile(t *testing.T) {
       - name: /etc/motd
       - text: "Host {{ hostname }} managed by sprout {{ sproutID }}"
 `
-	recipeFile := filepath.Join(tmpDir, "banner.grlx")
+	recipeFile := filepath.Join(recipeDir, "banner.grlx")
 	writeRecipe(t, recipeFile, recipeContent)
 
-	f, _ := os.ReadFile(recipeFile)
+	f := mustReadRecipe(t, recipeFile)
 	rendered, err := renderRecipeTemplate(testPropsTenantID, "banner-sprout-42", recipeFile, f)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
@@ -258,10 +226,7 @@ func TestPropsWithHostnameAndSproutIDInFile(t *testing.T) {
 func TestPropsWithConditionalInclude(t *testing.T) {
 	props.ClearStaticProps()
 
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	recipeDir := newRecipeTestStore(t)
 
 	recipeContent := `steps:
   base:
@@ -274,11 +239,11 @@ func TestPropsWithConditionalInclude(t *testing.T) {
       - source: grlx://monitoring/config
 {{- end }}
 `
-	recipeFile := filepath.Join(tmpDir, "conditional.grlx")
+	recipeFile := filepath.Join(recipeDir, "conditional.grlx")
 	writeRecipe(t, recipeFile, recipeContent)
 
 	// Without the prop — only 1 step.
-	f, _ := os.ReadFile(recipeFile)
+	f := mustReadRecipe(t, recipeFile)
 	rendered, err := renderRecipeTemplate(testPropsTenantID, "cond-sprout-off", recipeFile, f)
 	if err != nil {
 		t.Fatalf("render (off): %v", err)
@@ -308,20 +273,17 @@ func TestPropsWithDefaultFallbackInFile(t *testing.T) {
 	props.ClearStaticProps()
 	props.SetProp("default-sprout", "custom_port", "3000")
 
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	recipeDir := newRecipeTestStore(t)
 
 	recipeContent := `steps:
   configure:
     cmd.run:
       - name: "app --port={{ default "8080" (props "custom_port") }} --host={{ default "localhost" (props "custom_host") }}"
 `
-	recipeFile := filepath.Join(tmpDir, "defaults.grlx")
+	recipeFile := filepath.Join(recipeDir, "defaults.grlx")
 	writeRecipe(t, recipeFile, recipeContent)
 
-	f, _ := os.ReadFile(recipeFile)
+	f := mustReadRecipe(t, recipeFile)
 	rendered, err := renderRecipeTemplate(testPropsTenantID, "default-sprout", recipeFile, f)
 	if err != nil {
 		t.Fatalf("renderRecipeTemplate: %v", err)
@@ -349,20 +311,17 @@ func TestMultiSproutSameRecipeFile(t *testing.T) {
 	props.LoadStaticProps(cfg)
 	t.Cleanup(props.ClearStaticProps)
 
-	tmpDir := t.TempDir()
-	oldRecipeDir := config.RecipeDir
-	config.RecipeDir = tmpDir
-	defer func() { config.RecipeDir = oldRecipeDir }()
+	recipeDir := newRecipeTestStore(t)
 
 	recipeContent := `steps:
   configure:
     cmd.run:
       - name: "setup --role={{ props "role" }} --port={{ props "port" }}"
 `
-	recipeFile := filepath.Join(tmpDir, "setup.grlx")
+	recipeFile := filepath.Join(recipeDir, "setup.grlx")
 	writeRecipe(t, recipeFile, recipeContent)
 
-	f, _ := os.ReadFile(recipeFile)
+	f := mustReadRecipe(t, recipeFile)
 
 	type testCase struct {
 		sproutID     string
