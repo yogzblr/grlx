@@ -131,6 +131,17 @@ func (s *Store) Put(ctx context.Context, key string, data []byte) error {
 	return nil
 }
 
+// Delete removes key from the bucket. Deleting a key that doesn't exist
+// is not an error (S3 DeleteObject semantics), so callers racing each
+// other to remove the same object — e.g. several farmer replicas' job-log
+// reapers — all succeed.
+func (s *Store) Delete(ctx context.Context, key string) error {
+	if err := s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("objectstore: deleting %s: %w", key, err)
+	}
+	return nil
+}
+
 // List returns every object key under prefix, recursively — the
 // object-storage equivalent of filepath.WalkDir over a recipe directory
 // tree.
