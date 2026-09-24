@@ -139,18 +139,18 @@ func recipeToStep(id string, recipe map[string]interface{}) (Step, error) {
 	return Step{}, errors.New("error: recipe must have exactly one key")
 }
 
-func collectAllIncludes(tenantID, sproutID, basepath string, recipeID RecipeName) ([]RecipeName, error) {
+func collectAllIncludes(ctx context.Context, tenantID, sproutID, basepath string, recipeID RecipeName) ([]RecipeName, error) {
 	// pass in an ID to a Recipe
-	recipeFilePath, err := ResolveRecipeFilePath(basepath, recipeID)
+	recipeFilePath, err := ResolveRecipeFilePath(ctx, basepath, recipeID)
 	if err != nil {
 		return []RecipeName{}, err
 	}
-	f, err := store.Get(context.Background(), recipeFilePath)
+	f, err := readRecipe(ctx, recipeFilePath)
 	if err != nil {
 		return []RecipeName{}, err
 	}
 	// parse file imports
-	starterIncludes, err := extractIncludes(tenantID, sproutID, basepath, string(recipeID), f)
+	starterIncludes, err := extractIncludes(ctx, tenantID, sproutID, basepath, string(recipeID), f)
 	if err != nil {
 		return []RecipeName{}, err
 	}
@@ -159,7 +159,7 @@ func collectAllIncludes(tenantID, sproutID, basepath string, recipeID RecipeName
 	for _, si := range starterIncludes {
 		includeSet[si] = false
 	}
-	includeSet, err = collectIncludesRecurse(tenantID, sproutID, basepath, includeSet)
+	includeSet, err = collectIncludesRecurse(ctx, tenantID, sproutID, basepath, includeSet)
 	if err != nil {
 		return []RecipeName{}, err
 	}
@@ -375,11 +375,11 @@ func pathToRecipeName(path string) (RecipeName, error) {
 // attaches a related path to the prefix of a recipe name
 // makes no guarantees that the resultant path is valid
 
-func relativeRecipeToAbsolute(basepath, relatedRecipePath string, recipeID RecipeName) (RecipeName, error) {
+func relativeRecipeToAbsolute(ctx context.Context, basepath, relatedRecipePath string, recipeID RecipeName) (RecipeName, error) {
 	path := string(recipeID)
 	if !strings.HasPrefix(path, ".") {
 		var err error
-		path, err = ResolveRecipeFilePath(basepath, recipeID)
+		path, err = ResolveRecipeFilePath(ctx, basepath, recipeID)
 		if err != nil {
 			return "", err
 		}
@@ -395,11 +395,15 @@ func relativeRecipeToAbsolute(basepath, relatedRecipePath string, recipeID Recip
 
 // RecipeDirEnvVar names an optional environment variable that overrides the
 // recipe base path at cook time. This lets an operator point a cook at a
-// different recipe tree — e.g. a checkout of a specific git branch or tag, or
-// a per-environment directory — without rewriting the farmer config. When
-// unset or empty, config.RecipeDir is used.
+// different recipe tree — e.g. a specific git branch or tag, or a
+// per-environment tree, synced under its own prefix — without rewriting the
+// farmer config. When unset or empty, config.RecipeDir is used.
 const RecipeDirEnvVar = "GRLX_RECIPE_DIR"
 
+// getBasePath returns the object-key prefix recipes resolve under in the
+// recipe store (see store.go). Despite the historical "dir" naming it is
+// not a local filesystem path: nothing in this package reads recipes from
+// local disk.
 func getBasePath() string {
 	if dir := os.Getenv(RecipeDirEnvVar); dir != "" {
 		return dir
@@ -407,7 +411,7 @@ func getBasePath() string {
 	return config.RecipeDir
 }
 
-func extractIncludes(tenantID, sproutID, basepath, recipePath string, file []byte) ([]RecipeName, error) {
+func extractIncludes(ctx context.Context, tenantID, sproutID, basepath, recipePath string, file []byte) ([]RecipeName, error) {
 	recipeBytes, err := renderRecipeTemplate(tenantID, sproutID, recipePath, file)
 	if err != nil {
 		return []RecipeName{}, err
@@ -424,7 +428,7 @@ func extractIncludes(tenantID, sproutID, basepath, recipePath string, file []byt
 		tinc := string(inc)
 		if strings.HasPrefix(tinc, ".") {
 
-			rel, err := relativeRecipeToAbsolute(basepath, recipePath, inc)
+			rel, err := relativeRecipeToAbsolute(ctx, basepath, recipePath, inc)
 			if err != nil {
 				return []RecipeName{}, err
 			}
@@ -457,7 +461,7 @@ func unmarshalRecipe(recipe []byte) (map[string]interface{}, error) {
 	return rmap, err
 }
 
-func collectIncludesRecurse(tenantID, sproutID, basepath string, starter map[RecipeName]bool) (map[RecipeName]bool, error) {
+func collectIncludesRecurse(ctx context.Context, tenantID, sproutID, basepath string, starter map[RecipeName]bool) (map[RecipeName]bool, error) {
 	allIncluded := false
 	for !allIncluded {
 		allIncluded = true
@@ -465,16 +469,16 @@ func collectIncludesRecurse(tenantID, sproutID, basepath string, starter map[Rec
 			if !done {
 				allIncluded = false
 				starter[inc] = true
-				recipeFilePath, err := ResolveRecipeFilePath(basepath, inc)
+				recipeFilePath, err := ResolveRecipeFilePath(ctx, basepath, inc)
 				if err != nil {
 					return starter, err
 				}
-				f, err := store.Get(context.Background(), recipeFilePath)
+				f, err := readRecipe(ctx, recipeFilePath)
 				if err != nil {
 					return starter, err
 				}
 				// parse file imports
-				eIncludes, err := extractIncludes(tenantID, sproutID, basepath, string(inc), f)
+				eIncludes, err := extractIncludes(ctx, tenantID, sproutID, basepath, string(inc), f)
 				if err != nil {
 					return starter, err
 				}
@@ -484,7 +488,7 @@ func collectIncludesRecurse(tenantID, sproutID, basepath string, starter map[Rec
 					}
 				}
 
-				newIncludes, err := collectIncludesRecurse(tenantID, sproutID, basepath, starter)
+				newIncludes, err := collectIncludesRecurse(ctx, tenantID, sproutID, basepath, starter)
 				if err != nil {
 					return newIncludes, err
 				}

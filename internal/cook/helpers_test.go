@@ -1,9 +1,9 @@
 package cook
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -152,12 +152,12 @@ func TestExtractIncludes(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.id, func(t *testing.T) {
-			fp, err := ResolveRecipeFilePath(getBasePath(), tc.recipe)
+			fp, err := ResolveRecipeFilePath(context.Background(), getBasePath(), tc.recipe)
 			if err != nil {
 				t.Error(err)
 			}
-			f, _ := os.ReadFile(fp)
-			r, err := extractIncludes(testPropsTenantID, tc.sprout, tc.basepath, string(tc.recipe), f)
+			f := mustReadRecipe(t, fp)
+			r, err := extractIncludes(context.Background(), testPropsTenantID, tc.sprout, tc.basepath, string(tc.recipe), f)
 			if err != nil {
 				t.Error(err)
 			}
@@ -200,7 +200,7 @@ func TestCollectAllIncludes(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.id, func(t *testing.T) {
-			recipes, err := collectAllIncludes(testPropsTenantID, tc.sprout, getBasePath(), tc.recipe)
+			recipes, err := collectAllIncludes(context.Background(), testPropsTenantID, tc.sprout, getBasePath(), tc.recipe)
 			if err != nil {
 				t.Fatalf("collectAllIncludes(%q): %v", tc.recipe, err)
 			}
@@ -245,7 +245,7 @@ func TestRelativeRecipeToAbsolute(t *testing.T) {
 	}}
 	for _, tc := range testCases {
 		t.Run(tc.id, func(t *testing.T) {
-			filepath, err := relativeRecipeToAbsolute(getBasePath(), tc.relatedFilepath, tc.recipe)
+			filepath, err := relativeRecipeToAbsolute(context.Background(), getBasePath(), tc.relatedFilepath, tc.recipe)
 			if string(filepath) != tc.filepath {
 				t.Errorf("expected %s but got %s", tc.filepath, filepath)
 			}

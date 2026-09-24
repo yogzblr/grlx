@@ -16,3 +16,9 @@ var (
 	ErrInvalidSecrets        = errors.New("invalid secrets")
 	ErrInvalidOnExit         = errors.New("invalid on_exit")
 )
+
+// ErrRecipeStoreNotConfigured means SetStore was never called (or was
+// called with nil). Deliberately distinct from ErrNoRecipe: there is no
+// local-disk fallback, so a replica without object storage must fail
+// loudly rather than look like it simply can't find the recipe.
+var ErrRecipeStoreNotConfigured = errors.New("recipe store not configured")

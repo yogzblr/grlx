@@ -54,19 +54,46 @@ func NewStoreForBinary() (store *objectstore.Store, closeFn func(), err error) {
 	return newStore()
 }
 
-func newStore() (*objectstore.Store, func(), error) {
-	f := &fakeS3{data: make(map[string][]byte)}
-	srv := httptest.NewServer(http.HandlerFunc(f.handle))
+// NewSharedStores starts one in-process fake S3 server and returns n
+// independently opened objectstore.Store clients all pointed at its single
+// bucket — the test stand-in for n farmer replicas sharing one real
+// S3/MinIO bucket. A write through any one of them is visible to every
+// other. The server is closed automatically via t.Cleanup.
+func NewSharedStores(t *testing.T, n int) []*objectstore.Store {
+	t.Helper()
+	srv := startServer()
+	t.Cleanup(srv.Close)
+	stores := make([]*objectstore.Store, n)
+	for i := range stores {
+		s, err := openStore(srv)
+		if err != nil {
+			t.Fatalf("objectstoretest: opening shared fake store %d: %v", i, err)
+		}
+		stores[i] = s
+	}
+	return stores
+}
 
-	endpoint := strings.TrimPrefix(srv.URL, "http://")
-	store, err := objectstore.Open(objectstore.Config{
-		Endpoint: endpoint, AccessKeyID: "test", SecretAccessKey: "test", Bucket: bucket,
-	})
+func newStore() (*objectstore.Store, func(), error) {
+	srv := startServer()
+	store, err := openStore(srv)
 	if err != nil {
 		srv.Close()
 		return nil, nil, err
 	}
 	return store, srv.Close, nil
+}
+
+func startServer() *httptest.Server {
+	f := &fakeS3{data: make(map[string][]byte)}
+	return httptest.NewServer(http.HandlerFunc(f.handle))
+}
+
+func openStore(srv *httptest.Server) (*objectstore.Store, error) {
+	endpoint := strings.TrimPrefix(srv.URL, "http://")
+	return objectstore.Open(objectstore.Config{
+		Endpoint: endpoint, AccessKeyID: "test", SecretAccessKey: "test", Bucket: bucket,
+	})
 }
 
 // Seed uploads files (key -> content) directly into the fake server's
