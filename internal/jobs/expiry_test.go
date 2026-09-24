@@ -1,86 +1,169 @@
 package jobs
 
 import (
-	"os"
-	"path/filepath"
+	"context"
 	"testing"
 	"time"
+
+	"github.com/gogrlx/grlx/v2/internal/cook"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
+	"github.com/gogrlx/grlx/v2/internal/objectstore/objectstoretest"
 )
 
 func TestReapRemovesExpiredJobs(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
+	step := makeStep("s1", cook.StepCompleted, time.Now(), time.Second)
 
-	// Create a sprout dir with two job files.
-	sproutDir := filepath.Join(dir, "sprout-a")
-	if err := os.MkdirAll(sproutDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	oldFile := filepath.Join(sproutDir, "old-job.jsonl")
-	newFile := filepath.Join(sproutDir, "new-job.jsonl")
-
-	// Write dummy content.
-	os.WriteFile(oldFile, []byte(`{}`+"\n"), 0o644)
-	os.WriteFile(newFile, []byte(`{}`+"\n"), 0o644)
-
-	// Backdate the old file.
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldFile, past, past)
+	// old-job's newest event arrived 48h ago; new-job's just now.
+	writeJobEvent(t, obj, "sprout-a", "old-job", time.Now().Add(-49*time.Hour), step)
+	writeJobEvent(t, obj, "sprout-a", "old-job", time.Now().Add(-48*time.Hour), step)
+	writeJobEvent(t, obj, "sprout-a", "new-job", time.Now(), step)
 
 	// Reap with a 24h TTL — old-job should be removed.
 	store.reap(24 * time.Hour)
 
-	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
-		t.Errorf("expected old-job.jsonl to be removed, but it still exists")
+	if _, err := store.GetJob("sprout-a", "old-job"); err != ErrJobNotFound {
+		t.Errorf("expected old-job to be removed, got %v", err)
 	}
-	if _, err := os.Stat(newFile); err != nil {
-		t.Errorf("expected new-job.jsonl to still exist, got error: %v", err)
+	if _, err := store.GetJob("sprout-a", "new-job"); err != nil {
+		t.Errorf("expected new-job to still exist, got error: %v", err)
 	}
 }
 
-func TestReapRemovesEmptySproutDirs(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+// TestReapUsesNewestEvent verifies a long-running job isn't expired just
+// because its first event is old.
+func TestReapUsesNewestEvent(t *testing.T) {
+	store, obj := newTestStore(t)
+	step := makeStep("s1", cook.StepCompleted, time.Now(), time.Second)
 
-	sproutDir := filepath.Join(dir, "sprout-b")
-	if err := os.MkdirAll(sproutDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	oldFile := filepath.Join(sproutDir, "only-job.jsonl")
-	os.WriteFile(oldFile, []byte(`{}`+"\n"), 0o644)
-
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldFile, past, past)
+	writeJobEvent(t, obj, "sprout-a", "long-job", time.Now().Add(-72*time.Hour), step)
+	writeJobEvent(t, obj, "sprout-a", "long-job", time.Now().Add(-time.Hour), step)
 
 	store.reap(24 * time.Hour)
 
-	if _, err := os.Stat(sproutDir); !os.IsNotExist(err) {
-		t.Errorf("expected empty sprout dir to be removed")
+	if _, err := store.GetJob("sprout-a", "long-job"); err != nil {
+		t.Errorf("expected long-job to survive (newest event is 1h old), got %v", err)
+	}
+}
+
+func TestReap_RemovesMetaAndCreated(t *testing.T) {
+	store, obj := newTestStore(t)
+
+	// A job that was created 48h ago and never got a step event: dated by
+	// its meta.json CreatedAt.
+	putObject(t, obj, createdKey("sprout-meta-reap", "old-with-meta"), []byte("{}\n"))
+	putObject(t, obj, metaKey("sprout-meta-reap", "old-with-meta"),
+		[]byte(`{"jid":"old-with-meta","created_at":"`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`"}`))
+
+	store.reap(24 * time.Hour)
+
+	if objectExists(t, obj, createdKey("sprout-meta-reap", "old-with-meta")) {
+		t.Error("expected old job's created.jsonl to be removed")
+	}
+	if objectExists(t, obj, metaKey("sprout-meta-reap", "old-with-meta")) {
+		t.Error("expected old meta to be removed along with job")
+	}
+}
+
+// TestReap_RemovesOrphanMeta covers a meta.json whose created.jsonl Put
+// failed: not a job as far as reads go, but still expired.
+func TestReap_RemovesOrphanMeta(t *testing.T) {
+	store, obj := newTestStore(t)
+
+	putObject(t, obj, metaKey("sprout-orphan", "orphan"),
+		[]byte(`{"jid":"orphan","created_at":"`+time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)+`"}`))
+
+	store.reap(24 * time.Hour)
+
+	if objectExists(t, obj, metaKey("sprout-orphan", "orphan")) {
+		t.Error("expected orphaned meta.json to be removed")
+	}
+}
+
+// TestReap_KeepsUndatableJobs verifies a job with no event and no meta —
+// nothing to tell its age by — is left alone rather than deleted.
+func TestReap_KeepsUndatableJobs(t *testing.T) {
+	store, obj := newTestStore(t)
+	putObject(t, obj, createdKey("sprout-x", "undated"), []byte("{}\n"))
+
+	store.reap(time.Nanosecond)
+
+	if !objectExists(t, obj, createdKey("sprout-x", "undated")) {
+		t.Error("expected a job with no datable object to be kept")
+	}
+}
+
+func TestReap_SkipsStrayObjects(t *testing.T) {
+	store, obj := newTestStore(t)
+
+	// Objects outside the job layout are never touched.
+	putObject(t, obj, "jobs/sprout-skip/notes.txt", []byte("keep me"))
+	putObject(t, obj, "elsewhere/old.jsonl", []byte("keep me"))
+
+	store.reap(time.Nanosecond)
+
+	for _, key := range []string{"jobs/sprout-skip/notes.txt", "elsewhere/old.jsonl"} {
+		if !objectExists(t, obj, key) {
+			t.Errorf("expected %s to be preserved", key)
+		}
+	}
+}
+
+func TestReap_NotConfigured(t *testing.T) {
+	orig := objStore
+	SetStore(nil)
+	t.Cleanup(func() { SetStore(orig) })
+
+	// Should log and return, not panic.
+	NewStore().reap(time.Hour)
+}
+
+func TestReap_ListError(t *testing.T) {
+	srv := objectstoretest.NewServer(t)
+	obj, err := objectstore.Open(srv.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithObjectStore(obj)
+	step := makeStep("s1", cook.StepCompleted, time.Now(), time.Second)
+	writeJobEvent(t, obj, "sprout-a", "old-job", time.Now().Add(-48*time.Hour), step)
+
+	srv.FailNext(1, 403, "AccessDenied")
+	store.reap(24 * time.Hour)
+
+	// The failed listing means nothing was deleted.
+	keys, err := obj.List(context.Background(), jobPrefix("sprout-a", "old-job"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 {
+		t.Errorf("expected old job to survive a failed listing, got keys %v", keys)
 	}
 }
 
 func TestReapZeroTTLNoOp(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
+	step := makeStep("s1", cook.StepCompleted, time.Now(), time.Second)
+	writeJobEvent(t, obj, "sprout-c", "job", time.Now().Add(-9999*time.Hour), step)
 
-	sproutDir := filepath.Join(dir, "sprout-c")
-	os.MkdirAll(sproutDir, 0o700)
-	jobFile := filepath.Join(sproutDir, "job.jsonl")
-	os.WriteFile(jobFile, []byte(`{}`+"\n"), 0o644)
-
-	past := time.Now().Add(-9999 * time.Hour)
-	os.Chtimes(jobFile, past, past)
-
-	// StartReaper with 0 should not start a goroutine, but we can call reap
-	// with 0 directly — it should still not delete (TTL=0 means keep forever
-	// at the StartReaper level, but reap itself treats cutoff as now).
-	// Since StartReaper bails on ttl<=0, this test just verifies StartReaper
-	// doesn't panic.
+	// StartReaper bails on ttl<=0 without starting a goroutine, so nothing
+	// is ever deleted.
 	store.StartReaper(0)
 
-	if _, err := os.Stat(jobFile); err != nil {
-		t.Errorf("expected job file to still exist when TTL=0")
+	if _, err := store.GetJob("sprout-c", "job"); err != nil {
+		t.Errorf("expected job to still exist when TTL=0: %v", err)
+	}
+}
+
+func TestEventTime(t *testing.T) {
+	at := time.Unix(0, 1_700_000_000_123_456_789)
+	got, ok := eventTime(eventKey("s", "j", at))
+	if !ok || !got.Equal(at) {
+		t.Errorf("eventTime(eventKey(%v)) = %v, %v", at, got, ok)
+	}
+	for _, key := range []string{"jobs/s/j/events/nodash.jsonl", "jobs/s/j/events/abc-def.jsonl"} {
+		if _, ok := eventTime(key); ok {
+			t.Errorf("eventTime(%q) should fail", key)
+		}
 	}
 }

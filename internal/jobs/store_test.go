@@ -1,7 +1,9 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,27 +11,68 @@ import (
 	"time"
 
 	"github.com/gogrlx/grlx/v2/internal/cook"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
+	"github.com/gogrlx/grlx/v2/internal/objectstore/objectstoretest"
 )
 
-func writeJobFile(t *testing.T, dir, sproutID, jid string, steps []cook.StepCompletion) {
+// newTestStore returns a Store backed by its own fake S3 bucket, and that
+// bucket's objectstore.Store for seeding or inspecting objects directly.
+func newTestStore(t *testing.T) (*Store, *objectstore.Store) {
 	t.Helper()
-	sproutDir := filepath.Join(dir, sproutID)
-	if err := os.MkdirAll(sproutDir, 0o700); err != nil {
-		t.Fatal(err)
+	obj := objectstoretest.NewStore(t)
+	return NewStoreWithObjectStore(obj), obj
+}
+
+// useTestObjStore installs a fresh fake bucket as the package-level job
+// store (what RegisterNatsConn's listeners and NewStore use) for the rest
+// of the test.
+func useTestObjStore(t *testing.T) *objectstore.Store {
+	t.Helper()
+	obj := objectstoretest.NewStore(t)
+	orig := objStore
+	SetStore(obj)
+	t.Cleanup(func() { SetStore(orig) })
+	return obj
+}
+
+// writeJobFile seeds a job's step log the way RegisterNatsConn's listener
+// writes it: one event object per step, in order.
+func writeJobFile(t *testing.T, obj *objectstore.Store, sproutID, jid string, steps []cook.StepCompletion) {
+	t.Helper()
+	base := time.Now()
+	for i, step := range steps {
+		writeJobEvent(t, obj, sproutID, jid, base.Add(time.Duration(i)), step)
 	}
-	jobFile := filepath.Join(sproutDir, fmt.Sprintf("%s.jsonl", jid))
-	f, err := os.Create(jobFile)
+}
+
+// writeJobEvent seeds one event object as if it had been received at at.
+func writeJobEvent(t *testing.T, obj *objectstore.Store, sproutID, jid string, at time.Time, step cook.StepCompletion) {
+	t.Helper()
+	b, err := json.Marshal(step)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	for _, step := range steps {
-		b, marshalErr := json.Marshal(step)
-		if marshalErr != nil {
-			t.Fatal(marshalErr)
-		}
-		fmt.Fprintln(f, string(b))
+	if err := obj.Put(context.Background(), eventKey(sproutID, jid, at), append(b, '\n')); err != nil {
+		t.Fatal(err)
 	}
+}
+
+// putObject writes raw content to key, failing the test on error.
+func putObject(t *testing.T, obj *objectstore.Store, key string, data []byte) {
+	t.Helper()
+	if err := obj.Put(context.Background(), key, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// objectExists reports whether key is in obj, failing the test on error.
+func objectExists(t *testing.T, obj *objectstore.Store, key string) bool {
+	t.Helper()
+	ok, err := obj.Exists(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
 }
 
 func makeStep(id string, status cook.CompletionStatus, started time.Time, duration time.Duration) cook.StepCompletion {
@@ -42,23 +85,26 @@ func makeStep(id string, status cook.CompletionStatus, started time.Time, durati
 }
 
 func TestNewStore(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-	if store.logDir != dir {
-		t.Errorf("expected logDir %q, got %q", dir, store.logDir)
+	obj := objectstoretest.NewStore(t)
+	store := NewStoreWithObjectStore(obj)
+	got, err := store.backend()
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if got != obj {
+		t.Error("expected the Store to use the object store it was given")
 	}
 }
 
 func TestGetJob_Found(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepCompleted, now, 5*time.Second),
 		makeStep("step-2", cook.StepCompleted, now.Add(5*time.Second), 3*time.Second),
 	}
-	writeJobFile(t, dir, "sprout-a", "job-123", steps)
+	writeJobFile(t, obj, "sprout-a", "job-123", steps)
 
 	summary, err := store.GetJob("sprout-a", "job-123")
 	if err != nil {
@@ -82,8 +128,7 @@ func TestGetJob_Found(t *testing.T) {
 }
 
 func TestGetJob_NotFound(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, _ := newTestStore(t)
 
 	_, err := store.GetJob("nonexistent", "no-such-job")
 	if err != ErrJobNotFound {
@@ -92,14 +137,13 @@ func TestGetJob_NotFound(t *testing.T) {
 }
 
 func TestFindJob(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepFailed, now, 2*time.Second),
 	}
-	writeJobFile(t, dir, "sprout-b", "unique-jid", steps)
+	writeJobFile(t, obj, "sprout-b", "unique-jid", steps)
 
 	summary, err := store.FindJob("unique-jid")
 	if err != nil {
@@ -114,8 +158,7 @@ func TestFindJob(t *testing.T) {
 }
 
 func TestFindJob_NotFound(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, _ := newTestStore(t)
 
 	_, err := store.FindJob("missing")
 	if err != ErrJobNotFound {
@@ -124,17 +167,16 @@ func TestFindJob_NotFound(t *testing.T) {
 }
 
 func TestListJobsForSprout(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
-	writeJobFile(t, dir, "sprout-c", "job-1", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-c", "job-1", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
-	writeJobFile(t, dir, "sprout-c", "job-2", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-c", "job-2", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now.Add(10*time.Second), time.Second),
 	})
-	writeJobFile(t, dir, "sprout-c", "job-3", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-c", "job-3", []cook.StepCompletion{
 		makeStep("s1", cook.StepFailed, now.Add(20*time.Second), time.Second),
 	})
 
@@ -155,8 +197,7 @@ func TestListJobsForSprout(t *testing.T) {
 }
 
 func TestListJobsForSprout_NoJobs(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, _ := newTestStore(t)
 
 	_, err := store.ListJobsForSprout("nonexistent")
 	if err != ErrSproutNoJobs {
@@ -165,14 +206,13 @@ func TestListJobsForSprout_NoJobs(t *testing.T) {
 }
 
 func TestListAllJobs(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
-	writeJobFile(t, dir, "sprout-x", "job-a", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-x", "job-a", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
-	writeJobFile(t, dir, "sprout-y", "job-b", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-y", "job-b", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now.Add(5*time.Second), time.Second),
 	})
 
@@ -190,12 +230,11 @@ func TestListAllJobs(t *testing.T) {
 }
 
 func TestListAllJobs_WithLimit(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
 	for i := range 5 {
-		writeJobFile(t, dir, "sprout-z", fmt.Sprintf("job-%d", i), []cook.StepCompletion{
+		writeJobFile(t, obj, "sprout-z", fmt.Sprintf("job-%d", i), []cook.StepCompletion{
 			makeStep("s1", cook.StepCompleted, now.Add(time.Duration(i)*time.Minute), time.Second),
 		})
 	}
@@ -210,34 +249,37 @@ func TestListAllJobs_WithLimit(t *testing.T) {
 }
 
 func TestListSprouts(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
+	now := time.Now()
 
-	// Create sprout directories
-	for _, sprout := range []string{"alpha", "beta", "gamma"} {
-		if err := os.MkdirAll(filepath.Join(dir, sprout), 0o700); err != nil {
-			t.Fatal(err)
-		}
+	for _, sprout := range []string{"gamma", "alpha", "beta"} {
+		writeJobFile(t, obj, sprout, "job-1", []cook.StepCompletion{
+			makeStep("s1", cook.StepCompleted, now, time.Second),
+		})
 	}
+	// A second job for one sprout doesn't list it twice.
+	writeJobFile(t, obj, "alpha", "job-2", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, now, time.Second),
+	})
 
 	sprouts, err := store.ListSprouts()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(sprouts) != 3 {
-		t.Errorf("expected 3 sprouts, got %d", len(sprouts))
+	want := []string{"alpha", "beta", "gamma"}
+	if fmt.Sprint(sprouts) != fmt.Sprint(want) {
+		t.Errorf("ListSprouts = %v, want %v", sprouts, want)
 	}
 }
 
 func TestCountJobsForSprout(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
-	writeJobFile(t, dir, "sprout-count", "j1", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-count", "j1", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
-	writeJobFile(t, dir, "sprout-count", "j2", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-count", "j2", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
 
@@ -251,8 +293,7 @@ func TestCountJobsForSprout(t *testing.T) {
 }
 
 func TestCountJobsForSprout_Nonexistent(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, _ := newTestStore(t)
 
 	count, err := store.CountJobsForSprout("ghost")
 	if err != nil {
@@ -421,9 +462,8 @@ func TestReadJobFile_EmptyLines(t *testing.T) {
 	}
 }
 
-func TestListAllJobs_EmptyDir(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestListAllJobs_EmptyBucket(t *testing.T) {
+	store, _ := newTestStore(t)
 
 	summaries, err := store.ListAllJobs(0)
 	if err != nil {
@@ -434,9 +474,8 @@ func TestListAllJobs_EmptyDir(t *testing.T) {
 	}
 }
 
-func TestListSprouts_EmptyDir(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestListSprouts_EmptyBucket(t *testing.T) {
+	store, _ := newTestStore(t)
 
 	sprouts, err := store.ListSprouts()
 	if err != nil {
@@ -447,24 +486,54 @@ func TestListSprouts_EmptyDir(t *testing.T) {
 	}
 }
 
-func TestListSprouts_NonexistentDir(t *testing.T) {
-	store := NewStoreWithDir("/nonexistent/path/that/does/not/exist")
+func TestStore_NotConfigured(t *testing.T) {
+	orig := objStore
+	SetStore(nil)
+	t.Cleanup(func() { SetStore(orig) })
+	store := NewStore()
 
-	sprouts, err := store.ListSprouts()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if _, err := store.GetJob("s", "j"); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("GetJob: expected ErrJobStoreNotConfigured, got %v", err)
 	}
-	if sprouts != nil {
-		t.Errorf("expected nil sprouts, got %v", sprouts)
+	if _, err := store.FindJob("j"); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("FindJob: expected ErrJobStoreNotConfigured, got %v", err)
+	}
+	if _, err := store.ListJobsForSprout("s"); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("ListJobsForSprout: expected ErrJobStoreNotConfigured, got %v", err)
+	}
+	if _, err := store.ListAllJobs(0); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("ListAllJobs: expected ErrJobStoreNotConfigured, got %v", err)
+	}
+	if err := store.DeleteJob("j"); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("DeleteJob: expected ErrJobStoreNotConfigured, got %v", err)
+	}
+	if _, err := store.ListSprouts(); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("ListSprouts: expected ErrJobStoreNotConfigured, got %v", err)
+	}
+	if _, err := store.CountJobsForSprout("s"); !errors.Is(err, ErrJobStoreNotConfigured) {
+		t.Errorf("CountJobsForSprout: expected ErrJobStoreNotConfigured, got %v", err)
 	}
 }
 
-func writeJobMeta(t *testing.T, dir, sproutID, jid, invokedBy string) {
-	t.Helper()
-	sproutDir := filepath.Join(dir, sproutID)
-	if err := os.MkdirAll(sproutDir, 0o700); err != nil {
-		t.Fatal(err)
+// TestNewStore_ResolvesStoreLazily covers internal/natsapi's usage: it
+// calls NewStore in an init(), before main has called SetStore.
+func TestNewStore_ResolvesStoreLazily(t *testing.T) {
+	orig := objStore
+	SetStore(nil)
+	t.Cleanup(func() { SetStore(orig) })
+	store := NewStore()
+
+	obj := useTestObjStore(t)
+	writeJobFile(t, obj, "sprout-late", "job-late", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, time.Now(), time.Second),
+	})
+	if _, err := store.GetJob("sprout-late", "job-late"); err != nil {
+		t.Errorf("GetJob after SetStore: %v", err)
 	}
+}
+
+func writeJobMeta(t *testing.T, obj *objectstore.Store, sproutID, jid, invokedBy string) {
+	t.Helper()
 	meta := JobMeta{
 		JID:       jid,
 		InvokedBy: invokedBy,
@@ -474,22 +543,18 @@ func writeJobMeta(t *testing.T, dir, sproutID, jid, invokedBy string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metaFile := filepath.Join(sproutDir, fmt.Sprintf("%s.meta.json", jid))
-	if err := os.WriteFile(metaFile, data, 0o640); err != nil {
-		t.Fatal(err)
-	}
+	putObject(t, obj, metaKey(sproutID, jid), data)
 }
 
 func TestGetJob_WithInvokedBy(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now()
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepCompleted, now, time.Second),
 	}
-	writeJobFile(t, dir, "web-1", "job-meta-1", steps)
-	writeJobMeta(t, dir, "web-1", "job-meta-1", "UPUBKEY_ALICE")
+	writeJobFile(t, obj, "web-1", "job-meta-1", steps)
+	writeJobMeta(t, obj, "web-1", "job-meta-1", "UPUBKEY_ALICE")
 
 	summary, err := store.GetJob("web-1", "job-meta-1")
 	if err != nil {
@@ -501,14 +566,13 @@ func TestGetJob_WithInvokedBy(t *testing.T) {
 }
 
 func TestGetJob_WithoutMeta(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now()
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepCompleted, now, time.Second),
 	}
-	writeJobFile(t, dir, "web-1", "job-no-meta", steps)
+	writeJobFile(t, obj, "web-1", "job-no-meta", steps)
 
 	summary, err := store.GetJob("web-1", "job-no-meta")
 	if err != nil {
@@ -520,15 +584,14 @@ func TestGetJob_WithoutMeta(t *testing.T) {
 }
 
 func TestFindJob_WithInvokedBy(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now()
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepCompleted, now, time.Second),
 	}
-	writeJobFile(t, dir, "db-1", "job-find-meta", steps)
-	writeJobMeta(t, dir, "db-1", "job-find-meta", "UPUBKEY_BOB")
+	writeJobFile(t, obj, "db-1", "job-find-meta", steps)
+	writeJobMeta(t, obj, "db-1", "job-find-meta", "UPUBKEY_BOB")
 
 	summary, err := store.FindJob("job-find-meta")
 	if err != nil {
@@ -540,16 +603,15 @@ func TestFindJob_WithInvokedBy(t *testing.T) {
 }
 
 func TestListJobsForSprout_WithInvokedBy(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now()
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepCompleted, now, time.Second),
 	}
-	writeJobFile(t, dir, "app-1", "job-list-1", steps)
-	writeJobMeta(t, dir, "app-1", "job-list-1", "UPUBKEY_CAROL")
-	writeJobFile(t, dir, "app-1", "job-list-2", steps)
+	writeJobFile(t, obj, "app-1", "job-list-1", steps)
+	writeJobMeta(t, obj, "app-1", "job-list-1", "UPUBKEY_CAROL")
+	writeJobFile(t, obj, "app-1", "job-list-2", steps)
 	// No meta for job-list-2
 
 	summaries, err := store.ListJobsForSprout("app-1")
@@ -579,19 +641,18 @@ func TestListJobsForSprout_WithInvokedBy(t *testing.T) {
 }
 
 func TestDeleteJob_Found(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
 	steps := []cook.StepCompletion{
 		makeStep("step-1", cook.StepCompleted, now, 2*time.Second),
+		makeStep("step-2", cook.StepCompleted, now, 2*time.Second),
 	}
-	writeJobFile(t, dir, "sprout-del", "del-job-1", steps)
-
-	// Also write a meta file.
-	sproutDir := filepath.Join(dir, "sprout-del")
-	metaFile := filepath.Join(sproutDir, "del-job-1.meta.json")
-	os.WriteFile(metaFile, []byte(`{"invoked_by":"testuser"}`), 0o640)
+	putObject(t, obj, createdKey("sprout-del", "del-job-1"), []byte("\n"))
+	writeJobFile(t, obj, "sprout-del", "del-job-1", steps)
+	writeJobMeta(t, obj, "sprout-del", "del-job-1", "testuser")
+	// A different job on the same sprout must survive.
+	writeJobFile(t, obj, "sprout-del", "keep-job", steps)
 
 	// Confirm it exists.
 	_, err := store.FindJob("del-job-1")
@@ -610,15 +671,21 @@ func TestDeleteJob_Found(t *testing.T) {
 		t.Errorf("expected ErrJobNotFound after delete, got %v", err)
 	}
 
-	// Confirm meta file is also gone.
-	if _, statErr := os.Stat(metaFile); !os.IsNotExist(statErr) {
-		t.Error("meta file should have been deleted")
+	// Confirm every one of its objects, meta included, is gone.
+	keys, err := obj.List(context.Background(), jobPrefix("sprout-del", "del-job-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("expected no objects left for the deleted job, got %v", keys)
+	}
+	if _, err := store.GetJob("sprout-del", "keep-job"); err != nil {
+		t.Errorf("other job on the same sprout should survive: %v", err)
 	}
 }
 
 func TestDeleteJob_NotFound(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, _ := newTestStore(t)
 
 	err := store.DeleteJob("nonexistent-jid")
 	if err != ErrJobNotFound {
@@ -626,26 +693,85 @@ func TestDeleteJob_NotFound(t *testing.T) {
 	}
 }
 
-func TestDeleteJob_EmptyDir(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestDeleteJob_EmptyBucket(t *testing.T) {
+	store, _ := newTestStore(t)
 
 	err := store.DeleteJob("any-jid")
 	if err != ErrJobNotFound {
-		t.Errorf("expected ErrJobNotFound for empty dir, got %v", err)
+		t.Errorf("expected ErrJobNotFound for an empty bucket, got %v", err)
 	}
 }
 
 func TestReadJobMeta_MalformedJSON(t *testing.T) {
-	dir := t.TempDir()
-	sproutDir := filepath.Join(dir, "sprout-bad")
-	os.MkdirAll(sproutDir, 0o700)
+	store, obj := newTestStore(t)
 
-	metaFile := filepath.Join(sproutDir, "bad-job.meta.json")
-	os.WriteFile(metaFile, []byte("not json"), 0o640)
+	writeJobFile(t, obj, "sprout-bad", "bad-job", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, time.Now(), time.Second),
+	})
+	putObject(t, obj, metaKey("sprout-bad", "bad-job"), []byte("not json"))
 
-	got := readJobMeta(sproutDir, "bad-job")
-	if got != "" {
-		t.Errorf("readJobMeta = %q, want empty for malformed JSON", got)
+	summary, err := store.GetJob("sprout-bad", "bad-job")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if summary.InvokedBy != "" {
+		t.Errorf("InvokedBy = %q, want empty for malformed meta", summary.InvokedBy)
+	}
+}
+
+// TestStore_SharedBucketAcrossReplicas is the property this package's move
+// to object storage exists for: two farmer replicas, each with its own
+// independently opened client on the same bucket, see the same job data.
+// Before, each replica had its own local directory, so a job-status query
+// could only be answered by the replica that happened to record the job.
+func TestStore_SharedBucketAcrossReplicas(t *testing.T) {
+	clients := objectstoretest.NewSharedStores(t, 2)
+	replicaA := NewStoreWithObjectStore(clients[0])
+	replicaB := NewStoreWithObjectStore(clients[1])
+	now := time.Now().Truncate(time.Second)
+
+	// Queue-grouped listeners spread one job's events across replicas:
+	// the creation and first step land on A, the second step on B.
+	putObject(t, clients[0], createdKey("web-1", "job-shared"),
+		[]byte(`{"ID":"step-1","CompletionStatus":0}`+"\n"+`{"ID":"step-2","CompletionStatus":0}`+"\n"))
+	writeJobMeta(t, clients[0], "web-1", "job-shared", "UPUBKEY_ALICE")
+	writeJobEvent(t, clients[0], "web-1", "job-shared", now, makeStep("step-1", cook.StepCompleted, now, time.Second))
+	writeJobEvent(t, clients[1], "web-1", "job-shared", now.Add(time.Millisecond), makeStep("step-2", cook.StepFailed, now, 2*time.Second))
+	writeJobFile(t, clients[1], "db-1", "job-other", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, now.Add(time.Minute), time.Second),
+	})
+
+	for name, replica := range map[string]*Store{"A": replicaA, "B": replicaB} {
+		got, err := replica.GetJob("web-1", "job-shared")
+		if err != nil {
+			t.Fatalf("replica %s GetJob: %v", name, err)
+		}
+		if got.Total != 4 || got.Succeeded != 1 || got.Failed != 1 || got.InvokedBy != "UPUBKEY_ALICE" {
+			t.Errorf("replica %s sees %+v, want the whole job from both replicas' writes", name, got)
+		}
+		if got.Status != JobFailed {
+			t.Errorf("replica %s status = %s, want failed", name, got.Status)
+		}
+
+		found, err := replica.FindJob("job-other")
+		if err != nil || found.SproutID != "db-1" {
+			t.Errorf("replica %s FindJob(job-other) = %+v, %v", name, found, err)
+		}
+		all, err := replica.ListAllJobs(0)
+		if err != nil || len(all) != 2 {
+			t.Errorf("replica %s ListAllJobs = %d jobs, %v; want 2", name, len(all), err)
+		}
+		sprouts, err := replica.ListSprouts()
+		if err != nil || fmt.Sprint(sprouts) != "[db-1 web-1]" {
+			t.Errorf("replica %s ListSprouts = %v, %v", name, sprouts, err)
+		}
+	}
+
+	// A delete through one replica is seen by the other.
+	if err := replicaB.DeleteJob("job-shared"); err != nil {
+		t.Fatalf("replica B DeleteJob: %v", err)
+	}
+	if _, err := replicaA.GetJob("web-1", "job-shared"); err != ErrJobNotFound {
+		t.Errorf("replica A after B's delete: expected ErrJobNotFound, got %v", err)
 	}
 }

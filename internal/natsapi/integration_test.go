@@ -809,7 +809,7 @@ func TestHandleJobsCancelWithNATS(t *testing.T) {
 	nc, cleanup := startEmbeddedNATS(t)
 	defer cleanup()
 
-	dir, jobCleanup := setupJobStore(t)
+	obj, jobCleanup := setupJobStore(t)
 	defer jobCleanup()
 
 	tenantID := pki.CurrentTenantID()
@@ -823,7 +823,7 @@ func TestHandleJobsCancelWithNATS(t *testing.T) {
 	steps := []cook.StepCompletion{
 		{ID: "s1", Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-cancel-int", "jid-cancel-int", steps)
+	writeTestJob(t, obj, "sprout-cancel-int", "jid-cancel-int", steps)
 
 	// Subscribe to capture the cancel message.
 	cancelReceived := make(chan bool, 1)

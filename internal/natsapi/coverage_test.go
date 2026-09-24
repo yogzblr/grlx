@@ -459,7 +459,7 @@ func TestHandleSproutsListWithToken(t *testing.T) {
 // --- handleJobsList scope filtering ---
 
 func TestHandleJobsListDangerouslyAllowRoot(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, true)
@@ -468,7 +468,7 @@ func TestHandleJobsListDangerouslyAllowRoot(t *testing.T) {
 	steps := []cook.StepCompletion{
 		{ID: "s1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-dar-j", "jid-dar-1", steps)
+	writeTestJob(t, obj, "sprout-dar-j", "jid-dar-1", steps)
 
 	result, err := handleJobsList(pki.CurrentTenantID(), nil)
 	if err != nil {
@@ -482,7 +482,7 @@ func TestHandleJobsListDangerouslyAllowRoot(t *testing.T) {
 }
 
 func TestHandleJobsListWithTokenScope(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, false)
@@ -491,7 +491,7 @@ func TestHandleJobsListWithTokenScope(t *testing.T) {
 	steps := []cook.StepCompletion{
 		{ID: "s1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-scope-j", "jid-scope-1", steps)
+	writeTestJob(t, obj, "sprout-scope-j", "jid-scope-1", steps)
 
 	// Token-based filtering with invalid token.
 	params := json.RawMessage(`{"token":"invalid-token"}`)
@@ -523,13 +523,13 @@ func TestHandleJobsListInvalidJSON(t *testing.T) {
 // --- handleJobsCancel with non-cancellable status ---
 
 func TestHandleJobsCancelCompletedJob(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
 		{ID: "s1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-done", "jid-done", steps)
+	writeTestJob(t, obj, "sprout-done", "jid-done", steps)
 
 	params := json.RawMessage(`{"jid":"jid-done"}`)
 	_, err := handleJobsCancel(pki.CurrentTenantID(), params)
@@ -643,7 +643,7 @@ func TestSubscribeSessionDoneEmptySubject(t *testing.T) {
 // --- handleJobsCancel scope check path ---
 
 func TestHandleJobsCancelWithTokenScope(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	jetyCleanup := setupJetyDangerouslyAllowRoot(t, false)
@@ -652,7 +652,7 @@ func TestHandleJobsCancelWithTokenScope(t *testing.T) {
 	steps := []cook.StepCompletion{
 		{ID: "s1", Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-cancel-scope", "jid-cancel-scope", steps)
+	writeTestJob(t, obj, "sprout-cancel-scope", "jid-cancel-scope", steps)
 
 	ClearNatsConn(pki.CurrentTenantID())
 
@@ -1076,7 +1076,7 @@ func TestHandleSproutsListWithValidToken(t *testing.T) {
 // --- handleJobsList with valid token (scope filtering active path) ---
 
 func TestHandleJobsListWithValidToken(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	token, authCleanup := setupAuthWithToken(t, "viewer", []rbac.Rule{
@@ -1088,8 +1088,8 @@ func TestHandleJobsListWithValidToken(t *testing.T) {
 	steps := []cook.StepCompletion{
 		{ID: "s1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-jl-1", "jid-jl-1", steps)
-	writeTestJob(t, dir, "sprout-jl-2", "jid-jl-2", steps)
+	writeTestJob(t, obj, "sprout-jl-1", "jid-jl-1", steps)
+	writeTestJob(t, obj, "sprout-jl-2", "jid-jl-2", steps)
 
 	params, _ := json.Marshal(map[string]string{"token": token})
 	result, err := handleJobsList(pki.CurrentTenantID(), params)

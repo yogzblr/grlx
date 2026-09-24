@@ -7,7 +7,7 @@
 // and internal/cook's both need it.
 //
 // It doesn't validate request signing, and understands just enough of
-// the protocol (GET/PUT/HEAD on objects, HEAD on the bucket,
+// the protocol (GET/PUT/HEAD/DELETE on objects, HEAD on the bucket,
 // ListObjectsV2, GetBucketLocation, and aws-chunked streaming-signature
 // bodies) for minio-go's client to consider it a working single-node
 // endpoint.
@@ -218,6 +218,10 @@ func (f *fakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
+	case http.MethodDelete:
+		// S3 answers 204 whether or not the key existed.
+		delete(f.data, key)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}

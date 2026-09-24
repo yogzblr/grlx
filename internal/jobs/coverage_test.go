@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,172 +9,33 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 )
 
 // --- StartReaper / reap edge cases ---
 
 func TestStartReaper_NegativeTTL(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout")
-	os.MkdirAll(sproutDir, 0o700)
-	jobFile := filepath.Join(sproutDir, "j.jsonl")
-	os.WriteFile(jobFile, []byte("{}\n"), 0o644)
-	past := time.Now().Add(-9999 * time.Hour)
-	os.Chtimes(jobFile, past, past)
+	store, obj := newTestStore(t)
+	writeJobEvent(t, obj, "sprout", "j", time.Now().Add(-9999*time.Hour), makeStep("s1", cook.StepCompleted, time.Now(), time.Second))
 
 	// Negative TTL should disable reaper (same as zero).
 	store.StartReaper(-1 * time.Hour)
 
-	if _, err := os.Stat(jobFile); err != nil {
-		t.Error("expected job file to survive with negative TTL")
+	if _, err := store.GetJob("sprout", "j"); err != nil {
+		t.Errorf("expected job to survive with negative TTL: %v", err)
 	}
-}
-
-func TestReap_EmptyLogDir(t *testing.T) {
-	store := NewStoreWithDir("")
-	// Should not panic — listSproutDirsUnlocked returns ErrInvalidJobDir.
-	store.reap(24 * time.Hour)
-}
-
-func TestReap_NonexistentLogDir(t *testing.T) {
-	store := NewStoreWithDir("/tmp/nonexistent-reap-test-dir-xyz")
-	// Should handle gracefully.
-	store.reap(24 * time.Hour)
-}
-
-func TestReap_InfoError(t *testing.T) {
-	// This exercises the entry.Info() error path.
-	// Hard to trigger with real filesystem, but we verify reap doesn't crash
-	// on directories with unreadable entries.
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-	sproutDir := filepath.Join(dir, "sprout-info")
-	os.MkdirAll(sproutDir, 0o700)
-
-	// Create a directory inside sprout dir that looks like a jsonl file — IsDir check.
-	os.MkdirAll(filepath.Join(sproutDir, "fake.jsonl"), 0o700)
-
-	// Also add a valid old job to ensure the directory-named "jsonl" doesn't crash.
-	oldJob := filepath.Join(sproutDir, "real.jsonl")
-	os.WriteFile(oldJob, []byte("{}\n"), 0o644)
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldJob, past, past)
-
-	store.reap(24 * time.Hour)
-
-	// fake.jsonl dir should still exist (it's a dir, skipped by IsDir check).
-	if _, err := os.Stat(filepath.Join(sproutDir, "fake.jsonl")); err != nil {
-		t.Error("expected directory-named fake.jsonl to be untouched")
-	}
-	// real.jsonl should be removed.
-	if _, err := os.Stat(oldJob); !os.IsNotExist(err) {
-		t.Error("expected real.jsonl to be removed")
-	}
-}
-
-func TestReap_RemoveError(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test remove permission errors as root")
-	}
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout-perm")
-	os.MkdirAll(sproutDir, 0o700)
-
-	oldJob := filepath.Join(sproutDir, "protected.jsonl")
-	os.WriteFile(oldJob, []byte("{}\n"), 0o644)
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldJob, past, past)
-
-	// Make sprout dir read-only to prevent deletion.
-	os.Chmod(sproutDir, 0o555)
-	t.Cleanup(func() { os.Chmod(sproutDir, 0o700) })
-
-	// Should not panic — the remove error is logged.
-	store.reap(24 * time.Hour)
-}
-
-func TestReap_ReadDirError(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test readdir permission errors as root")
-	}
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout-unreadable")
-	os.MkdirAll(sproutDir, 0o700)
-	os.WriteFile(filepath.Join(sproutDir, "job.jsonl"), []byte("{}\n"), 0o644)
-
-	// Make sprout dir unreadable.
-	os.Chmod(sproutDir, 0o000)
-	t.Cleanup(func() { os.Chmod(sproutDir, 0o700) })
-
-	// Should handle gracefully (continue past ReadDir error).
-	store.reap(24 * time.Hour)
 }
 
 // --- RegisterNatsConn edge cases ---
 
-func TestRegisterNatsConn_ReadOnlyDir(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
-	}
-	dir := t.TempDir()
-	// Make dir read-only so MkdirAll fails.
-	readonlyDir := filepath.Join(dir, "readonly")
-	os.MkdirAll(readonlyDir, 0o555)
-	t.Cleanup(func() { os.Chmod(readonlyDir, 0o700) })
-
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = filepath.Join(readonlyDir, "joblogs")
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-
-	// Should not panic — error is logged.
-	RegisterNatsConn("t_test", conn)
-}
-
 // --- logJobs edge cases ---
 
-func TestLogJobs_ShortSubject(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+func TestLogJobCreation_ThreeSteps(t *testing.T) {
+	obj := useTestObjStore(t)
 
 	_, conn := startTestNATSServer(t)
 	RegisterNatsConn("t_test", conn)
 
-	// Subscribe to a subject that will produce short components.
-	// Publish directly to the callback won't work via NATS wildcard,
-	// but we can test that short subjects on cook creation are handled.
-	// grlx.sprouts.X.cook with too-short subject.
-	if err := conn.Publish("grlx.sprouts.s.cook", []byte(`{"job_id":"","steps":[]}`)); err != nil {
-		t.Fatal(err)
-	}
-	conn.Flush()
-	time.Sleep(200 * time.Millisecond)
-	// No crash = pass.
-}
-
-func TestLogJobCreation_ShortSubject(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// We can't easily trigger the < 4 components path via NATS subscription
-	// since the wildcard pattern guarantees 4 parts. But verify that
-	// the callback handles envelope parse failures gracefully.
 	envelope := cook.RecipeEnvelope{
 		JobID:     "sub-test",
 		InvokedBy: "UTEST",
@@ -184,56 +46,15 @@ func TestLogJobCreation_ShortSubject(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Flush()
-	time.Sleep(300 * time.Millisecond)
 
 	// Verify 3 steps written.
-	jobFile := filepath.Join(dir, "sprout-sub", "sub-test.jsonl")
-	steps, err := readJobFile(jobFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != 3 {
-		t.Errorf("expected 3 placeholder steps, got %d", len(steps))
+	summary := waitForSteps(t, obj, "sprout-sub", "sub-test", 3)
+	if len(summary.Steps) != 3 {
+		t.Errorf("expected 3 placeholder steps, got %d", len(summary.Steps))
 	}
 }
 
 // --- logJobs concurrent writes ---
-
-func TestLogJobs_ConcurrentSteps(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// Publish many steps concurrently.
-	const stepCount = 20
-	for i := range stepCount {
-		step := cook.StepCompletion{
-			ID:               cook.StepID(fmt.Sprintf("step-%d", i)),
-			CompletionStatus: cook.StepCompleted,
-			Started:          time.Now(),
-			Duration:         time.Millisecond,
-		}
-		data, _ := json.Marshal(step)
-		if err := conn.Publish("grlx.cook.sprout-concurrent.job-concurrent", data); err != nil {
-			t.Fatal(err)
-		}
-	}
-	conn.Flush()
-	time.Sleep(500 * time.Millisecond)
-
-	jobFile := filepath.Join(dir, "sprout-concurrent", "job-concurrent.jsonl")
-	steps, err := readJobFile(jobFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != stepCount {
-		t.Errorf("expected %d steps, got %d", stepCount, len(steps))
-	}
-}
 
 // --- CLIStore error paths ---
 
@@ -514,49 +335,42 @@ func TestCLIListener_HandleStepCompletion_RecordError(t *testing.T) {
 
 // --- Store.listSproutDirs edge cases ---
 
-func TestStore_ListSproutDirs_FilesIgnored(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestListSprouts_StrayObjectsIgnored(t *testing.T) {
+	store, obj := newTestStore(t)
 
-	// Create files (not dirs) — should be ignored.
-	os.WriteFile(filepath.Join(dir, "not-a-sprout.txt"), []byte("hi"), 0o644)
-	os.WriteFile(filepath.Join(dir, "also-not"), []byte("hi"), 0o644)
+	// Objects that don't fit the job layout — should be ignored.
+	putObject(t, obj, "jobs/not-a-sprout.txt", []byte("hi"))
+	putObject(t, obj, "jobs/also-not/x", []byte("hi"))
+	putObject(t, obj, "elsewhere/sprout/job/created.jsonl", []byte("{}\n"))
 
 	sprouts, err := store.ListSprouts()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(sprouts) != 0 {
-		t.Errorf("expected 0 sprouts (files should be ignored), got %d", len(sprouts))
+		t.Errorf("expected 0 sprouts (stray objects should be ignored), got %v", sprouts)
 	}
 }
 
 // --- ListJobsForSprout with unreadable job file ---
 
-func TestListJobsForSprout_UnreadableJobFile(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
-	}
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestListJobsForSprout_CorruptJobSkipped(t *testing.T) {
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
 	// One good job.
-	writeJobFile(t, dir, "sprout-unreadable", "good-job", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-unreadable", "good-job", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
 
-	// One unreadable job file.
-	badFile := filepath.Join(dir, "sprout-unreadable", "bad-job.jsonl")
-	os.WriteFile(badFile, []byte("{}\n"), 0o644)
-	os.Chmod(badFile, 0o000)
-	t.Cleanup(func() { os.Chmod(badFile, 0o644) })
+	// One job whose log can't be parsed.
+	putObject(t, obj, createdKey("sprout-unreadable", "bad-job"), []byte("not json\n"))
 
 	summaries, err := store.ListJobsForSprout("sprout-unreadable")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Bad file should be skipped.
+	// Bad job should be skipped.
 	if len(summaries) != 1 {
 		t.Errorf("expected 1 (bad skipped), got %d", len(summaries))
 	}
@@ -564,25 +378,17 @@ func TestListJobsForSprout_UnreadableJobFile(t *testing.T) {
 
 // --- ListAllJobs with unreadable sprout dir ---
 
-func TestListAllJobs_UnreadableSproutDir(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
-	}
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestListAllJobs_CorruptSproutSkipped(t *testing.T) {
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
 	// Good sprout.
-	writeJobFile(t, dir, "good-sprout", "j1", []cook.StepCompletion{
+	writeJobFile(t, obj, "good-sprout", "j1", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
 
-	// Unreadable sprout dir.
-	badSprout := filepath.Join(dir, "bad-sprout")
-	os.MkdirAll(badSprout, 0o700)
-	os.WriteFile(filepath.Join(badSprout, "j2.jsonl"), []byte("{}\n"), 0o644)
-	os.Chmod(badSprout, 0o000)
-	t.Cleanup(func() { os.Chmod(badSprout, 0o700) })
+	// A sprout whose only job can't be parsed.
+	putObject(t, obj, eventKey("bad-sprout", "j2", now), []byte("{not json\n"))
 
 	summaries, err := store.ListAllJobs(0)
 	if err != nil {
@@ -596,21 +402,16 @@ func TestListAllJobs_UnreadableSproutDir(t *testing.T) {
 // --- CountJobsForSprout with read error ---
 
 func TestCountJobsForSprout_ReadError(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
-	}
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	srv, obj := useTestObjServer(t)
+	store := NewStoreWithObjectStore(obj)
+	writeJobFile(t, obj, "sprout-count-err", "j", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, time.Now(), time.Second),
+	})
 
-	sproutDir := filepath.Join(dir, "sprout-count-err")
-	os.MkdirAll(sproutDir, 0o700)
-	os.WriteFile(filepath.Join(sproutDir, "j.jsonl"), []byte("{}\n"), 0o644)
-	os.Chmod(sproutDir, 0o000)
-	t.Cleanup(func() { os.Chmod(sproutDir, 0o700) })
-
+	srv.FailNext(1, 403, "AccessDenied")
 	_, err := store.CountJobsForSprout("sprout-count-err")
 	if err == nil {
-		t.Error("expected error for unreadable sprout dir")
+		t.Error("expected error when the object store listing fails")
 	}
 }
 
@@ -674,15 +475,14 @@ func TestBuildSummary_EmptySteps(t *testing.T) {
 // --- FindJob across multiple sprouts ---
 
 func TestFindJob_MultipleSprouts(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now()
 
 	// Same JID across two sprouts — FindJob returns the first one found.
-	writeJobFile(t, dir, "sprout-1", "shared-jid", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-1", "shared-jid", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
-	writeJobFile(t, dir, "sprout-2", "other-jid", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-2", "other-jid", []cook.StepCompletion{
 		makeStep("s1", cook.StepFailed, now, time.Second),
 	})
 
@@ -698,10 +498,7 @@ func TestFindJob_MultipleSprouts(t *testing.T) {
 // --- logJobCreation with marshal error in steps (unlikely but safe) ---
 
 func TestLogJobCreation_ManySteps(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+	obj := useTestObjStore(t)
 
 	_, conn := startTestNATSServer(t)
 	RegisterNatsConn("t_test", conn)
@@ -722,15 +519,10 @@ func TestLogJobCreation_ManySteps(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Flush()
-	time.Sleep(300 * time.Millisecond)
 
-	jobFile := filepath.Join(dir, "sprout-many", "many-steps-job.jsonl")
-	readSteps, err := readJobFile(jobFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(readSteps) != 50 {
-		t.Errorf("expected 50 steps, got %d", len(readSteps))
+	summary := waitForSteps(t, obj, "sprout-many", "many-steps-job", 50)
+	if len(summary.Steps) != 50 {
+		t.Errorf("expected 50 steps, got %d", len(summary.Steps))
 	}
 }
 
@@ -758,22 +550,18 @@ func TestJobStatus_AllStrings(t *testing.T) {
 // --- StartReaper with positive TTL ---
 
 func TestStartReaper_PositiveTTL(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout-reaper")
-	os.MkdirAll(sproutDir, 0o700)
-	oldJob := filepath.Join(sproutDir, "old.jsonl")
-	os.WriteFile(oldJob, []byte("{}\n"), 0o644)
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldJob, past, past)
+	store, obj := newTestStore(t)
+	writeJobEvent(t, obj, "sprout-reaper", "old", time.Now().Add(-48*time.Hour), makeStep("s1", cook.StepCompleted, time.Now(), time.Second))
 
 	// StartReaper with positive TTL should run reap immediately, then start ticker.
-	store.StartReaper(24 * time.Hour)
-	// Give the goroutine time to execute.
-	time.Sleep(200 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	store.StartReaperCtx(ctx, 24*time.Hour)
 
-	if _, err := os.Stat(oldJob); !os.IsNotExist(err) {
+	if !eventually(5*time.Second, func() bool {
+		_, err := store.GetJob("sprout-reaper", "old")
+		return err == ErrJobNotFound
+	}) {
 		t.Error("expected old job to be removed by StartReaper initial reap")
 	}
 }
@@ -819,94 +607,12 @@ func TestCLIListener_SubscribeJob_ClosedConn(t *testing.T) {
 
 // --- logJobs: write to read-only sprout dir ---
 
-func TestLogJobs_WriteToReadOnlyDir(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
-	}
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// Create sprout dir and make it read-only.
-	sproutDir := filepath.Join(dir, "sprout-ro")
-	os.MkdirAll(sproutDir, 0o700)
-	os.Chmod(sproutDir, 0o555)
-	t.Cleanup(func() { os.Chmod(sproutDir, 0o700) })
-
-	step := cook.StepCompletion{
-		ID:               "s1",
-		CompletionStatus: cook.StepCompleted,
-		Started:          time.Now(),
-		Duration:         time.Second,
-	}
-	data, _ := json.Marshal(step)
-
-	// Publishing to a read-only sprout dir should not panic.
-	if err := conn.Publish("grlx.cook.sprout-ro.job-ro", data); err != nil {
-		t.Fatal(err)
-	}
-	conn.Flush()
-	time.Sleep(200 * time.Millisecond)
-}
-
 // --- logJobs: existing file append path ---
-
-func TestLogJobs_ExistingFileAppend(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// Pre-create the sprout dir and an existing job file.
-	sproutDir := filepath.Join(dir, "sprout-existing")
-	os.MkdirAll(sproutDir, 0o700)
-	existingStep := cook.StepCompletion{
-		ID:               "existing-step",
-		CompletionStatus: cook.StepCompleted,
-		Started:          time.Now(),
-		Duration:         time.Second,
-	}
-	b, _ := json.Marshal(existingStep)
-	jobFile := filepath.Join(sproutDir, "existing-job.jsonl")
-	os.WriteFile(jobFile, append(b, '\n'), 0o644)
-
-	// Publish a new step — should append to existing file.
-	newStep := cook.StepCompletion{
-		ID:               "new-step",
-		CompletionStatus: cook.StepFailed,
-		Started:          time.Now(),
-		Duration:         2 * time.Second,
-	}
-	data, _ := json.Marshal(newStep)
-	if err := conn.Publish("grlx.cook.sprout-existing.existing-job", data); err != nil {
-		t.Fatal(err)
-	}
-	conn.Flush()
-	time.Sleep(300 * time.Millisecond)
-
-	steps, err := readJobFile(jobFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != 2 {
-		t.Errorf("expected 2 steps (1 existing + 1 new), got %d", len(steps))
-	}
-}
 
 // --- logJobs: new file creation path (sprout dir doesn't exist) ---
 
-func TestLogJobs_NewSproutDir(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+func TestLogJobs_NewSprout(t *testing.T) {
+	obj := useTestObjStore(t)
 
 	_, conn := startTestNATSServer(t)
 	RegisterNatsConn("t_test", conn)
@@ -919,57 +625,38 @@ func TestLogJobs_NewSproutDir(t *testing.T) {
 	}
 	data, _ := json.Marshal(step)
 
-	// Publish to a sprout that doesn't have a directory yet.
+	// Publish for a sprout and job with no objects yet: the event alone
+	// creates the job.
 	if err := conn.Publish("grlx.cook.brand-new-sprout.new-job", data); err != nil {
 		t.Fatal(err)
 	}
 	conn.Flush()
-	time.Sleep(300 * time.Millisecond)
 
-	// Verify both dir and file were created.
-	jobFile := filepath.Join(dir, "brand-new-sprout", "new-job.jsonl")
-	if _, err := os.Stat(jobFile); err != nil {
-		t.Fatalf("expected job file to be created: %v", err)
-	}
-	steps, err := readJobFile(jobFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != 1 {
-		t.Errorf("expected 1 step, got %d", len(steps))
+	summary := waitForSteps(t, obj, "brand-new-sprout", "new-job", 1)
+	if len(summary.Steps) != 1 {
+		t.Errorf("expected 1 step, got %d", len(summary.Steps))
 	}
 }
 
 // --- logJobCreation: read-only dir (MkdirAll fails) ---
 
-func TestLogJobCreation_ReadOnlyDir(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
+func TestLogJobCreation_PutError(t *testing.T) {
+	srv, obj := useTestObjServer(t)
+
+	// The existence check finds nothing; then both the meta.json and the
+	// created.jsonl Put fail.
+	srv.FailNext(1, 404, "NoSuchKey")
+	srv.FailNext(2, 403, "AccessDenied")
+	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout-fail.cook", cook.RecipeEnvelope{JobID: "fail-create", Steps: []cook.Step{{ID: "s1"}}}))
+
+	// Should not panic, and no half-created job is visible.
+	store := NewStoreWithObjectStore(obj)
+	if _, err := store.GetJob("sprout-fail", "fail-create"); err != ErrJobNotFound {
+		t.Errorf("expected ErrJobNotFound, got %v", err)
 	}
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// Make dir read-only so MkdirAll for sprout dir fails.
-	os.Chmod(dir, 0o555)
-	t.Cleanup(func() { os.Chmod(dir, 0o700) })
-
-	envelope := cook.RecipeEnvelope{
-		JobID: "fail-create",
-		Steps: []cook.Step{{ID: "s1"}},
+	if keys := listKeys(t, obj, jobKeyPrefix); len(keys) != 0 {
+		t.Errorf("expected nothing written, got %v", keys)
 	}
-	data, _ := json.Marshal(envelope)
-
-	if err := conn.Publish("grlx.sprouts.sprout-fail.cook", data); err != nil {
-		t.Fatal(err)
-	}
-	conn.Flush()
-	time.Sleep(200 * time.Millisecond)
-	// Should not panic.
 }
 
 // --- CLIStore listSproutDirs error path ---
@@ -1001,11 +688,6 @@ func TestCLIStore_ListSproutDirs_ReadError(t *testing.T) {
 // --- RegisterNatsConn with closed connection ---
 
 func TestRegisterNatsConn_ClosedConn(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = filepath.Join(dir, "joblogs")
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
 	_, conn := startTestNATSServer(t)
 	conn.Close()
 
@@ -1104,71 +786,7 @@ func TestCLIStore_GetJob_AcrossSprouts(t *testing.T) {
 
 // --- logJobCreation: create file error (dir is a file) ---
 
-func TestLogJobCreation_CreateFileError(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// Pre-create the sprout dir but put a FILE where the job file should be.
-	sproutDir := filepath.Join(dir, "sprout-filecollision")
-	os.MkdirAll(sproutDir, 0o700)
-	// Create a directory where the job file should be — os.Create will fail.
-	os.MkdirAll(filepath.Join(sproutDir, "collision-job.jsonl"), 0o700)
-
-	envelope := cook.RecipeEnvelope{
-		JobID: "collision-job",
-		Steps: []cook.Step{{ID: "s1"}},
-	}
-	data, _ := json.Marshal(envelope)
-
-	if err := conn.Publish("grlx.sprouts.sprout-filecollision.cook", data); err != nil {
-		t.Fatal(err)
-	}
-	conn.Flush()
-	time.Sleep(200 * time.Millisecond)
-	// Should not panic — os.Create error is logged.
-}
-
 // --- logJobs: file is read-only (OpenFile append fails) ---
-
-func TestLogJobs_ReadOnlyExistingFile(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("cannot test permission errors as root")
-	}
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
-
-	_, conn := startTestNATSServer(t)
-	RegisterNatsConn("t_test", conn)
-
-	// Create a read-only existing job file.
-	sproutDir := filepath.Join(dir, "sprout-readonly-file")
-	os.MkdirAll(sproutDir, 0o700)
-	jobFile := filepath.Join(sproutDir, "ro-job.jsonl")
-	os.WriteFile(jobFile, []byte("{}\n"), 0o444)
-	t.Cleanup(func() { os.Chmod(jobFile, 0o644) })
-
-	step := cook.StepCompletion{
-		ID:               "s1",
-		CompletionStatus: cook.StepCompleted,
-		Started:          time.Now(),
-		Duration:         time.Second,
-	}
-	data, _ := json.Marshal(step)
-
-	if err := conn.Publish("grlx.cook.sprout-readonly-file.ro-job", data); err != nil {
-		t.Fatal(err)
-	}
-	conn.Flush()
-	time.Sleep(200 * time.Millisecond)
-	// Should not panic — OpenFile error is logged.
-}
 
 // --- DefaultCLIStorePath without XDG_CONFIG_HOME ---
 

@@ -101,6 +101,30 @@ func TestList(t *testing.T) {
 	}
 }
 
+func TestDelete(t *testing.T) {
+	store := objectstoretest.NewStore(t)
+	ctx := context.Background()
+
+	if err := store.Put(ctx, "jobs/a/j1/created.jsonl", []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := store.Delete(ctx, "jobs/a/j1/created.jsonl"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	exists, err := store.Exists(ctx, "jobs/a/j1/created.jsonl")
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if exists {
+		t.Error("expected key to be gone after Delete")
+	}
+
+	// Deleting a missing key succeeds, matching S3's DeleteObject.
+	if err := store.Delete(ctx, "jobs/a/j1/created.jsonl"); err != nil {
+		t.Errorf("Delete of missing key: %v", err)
+	}
+}
+
 func TestOpenValidation(t *testing.T) {
 	if _, err := objectstore.Open(objectstore.Config{Bucket: "recipes"}); err == nil {
 		t.Error("expected an error for an empty endpoint")

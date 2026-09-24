@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/gogrlx/grlx/v2/internal/cook"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
+	"github.com/gogrlx/grlx/v2/internal/objectstore/objectstoretest"
 )
 
 func TestNewStore_Default(t *testing.T) {
-	// NewStore uses config.JobLogDir; verify it returns a non-nil store.
+	// NewStore uses the package-level store; verify it returns a non-nil store.
 	store := NewStore()
 	if store == nil {
 		t.Fatal("expected non-nil store")
@@ -52,90 +54,84 @@ func TestReadJobFile_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestListSproutDirs_EmptyLogDir(t *testing.T) {
-	store := NewStoreWithDir("")
-	_, err := store.listSproutDirs()
-	if err != ErrInvalidJobDir {
-		t.Errorf("expected ErrInvalidJobDir, got %v", err)
+func TestGetJob_InvalidRef(t *testing.T) {
+	store, obj := newTestStore(t)
+	writeJobFile(t, obj, "sprout", "job", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, time.Now(), time.Second),
+	})
+
+	for _, ref := range [][2]string{{"", "job"}, {"sprout", ""}, {"..", "job"}, {"sprout/job", "x"}, {"sprout", "job/events"}} {
+		if _, err := store.GetJob(ref[0], ref[1]); err != ErrJobNotFound {
+			t.Errorf("GetJob(%q, %q): expected ErrJobNotFound, got %v", ref[0], ref[1], err)
+		}
+	}
+	if _, err := store.ListJobsForSprout("a/b"); err != ErrSproutNoJobs {
+		t.Errorf("ListJobsForSprout: expected ErrSproutNoJobs, got %v", err)
 	}
 }
 
 func TestGetJob_ReadError(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 
-	// Create a sprout dir with a directory named like a job file.
-	sproutDir := filepath.Join(dir, "sprout-err")
-	os.MkdirAll(filepath.Join(sproutDir, "job-dir.jsonl"), 0o700)
+	// An event object that isn't valid JSONL.
+	putObject(t, obj, eventKey("sprout-err", "job-bad", time.Now()), []byte("not json\n"))
 
-	_, err := store.GetJob("sprout-err", "job-dir")
-	if err == nil {
-		t.Error("expected error when job file is a directory")
+	_, err := store.GetJob("sprout-err", "job-bad")
+	if err == nil || err == ErrJobNotFound {
+		t.Errorf("expected a read error for a corrupt event object, got %v", err)
 	}
 }
 
-func TestFindJob_EmptyLogDir(t *testing.T) {
-	store := NewStoreWithDir("")
-	_, err := store.FindJob("any-jid")
-	if err != ErrInvalidJobDir {
-		t.Errorf("expected ErrInvalidJobDir, got %v", err)
+func TestGetJob_ObjectStoreError(t *testing.T) {
+	srv := objectstoretest.NewServer(t)
+	obj, err := objectstore.Open(srv.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithObjectStore(obj)
+	writeJobFile(t, obj, "sprout-err", "job", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, time.Now(), time.Second),
+	})
+
+	srv.FailNext(1, 403, "AccessDenied")
+	if _, err := store.GetJob("sprout-err", "job"); err == nil || err == ErrJobNotFound {
+		t.Errorf("expected the object store's error to surface, got %v", err)
 	}
 }
 
-func TestListAllJobs_InvalidLogDir(t *testing.T) {
-	store := NewStoreWithDir("")
-	_, err := store.ListAllJobs(0)
-	if err != ErrInvalidJobDir {
-		t.Errorf("expected ErrInvalidJobDir, got %v", err)
-	}
-}
+func TestCountJobsForSprout_IgnoresStrayObjects(t *testing.T) {
+	store, obj := newTestStore(t)
 
-func TestListSprouts_InvalidLogDir(t *testing.T) {
-	store := NewStoreWithDir("")
-	_, err := store.ListSprouts()
-	if err != ErrInvalidJobDir {
-		t.Errorf("expected ErrInvalidJobDir, got %v", err)
-	}
-}
-
-func TestCountJobsForSprout_IgnoresNonJsonl(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout-mixed")
-	os.MkdirAll(sproutDir, 0o700)
-
-	// Create a .jsonl file, a .meta.json file, and a subdirectory.
-	os.WriteFile(filepath.Join(sproutDir, "job.jsonl"), []byte("{}"), 0o644)
-	os.WriteFile(filepath.Join(sproutDir, "job.meta.json"), []byte("{}"), 0o644)
-	os.MkdirAll(filepath.Join(sproutDir, "subdir"), 0o700)
+	writeJobFile(t, obj, "sprout-mixed", "job", []cook.StepCompletion{
+		makeStep("s1", cook.StepCompleted, time.Now(), time.Second),
+	})
+	// Metadata alone doesn't make a job, and keys outside the layout are
+	// ignored.
+	writeJobMeta(t, obj, "sprout-mixed", "meta-only", "UPUBKEY")
+	putObject(t, obj, "jobs/sprout-mixed/readme.txt", []byte("hi"))
+	putObject(t, obj, "jobs/sprout-mixed/job/notes.txt", []byte("hi"))
+	putObject(t, obj, "jobs/sprout-mixed/job/events/nested/x.jsonl", []byte("{}\n"))
 
 	count, err := store.CountJobsForSprout("sprout-mixed")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
-		t.Errorf("expected 1 (only .jsonl), got %d", count)
+		t.Errorf("expected 1 job, got %d", count)
 	}
 }
 
-func TestListJobsForSprout_SkipsDirs(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+func TestListJobsForSprout_SkipsStrayObjects(t *testing.T) {
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
-	sproutDir := filepath.Join(dir, "sprout-dirs")
-	os.MkdirAll(sproutDir, 0o700)
-
 	// Create a real job.
-	writeJobFile(t, dir, "sprout-dirs", "real-job", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-dirs", "real-job", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
-
-	// Create a subdirectory that should be ignored.
-	os.MkdirAll(filepath.Join(sproutDir, "not-a-job"), 0o700)
-	// Create a non-jsonl file.
-	os.WriteFile(filepath.Join(sproutDir, "readme.txt"), []byte("hi"), 0o644)
+	// Objects that aren't part of any job's log.
+	putObject(t, obj, "jobs/sprout-dirs/readme.txt", []byte("hi"))
+	putObject(t, obj, "jobs/sprout-dirs/not-a-job/other.bin", []byte("hi"))
 
 	summaries, err := store.ListJobsForSprout("sprout-dirs")
 	if err != nil {
@@ -178,14 +174,13 @@ func TestBuildSummary_Skipped(t *testing.T) {
 }
 
 func TestListAllJobs_WithInvokedBy(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
+	store, obj := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
 
-	writeJobFile(t, dir, "sprout-allinv", "job-inv-1", []cook.StepCompletion{
+	writeJobFile(t, obj, "sprout-allinv", "job-inv-1", []cook.StepCompletion{
 		makeStep("s1", cook.StepCompleted, now, time.Second),
 	})
-	writeJobMeta(t, dir, "sprout-allinv", "job-inv-1", "UPUBKEY_TESTER")
+	writeJobMeta(t, obj, "sprout-allinv", "job-inv-1", "UPUBKEY_TESTER")
 
 	summaries, err := store.ListAllJobs(0)
 	if err != nil {
@@ -273,75 +268,6 @@ func TestCLIStore_GetJob_WithBadMeta(t *testing.T) {
 	}
 	if meta != nil {
 		t.Error("expected nil meta for malformed meta file")
-	}
-}
-
-func TestReap_RemovesMetaFiles(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout-meta-reap")
-	os.MkdirAll(sproutDir, 0o700)
-
-	// Create old job + meta.
-	oldJob := filepath.Join(sproutDir, "old-with-meta.jsonl")
-	oldMeta := filepath.Join(sproutDir, "old-with-meta.meta.json")
-	os.WriteFile(oldJob, []byte("{}\n"), 0o644)
-	os.WriteFile(oldMeta, []byte(`{"jid":"old-with-meta"}`), 0o644)
-
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldJob, past, past)
-
-	store.reap(24 * time.Hour)
-
-	if _, err := os.Stat(oldJob); !os.IsNotExist(err) {
-		t.Error("expected old job to be removed")
-	}
-	if _, err := os.Stat(oldMeta); !os.IsNotExist(err) {
-		t.Error("expected old meta to be removed along with job")
-	}
-}
-
-func TestListSproutDirsUnlocked_EmptyLogDir(t *testing.T) {
-	store := NewStoreWithDir("")
-	_, err := store.listSproutDirsUnlocked()
-	if err != ErrInvalidJobDir {
-		t.Errorf("expected ErrInvalidJobDir, got %v", err)
-	}
-}
-
-func TestListSproutDirsUnlocked_NonexistentDir(t *testing.T) {
-	store := NewStoreWithDir("/nonexistent/path/that/should/not/exist")
-	sprouts, err := store.listSproutDirsUnlocked()
-	if err != nil {
-		t.Fatalf("expected nil error for nonexistent dir, got %v", err)
-	}
-	if sprouts != nil {
-		t.Errorf("expected nil sprouts, got %v", sprouts)
-	}
-}
-
-func TestReap_SkipsNonJsonl(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStoreWithDir(dir)
-
-	sproutDir := filepath.Join(dir, "sprout-skip")
-	os.MkdirAll(sproutDir, 0o700)
-
-	// Create an old non-jsonl file — should NOT be removed.
-	oldTxt := filepath.Join(sproutDir, "notes.txt")
-	os.WriteFile(oldTxt, []byte("keep me"), 0o644)
-	past := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(oldTxt, past, past)
-
-	// Create a new jsonl file to keep sprout dir alive.
-	newJob := filepath.Join(sproutDir, "new.jsonl")
-	os.WriteFile(newJob, []byte("{}\n"), 0o644)
-
-	store.reap(24 * time.Hour)
-
-	if _, err := os.Stat(oldTxt); err != nil {
-		t.Error("expected non-jsonl file to be preserved")
 	}
 }
 

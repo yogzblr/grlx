@@ -1,15 +1,18 @@
 package natsapi
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 	"github.com/gogrlx/grlx/v2/internal/jobs"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
+	"github.com/gogrlx/grlx/v2/internal/objectstore/objectstoretest"
 	"github.com/gogrlx/grlx/v2/internal/props"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
 )
@@ -59,30 +62,29 @@ func TestHandleVersionEmpty(t *testing.T) {
 
 // --- Jobs handler tests ---
 
-func setupJobStore(t *testing.T) (string, func()) {
+// setupJobStore points the jobs handlers at a fresh fake S3 bucket and
+// returns it for seeding.
+func setupJobStore(t *testing.T) (*objectstore.Store, func()) {
 	t.Helper()
-	dir := t.TempDir()
+	obj := objectstoretest.NewStore(t)
 	old := jobStore
-	jobStore = jobs.NewStoreWithDir(dir)
-	return dir, func() { jobStore = old }
+	jobStore = jobs.NewStoreWithObjectStore(obj)
+	return obj, func() { jobStore = old }
 }
 
-func writeTestJob(t *testing.T, dir, sproutID, jid string, steps []cook.StepCompletion) {
+// writeTestJob seeds a job's step log using internal/jobs's object key
+// layout (see the comment at the top of internal/jobs/store.go).
+func writeTestJob(t *testing.T, obj *objectstore.Store, sproutID, jid string, steps []cook.StepCompletion) {
 	t.Helper()
-	sproutDir := filepath.Join(dir, sproutID)
-	if err := os.MkdirAll(sproutDir, 0o755); err != nil {
-		t.Fatalf("creating sprout dir: %v", err)
-	}
-	jobFile := filepath.Join(sproutDir, jid+".jsonl")
-	f, err := os.Create(jobFile)
-	if err != nil {
-		t.Fatalf("creating job file: %v", err)
-	}
-	defer f.Close()
+	var buf bytes.Buffer
 	for _, step := range steps {
 		b, _ := json.Marshal(step)
-		f.Write(b)
-		f.WriteString("\n")
+		buf.Write(b)
+		buf.WriteString("\n")
+	}
+	key := fmt.Sprintf("jobs/%s/%s/created.jsonl", sproutID, jid)
+	if err := obj.Put(context.Background(), key, buf.Bytes()); err != nil {
+		t.Fatalf("writing job: %v", err)
 	}
 }
 
@@ -105,7 +107,7 @@ func TestHandleJobsListEmpty(t *testing.T) {
 }
 
 func TestHandleJobsListWithJobs(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
@@ -115,8 +117,8 @@ func TestHandleJobsListWithJobs(t *testing.T) {
 			Started:          time.Now(),
 		},
 	}
-	writeTestJob(t, dir, "sprout-alpha", "jid-001", steps)
-	writeTestJob(t, dir, "sprout-beta", "jid-002", steps)
+	writeTestJob(t, obj, "sprout-alpha", "jid-001", steps)
+	writeTestJob(t, obj, "sprout-beta", "jid-002", steps)
 
 	result, err := handleJobsList(props.CurrentTenantID(), nil)
 	if err != nil {
@@ -133,15 +135,15 @@ func TestHandleJobsListWithJobs(t *testing.T) {
 }
 
 func TestHandleJobsListWithLimit(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
 		{ID: "s1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-a", "jid-1", steps)
-	writeTestJob(t, dir, "sprout-a", "jid-2", steps)
-	writeTestJob(t, dir, "sprout-a", "jid-3", steps)
+	writeTestJob(t, obj, "sprout-a", "jid-1", steps)
+	writeTestJob(t, obj, "sprout-a", "jid-2", steps)
+	writeTestJob(t, obj, "sprout-a", "jid-3", steps)
 
 	params := json.RawMessage(`{"limit":2}`)
 	result, err := handleJobsList(props.CurrentTenantID(), params)
@@ -155,23 +157,22 @@ func TestHandleJobsListWithLimit(t *testing.T) {
 	}
 }
 
-func writeTestJobMeta(t *testing.T, dir, sproutID, jid, invokedBy string) {
+func writeTestJobMeta(t *testing.T, obj *objectstore.Store, sproutID, jid, invokedBy string) {
 	t.Helper()
-	sproutDir := filepath.Join(dir, sproutID)
-	metaFile := filepath.Join(sproutDir, jid+".meta.json")
 	meta := jobs.JobMeta{
 		JID:       jid,
 		InvokedBy: invokedBy,
 		CreatedAt: time.Now().UTC(),
 	}
 	data, _ := json.Marshal(meta)
-	if err := os.WriteFile(metaFile, data, 0o644); err != nil {
+	key := fmt.Sprintf("jobs/%s/%s/meta.json", sproutID, jid)
+	if err := obj.Put(context.Background(), key, data); err != nil {
 		t.Fatalf("writing job meta: %v", err)
 	}
 }
 
 func TestHandleJobsListFilterByUser(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
@@ -179,14 +180,14 @@ func TestHandleJobsListFilterByUser(t *testing.T) {
 	}
 
 	// Create jobs with different invokers.
-	writeTestJob(t, dir, "sprout-a", "jid-alice", steps)
-	writeTestJobMeta(t, dir, "sprout-a", "jid-alice", "UALICE000")
+	writeTestJob(t, obj, "sprout-a", "jid-alice", steps)
+	writeTestJobMeta(t, obj, "sprout-a", "jid-alice", "UALICE000")
 
-	writeTestJob(t, dir, "sprout-a", "jid-bob", steps)
-	writeTestJobMeta(t, dir, "sprout-a", "jid-bob", "UBOB00000")
+	writeTestJob(t, obj, "sprout-a", "jid-bob", steps)
+	writeTestJobMeta(t, obj, "sprout-a", "jid-bob", "UBOB00000")
 
-	writeTestJob(t, dir, "sprout-b", "jid-alice2", steps)
-	writeTestJobMeta(t, dir, "sprout-b", "jid-alice2", "UALICE000")
+	writeTestJob(t, obj, "sprout-b", "jid-alice2", steps)
+	writeTestJobMeta(t, obj, "sprout-b", "jid-alice2", "UALICE000")
 
 	// Filter by Alice — should get 2 jobs.
 	params := json.RawMessage(`{"user":"UALICE000"}`)
@@ -239,13 +240,13 @@ func TestHandleJobsGetMissing(t *testing.T) {
 }
 
 func TestHandleJobsGetFound(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
 		{ID: "step-1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-x", "jid-abc", steps)
+	writeTestJob(t, obj, "sprout-x", "jid-abc", steps)
 
 	params := json.RawMessage(`{"jid":"jid-abc"}`)
 	result, err := handleJobsGet(props.CurrentTenantID(), params)
@@ -287,13 +288,13 @@ func TestHandleJobsGetInvalidJSON(t *testing.T) {
 }
 
 func TestHandleJobsCancelNoNATS(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
 		{ID: "s1", Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-c", "jid-cancel", steps)
+	writeTestJob(t, obj, "sprout-c", "jid-cancel", steps)
 
 	// Ensure no NATS connection.
 	ClearNatsConn(props.CurrentTenantID())
@@ -328,15 +329,15 @@ func TestHandleJobsCancelNonexistent(t *testing.T) {
 }
 
 func TestHandleJobsListForSprout(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
 		{ID: "s1", CompletionStatus: cook.StepCompleted, Started: time.Now()},
 	}
-	writeTestJob(t, dir, "sprout-target", "jid-a", steps)
-	writeTestJob(t, dir, "sprout-target", "jid-b", steps)
-	writeTestJob(t, dir, "sprout-other", "jid-c", steps)
+	writeTestJob(t, obj, "sprout-target", "jid-a", steps)
+	writeTestJob(t, obj, "sprout-target", "jid-b", steps)
+	writeTestJob(t, obj, "sprout-other", "jid-c", steps)
 
 	params := json.RawMessage(`{"sprout_id":"sprout-target"}`)
 	result, err := handleJobsListForSprout(props.CurrentTenantID(), params)
@@ -378,13 +379,13 @@ func TestHandleJobsListForSproutNoJobs(t *testing.T) {
 // --- Jobs delete handler tests ---
 
 func TestHandleJobsDeleteSuccess(t *testing.T) {
-	dir, cleanup := setupJobStore(t)
+	obj, cleanup := setupJobStore(t)
 	defer cleanup()
 
 	steps := []cook.StepCompletion{
 		{ID: "step-1", CompletionStatus: cook.StepCompleted, Started: time.Now(), Duration: time.Second},
 	}
-	writeTestJob(t, dir, "sprout-del", "del-jid", steps)
+	writeTestJob(t, obj, "sprout-del", "del-jid", steps)
 
 	params := json.RawMessage(`{"jid":"del-jid"}`)
 	result, err := handleJobsDelete(props.CurrentTenantID(), params)
