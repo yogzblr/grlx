@@ -131,10 +131,7 @@ func main() {
 	fmt.Printf("Starting Farmer (core) with bus URL %s\n", config.FarmerBusURL)
 	defer log.Flush()
 	initStorage()
-	if shutdown := initRecipeStore(); shutdown {
-		log.Info("Shutdown signal received during startup, stopping farmer")
-		return
-	}
+	recipeStore := initRecipeStore()
 	initGatewaySigner()
 	initHeartbeatClient()
 	props.LoadStaticProps(config.StaticProps())
@@ -182,6 +179,9 @@ func main() {
 	// ReloadNKeysForTenant's lazy provisioning path).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if recipeStore != nil {
+		go waitForRecipeStore(ctx, recipeStore)
+	}
 	// See docs/design/grlx-tenant-context-threading.md's Option A: a
 	// newly-provisioned tenant (explicit ProvisionTenant, or enroll.go's
 	// lazy ReloadNKeysForTenant path) gets its own dedicated NATS
@@ -259,19 +259,13 @@ func initStorage() {
 // truth; syncing a merged commit into this bucket is a deploy-time
 // concern, not something farmer does at runtime.
 //
-// The object store is never a reason for farmer to exit. The store is
-// installed as soon as it's configured, then checked with exponential
-// backoff (objectstore.DefaultRetryPolicy, about 90s) so a MinIO that's
-// still starting alongside farmer is logged rather than silently missed.
-// If it's still unreachable after that, boot continues: recipe requests
-// fail individually until it's back, then succeed without a restart. If
-// it isn't configured at all, recipe requests fail with "recipe store not
-// configured".
-//
-// SIGINT/SIGTERM during the wait is a request to stop farmer, not an
-// object-store failure: the signal is consumed here, so initRecipeStore
-// reports it (shutdown=true) for main to stop instead of booting on.
-func initRecipeStore() (shutdown bool) {
+// The object store is never a reason for farmer to exit or wait. Open
+// makes no network calls, so the store is installed immediately and
+// returned for waitForRecipeStore to check in the background. Until it's
+// reachable, recipe requests fail individually, then succeed without a
+// restart. If it isn't configured at all, this logs, returns nil, and
+// recipe requests fail with "recipe store not configured".
+func initRecipeStore() *objectstore.Store {
 	store, err := objectstore.Open(objectstore.Config{
 		Endpoint:        config.S3Endpoint,
 		AccessKeyID:     config.S3AccessKeyID,
@@ -281,26 +275,32 @@ func initRecipeStore() (shutdown bool) {
 	})
 	if err != nil {
 		log.Errorf("recipe object store not configured (recipe requests will fail until it is): %v", err)
-		return false
+		return nil
 	}
 	cook.SetStore(store)
 	handlers.SetRecipeStore(store)
+	return store
+}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+// waitForRecipeStore checks the recipe store with exponential backoff
+// (objectstore.DefaultRetryPolicy, about 90s) and logs the outcome, so an
+// unreachable store or missing bucket shows up in the logs at boot rather
+// than on the first cook. It only reports: it doesn't block anything, and
+// giving up changes nothing about how requests are served. It stops
+// quietly when ctx (farmer's shutdown context) is cancelled.
+func waitForRecipeStore(ctx context.Context, store *objectstore.Store) {
 	policy := objectstore.DefaultRetryPolicy()
 	policy.OnRetry = func(attempt int, wait time.Duration, err error) {
 		log.Errorf("recipe object store not ready (attempt %d/%d), retrying in %s: %v", attempt, policy.MaxAttempts, wait.Round(time.Millisecond), err)
 	}
 	if err := store.WaitReady(ctx, policy); err != nil {
 		if ctx.Err() != nil {
-			return true
+			return
 		}
-		log.Errorf("recipe object store still unreachable after retries; starting anyway (recipe requests will fail until it's back): %v", err)
-		return false
+		log.Errorf("recipe object store still unreachable after retries (recipe requests will fail until it's back): %v", err)
+		return
 	}
 	log.Infof("Connected to recipe object store %s (bucket %s)", config.S3Endpoint, config.S3Bucket)
-	return false
 }
 
 // initGatewaySigner wires up the OpenBao Transit-backed signer for
