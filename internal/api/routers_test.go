@@ -179,3 +179,26 @@ func TestNewRouterUnknownPathReturns404(t *testing.T) {
 		t.Errorf("GET /nonexistent returned %d, want 404", resp.StatusCode)
 	}
 }
+
+// GET /ready is routed and unauthenticated. With no readiness dependencies
+// wired up (as in this test), it reports 503 rather than 200 — the check
+// that its behavior is right lives in handlers/ready_test.go.
+func TestNewRouterReadyEndpoint(t *testing.T) {
+	tmpDir := t.TempDir()
+	origRecipeDir := config.RecipeDir
+	config.RecipeDir = tmpDir
+	t.Cleanup(func() { config.RecipeDir = origRecipeDir })
+
+	mux := NewRouter("")
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("GET /ready returned %d, want 503", resp.StatusCode)
+	}
+}

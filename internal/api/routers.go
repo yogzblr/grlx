@@ -22,8 +22,9 @@ import (
 //     /v1/recipes route) — replaces the old NATS-based
 //     internal/natsapi/recipes.go per
 //     docs/design/grlx-fork-roadmap.md workstream I.
-//   - Health checks: an unauthenticated /health endpoint for monitoring
-//     and automated tooling.
+//   - Health checks: unauthenticated /health (liveness) and /ready
+//     (readiness) endpoints for Kubernetes probes, monitoring, and
+//     automated tooling.
 func NewRouter(certificate string) *http.ServeMux {
 	_ = certificate // reserved for future TLS configuration
 	mux := http.NewServeMux()
@@ -44,8 +45,11 @@ func NewRouter(certificate string) *http.ServeMux {
 	// jwt_authn remote_jwks (deploy/envoy/envoy.yaml) fetches.
 	mux.Handle("GET /v1/.well-known/jwks.json", Logger(http.HandlerFunc(handlers.JWKS), "JWKS"))
 
-	// Health check (unauthenticated).
+	// Health checks (unauthenticated): /health is liveness only (process up,
+	// no dependency checks); /ready is readiness (PXC, Valkey, and NATS
+	// tenant connection state — see handlers.GetReady for what gates it).
 	mux.Handle("GET /health", Logger(http.HandlerFunc(handlers.GetHealth), "GetHealth"))
+	mux.Handle("GET /ready", Logger(http.HandlerFunc(handlers.GetReady), "GetReady"))
 
 	// File server: serves recipe files over HTTPS (farmer:// scheme).
 	mux.Handle("GET /files/", Logger(Auth(http.HandlerFunc(handlers.GetFile), "FileServer"), "FileServer"))

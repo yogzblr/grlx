@@ -44,6 +44,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/props"
 	"github.com/gogrlx/grlx/v2/internal/pxc"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
+	"github.com/gogrlx/grlx/v2/internal/tenantconn"
 
 	nats "github.com/nats-io/nats.go"
 	valkey "github.com/valkey-io/valkey-go"
@@ -91,39 +92,27 @@ func getHeartbeatConn() *nats.Conn {
 // tenantConns holds every tenant's live NATS connection — one per tenant,
 // including the legacy tenant (pki.CurrentTenantID()) under its own entry
 // like any other — per docs/design/grlx-tenant-context-threading.md's
-// Option A. Guarded separately from srvMu above since it's read/written
-// from ConnectFarmer's own goroutines (boot-time enumeration,
-// pki.OnTenantProvisioned/OnTenantDeprovisioned callbacks) independently of
-// the API server/heartbeat state srvMu protects.
-var (
-	tenantConnMu sync.Mutex
-	tenantConns  = map[string]*nats.Conn{}
-)
+// Option A, plus every tenant still retrying its first connect. It has its
+// own lock (see internal/tenantconn), separate from srvMu above, since it's
+// read/written from ConnectFarmer's own goroutines (boot-time enumeration,
+// pki.OnTenantProvisioned/OnTenantDeprovisioned callbacks) and GET /ready
+// independently of the API server/heartbeat state srvMu protects.
+var tenantConns = tenantconn.NewRegistry()
 
-func setTenantConn(tenantID string, nc *nats.Conn) {
-	tenantConnMu.Lock()
-	defer tenantConnMu.Unlock()
-	tenantConns[tenantID] = nc
-}
+// legacyTenantReady latches true once ConnectFarmer's boot-time connection
+// for the legacy tenant is up and registered. GET /ready gates on it; see
+// handlers.GetReady for why it's a one-way latch rather than live state.
+var legacyTenantReady atomic.Bool
 
-// removeTenantConn deletes tenantID's entry and returns the connection that
-// was there, or nil if none was registered.
-func removeTenantConn(tenantID string) *nats.Conn {
-	tenantConnMu.Lock()
-	defer tenantConnMu.Unlock()
-	nc := tenantConns[tenantID]
-	delete(tenantConns, tenantID)
-	return nc
-}
-
-func allTenantConns() []*nats.Conn {
-	tenantConnMu.Lock()
-	defer tenantConnMu.Unlock()
-	out := make([]*nats.Conn, 0, len(tenantConns))
-	for _, nc := range tenantConns {
-		out = append(out, nc)
+// readinessTenantStats is what GET /ready reports per-tenant NATS state
+// from (handlers.SetTenantConnStats).
+func readinessTenantStats() handlers.TenantConnStats {
+	connected, total := tenantConns.Counts()
+	return handlers.TenantConnStats{
+		LegacyReady: legacyTenantReady.Load(),
+		Connected:   connected,
+		Total:       total,
 	}
-	return out
 }
 
 func main() {
@@ -196,6 +185,7 @@ func main() {
 	// needed).
 	pki.OnTenantProvisioned(func(tenantID string) { connectTenantWithRetry(ctx, tenantID) })
 	pki.OnTenantDeprovisioned(disconnectTenant)
+	handlers.SetTenantConnStats(readinessTenantStats)
 
 	StartAPIServer()
 	natsapi.StartCohortRefresher(ctx, config.CohortRefreshInterval)
@@ -254,6 +244,7 @@ func initStorage() {
 	props.SetDB(db)
 	pki.SetDB(db)
 	rbac.SetDB(db)
+	handlers.SetReadinessDB(db)
 }
 
 // initRecipeStore opens the object-storage backend recipes are read from
@@ -372,6 +363,7 @@ func initHeartbeatClient() {
 		return
 	}
 	heartbeat.SetClient(client)
+	handlers.SetReadinessValkey(client)
 }
 
 // initSystemAccountListeners opens farmer's one persistent SYS-account
@@ -680,7 +672,7 @@ func registerTenantHandlers(nc *nats.Conn, tenantID string) error {
 		return fmt.Errorf("failed to subscribe NATS API handlers for tenant %s: %w", tenantID, err)
 	}
 	log.Infof("NATS API handlers registered for tenant %s", tenantID)
-	setTenantConn(tenantID, nc)
+	tenantConns.Set(tenantID, nc)
 	return nil
 }
 
@@ -699,6 +691,9 @@ func registerTenantHandlers(nc *nats.Conn, tenantID string) error {
 // (pki.OnTenantProvisioned) — deliberately consistent between the two, per
 // the design doc's "don't leave this undecided or inconsistent" ask.
 func connectTenantWithRetry(ctx context.Context, tenantID string) {
+	// Counted in GET /ready's tenants_total from here on, so a tenant that
+	// never manages to connect still shows up as the one that isn't.
+	tenantConns.MarkPending(tenantID)
 	backoff := 5 * time.Second
 	const maxBackoff = 5 * time.Minute
 	for {
@@ -736,7 +731,7 @@ func connectTenantWithRetry(ctx context.Context, tenantID string) {
 // separate unsubscribe bookkeeping is needed to avoid leaked goroutines or
 // subscriptions.
 func disconnectTenant(tenantID string) {
-	nc := removeTenantConn(tenantID)
+	nc := tenantConns.Remove(tenantID)
 	if nc == nil {
 		return
 	}
@@ -773,6 +768,7 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 	})
 
 	legacyTenant := pki.CurrentTenantID()
+	tenantConns.MarkPending(legacyTenant)
 	nc, err := dialTenantBus(ctx, legacyTenant)
 	if err != nil {
 		log.Fatalf("Failed to connect farmer to NATS bus for the legacy tenant %s: %v", legacyTenant, err)
@@ -780,6 +776,7 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 	if err := registerTenantHandlers(nc, legacyTenant); err != nil {
 		log.Fatalf("%v", err)
 	}
+	legacyTenantReady.Store(true)
 
 	// Now that the legacy tenant's connection is up, register the SYS
 	// listeners (heartbeat and tenant provisioning, on their own, separate
@@ -822,7 +819,7 @@ func ConnectFarmer(ctx context.Context, done chan<- struct{}) {
 	jobs.NewStore().StartReaperCtx(ctx, config.JobLogTTL)
 
 	<-ctx.Done()
-	for _, c := range allTenantConns() {
+	for _, c := range tenantConns.All() {
 		c.Close()
 	}
 }
