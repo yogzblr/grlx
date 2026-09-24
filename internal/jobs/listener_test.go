@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -412,5 +413,77 @@ func TestLogJobCreation_InvalidJSON(t *testing.T) {
 		if len(entries) > 0 {
 			t.Error("expected no files for invalid JSON")
 		}
+	}
+}
+
+func TestLogJobs_FailedStepWithError(t *testing.T) {
+	dir := t.TempDir()
+	origJobLogDir := config.JobLogDir
+	config.JobLogDir = dir
+	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+
+	_, conn := startTestNATSServer(t)
+	RegisterNatsConn("t_test", conn)
+
+	step := cook.StepCompletion{
+		ID:               "step-fail",
+		CompletionStatus: cook.StepFailed,
+		Started:          time.Now(),
+		Duration:         time.Second,
+		Error:            errors.New("boom"),
+	}
+	data, err := json.Marshal(step)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Publish("grlx.cook.sprout-fail.job-fail-1", data); err != nil {
+		t.Fatal(err)
+	}
+	conn.Flush()
+	time.Sleep(300 * time.Millisecond)
+
+	steps, err := readJobFile(filepath.Join(dir, "sprout-fail", "job-fail-1.jsonl"))
+	if err != nil {
+		t.Fatalf("failed step was not recorded: %v", err)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(steps))
+	}
+	got := steps[0]
+	if got.ID != "step-fail" || got.CompletionStatus != cook.StepFailed {
+		t.Errorf("got step %+v", got)
+	}
+	if got.Error == nil || got.Error.Error() != "boom" {
+		t.Errorf("Error = %v, want boom", got.Error)
+	}
+	if s := buildSummary("job-fail-1", "sprout-fail", steps); s.Status != JobFailed || s.Failed != 1 {
+		t.Errorf("summary = %+v, want one failed step", s)
+	}
+}
+
+func TestLogJobs_LegacyEmptyObjectError(t *testing.T) {
+	// Sprouts on an older version still send "Error":{}; the event must
+	// be recorded, not dropped.
+	dir := t.TempDir()
+	origJobLogDir := config.JobLogDir
+	config.JobLogDir = dir
+	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+
+	_, conn := startTestNATSServer(t)
+	RegisterNatsConn("t_test", conn)
+
+	payload := []byte(`{"ID":"timeout-job-old","CompletionStatus":3,"ChangesMade":false,"Changes":null,"started":"0001-01-01T00:00:00Z","Error":{}}`)
+	if err := conn.Publish("grlx.cook.sprout-old.job-old", payload); err != nil {
+		t.Fatal(err)
+	}
+	conn.Flush()
+	time.Sleep(300 * time.Millisecond)
+
+	steps, err := readJobFile(filepath.Join(dir, "sprout-old", "job-old.jsonl"))
+	if err != nil {
+		t.Fatalf("legacy failed step was not recorded: %v", err)
+	}
+	if len(steps) != 1 || steps[0].CompletionStatus != cook.StepFailed || steps[0].Error == nil {
+		t.Errorf("got %+v, want one failed step with a non-nil Error", steps)
 	}
 }
