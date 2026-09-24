@@ -2,6 +2,8 @@ package cook
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -37,7 +39,11 @@ type (
 		Changes          []string
 		Started          time.Time     `json:"started,omitempty"`
 		Duration         time.Duration `json:"duration,omitempty"`
-		Error            error
+		// Error is carried on the wire and in job logs as its message
+		// string (see MarshalJSON/UnmarshalJSON), so a decoded Error keeps
+		// its text but not its identity: errors.Is against a sentinel such
+		// as ErrCookTimeout does not hold after a round trip.
+		Error error
 	}
 	RecipeCooker interface {
 		Apply(context.Context) (Result, error)
@@ -192,6 +198,63 @@ func (r Requisite) Equals(other Requisite) bool {
 		}
 	}
 	return true
+}
+
+// stepCompletionFields has StepCompletion's fields but none of its methods,
+// so (Un)MarshalJSON can delegate to encoding/json without recursing.
+type stepCompletionFields StepCompletion
+
+// errLegacyStepError stands in for an Error that an older grlx encoded as
+// `{}`, which kept that the step errored but lost the message.
+var errLegacyStepError = errors.New("step error (message not recorded by the sending grlx version)")
+
+// MarshalJSON encodes Error as its message string, or null when Error is
+// nil. encoding/json would otherwise write a non-nil error as `{}`, which
+// drops the message and cannot be decoded back into an error.
+func (s StepCompletion) MarshalJSON() ([]byte, error) {
+	var msg *string
+	if s.Error != nil {
+		m := s.Error.Error()
+		msg = &m
+	}
+	return json.Marshal(struct {
+		stepCompletionFields
+		Error *string `json:"Error"`
+	}{stepCompletionFields(s), msg})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON. It also accepts what older
+// versions wrote: null (no error, as in existing job logs) and `{}` (an
+// error whose message was lost), so events from not-yet-upgraded sprouts
+// are still recorded rather than dropped.
+func (s *StepCompletion) UnmarshalJSON(b []byte) error {
+	aux := struct {
+		stepCompletionFields
+		Error json.RawMessage `json:"Error"`
+	}{stepCompletionFields: stepCompletionFields(*s)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	*s = StepCompletion(aux.stepCompletionFields)
+	if aux.Error == nil {
+		// Key absent: leave Error as it was, like encoding/json does.
+		return nil
+	}
+	s.Error = decodeStepError(aux.Error)
+	return nil
+}
+
+func decodeStepError(raw json.RawMessage) error {
+	var msg *string
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		// Not null or a string: the legacy `{}` encoding (or something
+		// else we can't read). The step still errored, so keep that.
+		return errLegacyStepError
+	}
+	if msg == nil {
+		return nil
+	}
+	return errors.New(*msg)
 }
 
 func (s SimpleNote) String() string {

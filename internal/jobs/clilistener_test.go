@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -228,5 +229,47 @@ func TestCLIListener_HandleStepCompletion_BadSubject(t *testing.T) {
 	// File should exist but be empty or non-existent.
 	if err != ErrJobNotFound {
 		t.Logf("error was: %v (acceptable if step wasn't recorded)", err)
+	}
+}
+
+func TestCLIListener_RecordsFailedStepWithError(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewCLIStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, conn := startTestNATSServer(t)
+	listener := NewCLIListener(store, conn, "UKEY3")
+	if err := listener.SubscribeJob("jid-err"); err != nil {
+		t.Fatalf("SubscribeJob: %v", err)
+	}
+	defer listener.Stop()
+
+	step := cook.StepCompletion{
+		ID:               "step-1",
+		CompletionStatus: cook.StepFailed,
+		Started:          time.Now(),
+		Error:            errors.New("boom"),
+	}
+	data, err := json.Marshal(step)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Publish("grlx.cook.sprout-e.jid-err", data); err != nil {
+		t.Fatal(err)
+	}
+	conn.Flush()
+	time.Sleep(200 * time.Millisecond)
+
+	summary, _, err := store.GetJob("jid-err")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if summary.Status != JobFailed || len(summary.Steps) != 1 {
+		t.Fatalf("summary = %+v, want one failed step", summary)
+	}
+	if e := summary.Steps[0].Error; e == nil || e.Error() != "boom" {
+		t.Errorf("Error = %v, want boom", e)
 	}
 }
