@@ -7,10 +7,25 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/valkey-io/valkey-go"
+
+	"github.com/gogrlx/grlx/v2/internal/api/handlers"
 	"github.com/gogrlx/grlx/v2/internal/config"
 )
 
+// installedValkey stands in for a Valkey client that exists. GET /health
+// only checks that one was installed and never calls it, so the embedded
+// nil valkey.Client is never used.
+type installedValkey struct{ valkey.Client }
+
+func withValkeyClient(t *testing.T) {
+	t.Helper()
+	handlers.SetReadinessValkey(installedValkey{})
+	t.Cleanup(func() { handlers.SetReadinessValkey(nil) })
+}
+
 func TestNewRouterHealthEndpoint(t *testing.T) {
+	withValkeyClient(t)
 	// Set up a temporary recipe directory so the file server has
 	// a valid root (NewRouter reads config.RecipeDir).
 	tmpDir := t.TempDir()
@@ -177,5 +192,28 @@ func TestNewRouterUnknownPathReturns404(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("GET /nonexistent returned %d, want 404", resp.StatusCode)
+	}
+}
+
+// GET /ready is routed and unauthenticated. With no readiness dependencies
+// wired up (as in this test), it reports 503 rather than 200 — the check
+// that its behavior is right lives in handlers/ready_test.go.
+func TestNewRouterReadyEndpoint(t *testing.T) {
+	tmpDir := t.TempDir()
+	origRecipeDir := config.RecipeDir
+	config.RecipeDir = tmpDir
+	t.Cleanup(func() { config.RecipeDir = origRecipeDir })
+
+	mux := NewRouter("")
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("GET /ready returned %d, want 503", resp.StatusCode)
 	}
 }
