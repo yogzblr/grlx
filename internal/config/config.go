@@ -130,6 +130,14 @@ var (
 	S3SecretAccessKey string
 	S3UseSSL          bool
 	S3Bucket          string
+
+	// S3JobBucket is the bucket farmer's job logs are stored in (see
+	// internal/jobs/store.go), on the same endpoint and credentials as
+	// S3Bucket. It must be a different bucket: GET /files/<key>
+	// (internal/api/handlers/recipes.go) serves any key in the recipe
+	// bucket to any authenticated caller, so job logs sharing it would be
+	// readable across sprouts and tenants.
+	S3JobBucket string
 )
 
 // Binary represents the type of grlx binary being configured.
@@ -281,6 +289,11 @@ func LoadConfig(binary string) {
 					jety.Set("s3bucket", v)
 				}
 			}
+			if jety.GetString("s3jobbucket") == "" {
+				if v, found := os.LookupEnv("GRLX_S3_JOB_BUCKET"); found {
+					jety.Set("s3jobbucket", v)
+				}
+			}
 			if len(jety.GetStringSlice("sproutbusurls")) == 0 {
 				if v, found := os.LookupEnv("GRLX_SPROUT_BUS_URLS"); found {
 					urls := []string{}
@@ -425,6 +438,7 @@ func LoadConfig(binary string) {
 	S3SecretAccessKey = jety.GetString("s3secretaccesskey")
 	S3UseSSL = jety.GetBool("s3usessl")
 	S3Bucket = jety.GetString("s3bucket")
+	S3JobBucket = jety.GetString("s3jobbucket")
 	SproutBusURLs = jety.GetStringSlice("sproutbusurls")
 }
 

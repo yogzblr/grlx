@@ -1,24 +1,118 @@
 package jobs
 
+// Farmer-side job storage lives in object storage (S3/MinIO, through
+// internal/objectstore), not under config.JobLogDir on local disk: with more
+// than one farmer replica, a job-status query can land on any of them, so
+// they all need to read the same job data (docs/design/grlx-master-plan.md,
+// "Job logs → object storage"). config.JobLogDir is now only the sprout's
+// own local log directory (internal/cook/sproutcook.go's logStepResult,
+// StartSproutReaper); the CLI's CLIStore stays on the user's own disk too.
+//
+// # Write strategy: one object per event
+//
+// Object storage can't append, and the old writer appended one line per job
+// event as it arrived. The choice among the alternatives came down to what
+// a job's event stream looks like and to who writes it.
+//
+// Volume. Cooking an N-step recipe makes one creation event on
+// grlx.sprouts.<sprout>.cook (N "not started" placeholders, written by
+// logJobCreation) and N+2 events on grlx.cook.<sprout>.<jid>: a seeded
+// "start-<jid>", one terminal completion per step (sproutcook.go publishes
+// no separate in-progress event), and a final "completed-<jid>" or
+// "timeout-<jid>". Each event is one cook.StepCompletion of a few hundred
+// bytes (more only when a step reports long Changes notes). Recipes run
+// tens of steps, so a job is tens of small events and a few KB in total.
+//
+// At that volume, rewriting the whole accumulated log on every event would
+// be cheap. It is ruled out by the writers instead: RegisterNatsConn
+// queue-subscribes, so a job's events are spread across farmer replicas and
+// handled concurrently. A read-modify-write of one shared object would lose
+// events whenever two replicas interleave, and objectstore.Store has no
+// conditional (If-Match) Put to detect it. Buffering a job in memory and
+// writing it once at the end fails for the same reason, since no replica
+// sees all of a job's events, and it would also hide running jobs from
+// status queries.
+//
+// Writing each event to its own object needs no coordination: every Put
+// goes to a key no other writer uses, whichever replica received the event.
+// Reads cost a List plus one Get per object, which at tens of objects per
+// job is small, and loadJobs fetches jobs concurrently. Event keys start
+// with the receiving replica's clock (zero-padded UnixNano), so sorting keys
+// sorts by receive time. Events that two replicas receive within their
+// clock skew of each other can come back slightly out of order. That only
+// changes the order of JobSummary.Steps: everything buildSummary computes
+// (counts, earliest start, latest end, status) ignores order.
+//
+// # Key layout
+//
+// Keys live in the dedicated job bucket (config.S3JobBucket). It must not be
+// the recipe bucket, because GET /files/ serves any key in that bucket to
+// any authenticated caller.
+//
+//	jobs/<sprout>/<jid>/created.jsonl               placeholders from logJobCreation
+//	jobs/<sprout>/<jid>/meta.json                   JobMeta (invoker, creation time)
+//	jobs/<sprout>/<jid>/events/<unixnano>-<rand>.jsonl  one step event
+//
+// A job exists once it has created.jsonl or at least one event.
+// created.jsonl followed by events/ in key order holds the same lines the
+// old local <jid>.jsonl file did.
+//
+// Deferred: looking a job up by JID alone (FindJob, DeleteJob) lists the
+// whole jobs/ prefix, as ListAllJobs always has to. A jid-to-sprout index
+// would make that one List call if job counts grow enough to matter.
+// Nothing compacts a finished job's event objects into a single object.
+
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
 )
 
 var (
-	ErrJobNotFound   = errors.New("job not found")
-	ErrSproutNoJobs  = errors.New("no jobs found for sprout")
-	ErrInvalidJobDir = errors.New("invalid job log directory")
+	ErrJobNotFound  = errors.New("job not found")
+	ErrSproutNoJobs = errors.New("no jobs found for sprout")
+	// ErrJobStoreNotConfigured means SetStore was never called (or was
+	// called with nil), so farmer has nowhere to keep job logs. It is never
+	// a cue to fall back to local disk, which would bring back the
+	// cross-replica inconsistency object storage exists to remove.
+	ErrJobStoreNotConfigured = errors.New("job store not configured")
+)
+
+// objStore is the object-storage backend farmer's job logs are kept in.
+// Set once at startup via SetStore.
+var objStore *objectstore.Store
+
+// SetStore installs the object-storage backend job logs are written to
+// (by RegisterNatsConn's listeners) and read from (by NewStore's Store).
+// Call once at startup, as cmd/farmer/main.go does for cook.SetStore.
+func SetStore(s *objectstore.Store) { objStore = s }
+
+// opTimeout bounds each Store method, and each listener write, against
+// the object store.
+const opTimeout = 30 * time.Second
+
+// loadConcurrency caps how many jobs a listing fetches at once.
+const loadConcurrency = 16
+
+const (
+	jobKeyPrefix  = "jobs/"
+	createdObject = "created.jsonl"
+	metaObject    = "meta.json"
+	eventsDir     = "events/"
+	logExt        = ".jsonl"
 )
 
 // JobStatus represents the aggregate status of a job across all its steps.
@@ -92,248 +186,460 @@ type JobSummary struct {
 	InvokedBy string                `json:"invoked_by,omitempty"`
 }
 
-// Store provides methods for retrieving job data from the flat-file store.
+// Store reads farmer-side job data from object storage. See the comment at
+// the top of this file for the layout and why it's shaped this way.
 type Store struct {
-	mu     sync.RWMutex
-	logDir string
+	// obj overrides the package-level objStore when set.
+	obj *objectstore.Store
 }
 
-// NewStore creates a new job Store using the configured job log directory.
+// NewStore returns a Store backed by the object store installed with
+// SetStore. The backend is looked up on every call rather than captured
+// here, because internal/natsapi builds its Store in an init(), before
+// main has called SetStore.
 func NewStore() *Store {
-	return &Store{
-		logDir: config.JobLogDir,
-	}
+	return &Store{}
 }
 
-// NewStoreWithDir creates a Store using a custom directory (useful for testing).
-func NewStoreWithDir(dir string) *Store {
-	return &Store{
-		logDir: dir,
+// NewStoreWithObjectStore returns a Store backed by obj rather than the
+// package-level store. Tests use it, including to point two Stores (two
+// "replicas") at one bucket.
+func NewStoreWithObjectStore(obj *objectstore.Store) *Store {
+	return &Store{obj: obj}
+}
+
+func (s *Store) backend() (*objectstore.Store, error) {
+	if s.obj != nil {
+		return s.obj, nil
 	}
+	if objStore != nil {
+		return objStore, nil
+	}
+	return nil, ErrJobStoreNotConfigured
+}
+
+func opContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), opTimeout)
 }
 
 // GetJob retrieves a job by its JID and sprout ID.
 func (s *Store) GetJob(sproutID, jid string) (*JobSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sproutDir := filepath.Join(s.logDir, sproutID)
-	jobFile := filepath.Join(sproutDir, fmt.Sprintf("%s.jsonl", jid))
-	steps, err := readJobFile(jobFile)
+	obj, err := s.backend()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if !validKeySegment(sproutID) || !validKeySegment(jid) {
+		return nil, ErrJobNotFound
+	}
+	ctx, cancel := opContext()
+	defer cancel()
+
+	idx, err := listJobs(ctx, obj, jobPrefix(sproutID, jid))
+	if err != nil {
+		return nil, fmt.Errorf("listing job: %w", err)
+	}
+	ref := jobRef{sproutID: sproutID, jid: jid}
+	objs, ok := idx[ref]
+	if !ok {
+		return nil, ErrJobNotFound
+	}
+	summary, err := loadJob(ctx, obj, ref, objs)
+	if err != nil {
+		if objectstore.IsNotExist(err) {
+			// Deleted between the List and the Get.
 			return nil, ErrJobNotFound
 		}
-		return nil, fmt.Errorf("reading job file: %w", err)
+		return nil, fmt.Errorf("reading job: %w", err)
 	}
-
-	summary := buildSummary(jid, sproutID, steps)
-	summary.InvokedBy = readJobMeta(sproutDir, jid)
 	return summary, nil
 }
 
 // FindJob searches all sprouts for a job with the given JID.
 func (s *Store) FindJob(jid string) (*JobSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sprouts, err := s.listSproutDirs()
+	obj, err := s.backend()
 	if err != nil {
 		return nil, err
 	}
+	if !validKeySegment(jid) {
+		return nil, ErrJobNotFound
+	}
+	ctx, cancel := opContext()
+	defer cancel()
 
-	for _, sproutID := range sprouts {
-		sproutDir := filepath.Join(s.logDir, sproutID)
-		jobFile := filepath.Join(sproutDir, fmt.Sprintf("%s.jsonl", jid))
-		steps, readErr := readJobFile(jobFile)
-		if readErr != nil {
+	idx, err := listJobs(ctx, obj, jobKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing jobs: %w", err)
+	}
+	for _, ref := range refsForJID(idx, jid) {
+		summary, loadErr := loadJob(ctx, obj, ref, idx[ref])
+		if loadErr != nil {
 			continue
 		}
-		summary := buildSummary(jid, sproutID, steps)
-		summary.InvokedBy = readJobMeta(sproutDir, jid)
 		return summary, nil
 	}
-
 	return nil, ErrJobNotFound
 }
 
 // ListJobsForSprout returns all job summaries for a specific sprout,
 // sorted by start time (most recent first).
 func (s *Store) ListJobsForSprout(sproutID string) ([]JobSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sproutDir := filepath.Join(s.logDir, sproutID)
-	entries, err := os.ReadDir(sproutDir)
+	obj, err := s.backend()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, ErrSproutNoJobs
-		}
-		return nil, fmt.Errorf("reading sprout job dir: %w", err)
+		return nil, err
 	}
-
-	var summaries []JobSummary
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		jid := strings.TrimSuffix(entry.Name(), ".jsonl")
-		jobFile := filepath.Join(sproutDir, entry.Name())
-		steps, readErr := readJobFile(jobFile)
-		if readErr != nil {
-			continue
-		}
-		s := buildSummary(jid, sproutID, steps)
-		s.InvokedBy = readJobMeta(sproutDir, jid)
-		summaries = append(summaries, *s)
+	if !validKeySegment(sproutID) {
+		return nil, ErrSproutNoJobs
 	}
+	ctx, cancel := opContext()
+	defer cancel()
 
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].StartedAt.After(summaries[j].StartedAt)
-	})
-
-	return summaries, nil
+	idx, err := listJobs(ctx, obj, sproutPrefix(sproutID))
+	if err != nil {
+		return nil, fmt.Errorf("listing sprout jobs: %w", err)
+	}
+	if len(idx) == 0 {
+		return nil, ErrSproutNoJobs
+	}
+	return loadJobs(ctx, obj, idx), nil
 }
 
 // ListAllJobs returns job summaries across all sprouts,
 // sorted by start time (most recent first). Limit of 0 means no limit.
 func (s *Store) ListAllJobs(limit int) ([]JobSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sprouts, err := s.listSproutDirs()
+	obj, err := s.backend()
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := opContext()
+	defer cancel()
 
-	var allSummaries []JobSummary
-	for _, sproutID := range sprouts {
-		sproutDir := filepath.Join(s.logDir, sproutID)
-		entries, readErr := os.ReadDir(sproutDir)
-		if readErr != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-				continue
-			}
-			jid := strings.TrimSuffix(entry.Name(), ".jsonl")
-			jobFile := filepath.Join(sproutDir, entry.Name())
-			steps, fileErr := readJobFile(jobFile)
-			if fileErr != nil {
-				continue
-			}
-			sm := buildSummary(jid, sproutID, steps)
-			sm.InvokedBy = readJobMeta(sproutDir, jid)
-			allSummaries = append(allSummaries, *sm)
-		}
+	idx, err := listJobs(ctx, obj, jobKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing jobs: %w", err)
 	}
-
-	sort.Slice(allSummaries, func(i, j int) bool {
-		return allSummaries[i].StartedAt.After(allSummaries[j].StartedAt)
-	})
-
+	allSummaries := loadJobs(ctx, obj, idx)
 	if limit > 0 && len(allSummaries) > limit {
 		allSummaries = allSummaries[:limit]
 	}
-
 	return allSummaries, nil
 }
 
-// DeleteJob removes a job's JSONL and metadata files from the farmer-side store.
-// It first searches all sprout directories to find the job, then deletes
-// both the .jsonl log file and the optional .meta.json file.
+// DeleteJob removes a job's log and metadata objects. If more than one
+// sprout ran the JID, it deletes the same one FindJob would return (the
+// first by sprout ID).
 func (s *Store) DeleteJob(jid string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	sprouts, err := s.listSproutDirs()
+	obj, err := s.backend()
 	if err != nil {
 		return err
 	}
-
-	for _, sproutID := range sprouts {
-		sproutDir := filepath.Join(s.logDir, sproutID)
-		jobFile := filepath.Join(sproutDir, fmt.Sprintf("%s.jsonl", jid))
-		if _, statErr := os.Stat(jobFile); statErr != nil {
-			continue
-		}
-
-		// Found the job — remove log and meta files.
-		if removeErr := os.Remove(jobFile); removeErr != nil {
-			return fmt.Errorf("deleting job file: %w", removeErr)
-		}
-
-		metaFile := filepath.Join(sproutDir, fmt.Sprintf("%s.meta.json", jid))
-		os.Remove(metaFile) // best-effort, may not exist
-
-		return nil
+	if !validKeySegment(jid) {
+		return ErrJobNotFound
 	}
+	ctx, cancel := opContext()
+	defer cancel()
 
-	return ErrJobNotFound
+	idx, err := listJobs(ctx, obj, jobKeyPrefix)
+	if err != nil {
+		return fmt.Errorf("listing jobs: %w", err)
+	}
+	refs := refsForJID(idx, jid)
+	if len(refs) == 0 {
+		return ErrJobNotFound
+	}
+	return deleteJobObjects(ctx, obj, refs[0], idx[refs[0]])
 }
 
 // ListSprouts returns the IDs of all sprouts that have job records.
 func (s *Store) ListSprouts() ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	obj, err := s.backend()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := opContext()
+	defer cancel()
 
-	return s.listSproutDirs()
+	idx, err := listJobs(ctx, obj, jobKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing jobs: %w", err)
+	}
+	seen := make(map[string]bool)
+	var sprouts []string
+	for ref := range idx {
+		if !seen[ref.sproutID] {
+			seen[ref.sproutID] = true
+			sprouts = append(sprouts, ref.sproutID)
+		}
+	}
+	slices.Sort(sprouts)
+	return sprouts, nil
 }
 
 // CountJobsForSprout returns the number of jobs recorded for a sprout.
 func (s *Store) CountJobsForSprout(sproutID string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sproutDir := filepath.Join(s.logDir, sproutID)
-	entries, err := os.ReadDir(sproutDir)
+	obj, err := s.backend()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("reading sprout job dir: %w", err)
+		return 0, err
 	}
+	if !validKeySegment(sproutID) {
+		return 0, nil
+	}
+	ctx, cancel := opContext()
+	defer cancel()
 
-	count := 0
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
-			count++
-		}
+	idx, err := listJobs(ctx, obj, sproutPrefix(sproutID))
+	if err != nil {
+		return 0, fmt.Errorf("listing sprout jobs: %w", err)
 	}
-	return count, nil
+	return len(idx), nil
 }
 
-// listSproutDirs returns directory names under the job log dir (each is a sprout ID).
-func (s *Store) listSproutDirs() ([]string, error) {
-	if s.logDir == "" {
-		return nil, ErrInvalidJobDir
-	}
-
-	entries, err := os.ReadDir(s.logDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading job log dir: %w", err)
-	}
-
-	var sprouts []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			sprouts = append(sprouts, entry.Name())
-		}
-	}
-	return sprouts, nil
+// validKeySegment reports whether id (a sprout ID or JID) can be used as
+// one segment of an object key. Both arrive in NATS subject tokens, which
+// may contain "/", and a "/" would let one job's keys land inside
+// another's prefix.
+func validKeySegment(id string) bool {
+	return id != "" && id != "." && id != ".." && !strings.Contains(id, "/")
 }
 
-// readJobFile reads and parses a JSONL job file into step completions.
+func sproutPrefix(sproutID string) string {
+	return jobKeyPrefix + sproutID + "/"
+}
+
+func jobPrefix(sproutID, jid string) string {
+	return sproutPrefix(sproutID) + jid + "/"
+}
+
+func createdKey(sproutID, jid string) string {
+	return jobPrefix(sproutID, jid) + createdObject
+}
+
+func metaKey(sproutID, jid string) string {
+	return jobPrefix(sproutID, jid) + metaObject
+}
+
+// eventKey names the object for one job event received at the given
+// time. The zero-padded UnixNano sorts lexically in time order; the random
+// suffix keeps two events received in the same nanosecond (on different
+// replicas) from overwriting each other.
+func eventKey(sproutID, jid string, at time.Time) string {
+	var suffix [4]byte
+	rand.Read(suffix[:])
+	return fmt.Sprintf("%s%s%020d-%s%s", jobPrefix(sproutID, jid), eventsDir, at.UnixNano(), hex.EncodeToString(suffix[:]), logExt)
+}
+
+// eventTime recovers the receive time eventKey encoded into key.
+func eventTime(key string) (time.Time, bool) {
+	name := key[strings.LastIndex(key, "/")+1:]
+	digits, _, found := strings.Cut(name, "-")
+	if !found {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, ns), true
+}
+
+// jobRef identifies one sprout's run of one job.
+type jobRef struct {
+	sproutID string
+	jid      string
+}
+
+// jobObjects is what a List found under one job's prefix.
+type jobObjects struct {
+	created bool
+	meta    bool
+	events  []string // full keys, sorted
+}
+
+// hasLog reports whether the job has any step data. A meta.json alone
+// (say, logJobCreation's second Put failed) doesn't make a job.
+func (o *jobObjects) hasLog() bool {
+	return o.created || len(o.events) > 0
+}
+
+// indexJobs groups object keys under jobKeyPrefix by job. Keys that don't
+// fit the layout are ignored.
+func indexJobs(keys []string) map[jobRef]*jobObjects {
+	idx := make(map[jobRef]*jobObjects)
+	for _, key := range keys {
+		rest, ok := strings.CutPrefix(key, jobKeyPrefix)
+		if !ok {
+			continue
+		}
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) != 3 || !validKeySegment(parts[0]) || !validKeySegment(parts[1]) {
+			continue
+		}
+		ref := jobRef{sproutID: parts[0], jid: parts[1]}
+		name := parts[2]
+		objs := idx[ref]
+		if objs == nil {
+			objs = &jobObjects{}
+		}
+		switch {
+		case name == createdObject:
+			objs.created = true
+		case name == metaObject:
+			objs.meta = true
+		case strings.HasPrefix(name, eventsDir) && strings.HasSuffix(name, logExt) && !strings.Contains(name[len(eventsDir):], "/"):
+			objs.events = append(objs.events, key)
+		default:
+			continue
+		}
+		idx[ref] = objs
+	}
+	for _, objs := range idx {
+		slices.Sort(objs.events)
+	}
+	return idx
+}
+
+// listJobs lists and indexes every job under prefix that has step data.
+func listJobs(ctx context.Context, obj *objectstore.Store, prefix string) (map[jobRef]*jobObjects, error) {
+	keys, err := obj.List(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	idx := indexJobs(keys)
+	for ref, objs := range idx {
+		if !objs.hasLog() {
+			delete(idx, ref)
+		}
+	}
+	return idx, nil
+}
+
+// refsForJID returns every sprout's run of jid in idx, ordered by sprout
+// ID so lookups by JID alone are deterministic.
+func refsForJID(idx map[jobRef]*jobObjects, jid string) []jobRef {
+	var refs []jobRef
+	for ref := range idx {
+		if ref.jid == jid {
+			refs = append(refs, ref)
+		}
+	}
+	slices.SortFunc(refs, func(a, b jobRef) int { return strings.Compare(a.sproutID, b.sproutID) })
+	return refs
+}
+
+// loadJob reads a job's log objects (created.jsonl, then events in key
+// order) and its metadata into a JobSummary.
+func loadJob(ctx context.Context, obj *objectstore.Store, ref jobRef, objs *jobObjects) (*JobSummary, error) {
+	var logKeys []string
+	if objs.created {
+		logKeys = append(logKeys, createdKey(ref.sproutID, ref.jid))
+	}
+	logKeys = append(logKeys, objs.events...)
+
+	var steps []cook.StepCompletion
+	for _, key := range logKeys {
+		data, err := obj.Get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		chunk, err := parseJobLines(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		steps = append(steps, chunk...)
+	}
+
+	summary := buildSummary(ref.jid, ref.sproutID, steps)
+	if objs.meta {
+		if meta, err := readJobMeta(ctx, obj, ref); err == nil {
+			summary.InvokedBy = meta.InvokedBy
+		}
+	}
+	return summary, nil
+}
+
+// loadJobs loads every job in idx, loadConcurrency at a time, skipping any
+// that fail to load, sorted by start time (most recent first).
+func loadJobs(ctx context.Context, obj *objectstore.Store, idx map[jobRef]*jobObjects) []JobSummary {
+	var (
+		mu        sync.Mutex
+		wg        sync.WaitGroup
+		summaries []JobSummary
+	)
+	sem := make(chan struct{}, loadConcurrency)
+	for ref, objs := range idx {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			summary, err := loadJob(ctx, obj, ref, objs)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			summaries = append(summaries, *summary)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	sort.Slice(summaries, func(i, j int) bool {
+		if !summaries[i].StartedAt.Equal(summaries[j].StartedAt) {
+			return summaries[i].StartedAt.After(summaries[j].StartedAt)
+		}
+		if summaries[i].SproutID != summaries[j].SproutID {
+			return summaries[i].SproutID < summaries[j].SproutID
+		}
+		return summaries[i].JID < summaries[j].JID
+	})
+	return summaries
+}
+
+// deleteJobObjects removes one job's log objects, then its metadata. A
+// failure to delete a log object is returned; the metadata delete is
+// best-effort, like the old local-disk .meta.json removal.
+func deleteJobObjects(ctx context.Context, obj *objectstore.Store, ref jobRef, objs *jobObjects) error {
+	var logKeys []string
+	if objs.created {
+		logKeys = append(logKeys, createdKey(ref.sproutID, ref.jid))
+	}
+	logKeys = append(logKeys, objs.events...)
+	for _, key := range logKeys {
+		if err := obj.Delete(ctx, key); err != nil {
+			return fmt.Errorf("deleting job: %w", err)
+		}
+	}
+	if objs.meta {
+		obj.Delete(ctx, metaKey(ref.sproutID, ref.jid))
+	}
+	return nil
+}
+
+// readJobMeta reads a job's meta.json.
+func readJobMeta(ctx context.Context, obj *objectstore.Store, ref jobRef) (*JobMeta, error) {
+	data, err := obj.Get(ctx, metaKey(ref.sproutID, ref.jid))
+	if err != nil {
+		return nil, err
+	}
+	var meta JobMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+// readJobFile reads and parses a local JSONL job file into step
+// completions. Only CLIStore, which stays on the CLI user's disk, reads
+// local files now.
 func readJobFile(path string) ([]cook.StepCompletion, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	return parseJobLines(data)
+}
 
+// parseJobLines parses JSONL job data into step completions.
+func parseJobLines(data []byte) ([]cook.StepCompletion, error) {
 	var steps []cook.StepCompletion
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	for _, line := range lines {
@@ -348,21 +654,6 @@ func readJobFile(path string) ([]cook.StepCompletion, error) {
 		steps = append(steps, step)
 	}
 	return steps, nil
-}
-
-// readJobMeta reads the optional .meta.json file for a job.
-// Returns empty string if the file is missing or unreadable.
-func readJobMeta(dir, jid string) string {
-	metaFile := filepath.Join(dir, fmt.Sprintf("%s.meta.json", jid))
-	data, err := os.ReadFile(metaFile)
-	if err != nil {
-		return ""
-	}
-	var meta JobMeta
-	if json.Unmarshal(data, &meta) != nil {
-		return ""
-	}
-	return meta.InvokedBy
 }
 
 // buildSummary aggregates step completions into a JobSummary.

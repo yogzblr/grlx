@@ -1,84 +1,77 @@
 package jobs
 
-// This code will subscribe to the jobs topic and record the jobs
-// to flat files in the jobs directory.  The files will be named
-// with the job id and will contain the job data in jsonL format.
+// This code subscribes to the job topics and records each job's events in
+// the shared job object store (see store.go for the key layout and why
+// each event is its own object).
 
-// The jobs directory will be created if it does not exist.
-
-// Jobs will eventuall be stored in triplicate: in the jobs directory on the farmer,
-// in the jobs directory on the sprout, and in the jobs directory on
-// the cli user's machine. For now, they are only stored farmer-side.
-// Jobs can be retrieved from the farmer with the grlx job command.
+// Jobs will eventuall be stored in triplicate: farmer-side (the shared job
+// object store), in the jobs directory on the sprout, and in the jobs
+// directory on the cli user's machine. For now, they are only stored
+// farmer-side. Jobs can be retrieved from the farmer with the grlx job
+// command.
 
 // Job data expiration is configurable via the joblogttl setting on both the
 // farmer (Store.StartReaperCtx) and the sprout (StartSproutReaper).
 
 import (
+	"bytes"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gogrlx/grlx/v2/internal/log"
 	"github.com/nats-io/nats.go"
 
-	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 )
 
-// Job represents a job
+// natsCoreQueueGroup is the queue group every farmer replica shares for
+// grlx.cook.*.* and grlx.sprouts.*.cook. It has the same well-known value
+// internal/natsapi/router.go's Subscribe and internal/facts's listener use;
+// the constant is unexported in both, so this package defines its own copy
+// of the same value, as internal/facts does.
+const natsCoreQueueGroup = "grlx-core"
 
 // RegisterNatsConn subscribes to job-related subjects on conn, one of
 // farmer's per-tenant NATS connections (see
 // docs/design/grlx-tenant-context-threading.md's Option A). Called once
 // per tenant connection by cmd/farmer/main.go, so every tenant's job/cook
-// events reach farmer, not just the legacy tenant's — job storage itself
-// (config.JobLogDir) stays a single, un-partitioned directory across every
-// tenant, the same "which connection a handler runs on, not rescoping what
-// the handler does once it's there" carve-out the design doc makes
-// explicit for internal/cook and internal/facts.
+// events reach farmer, not just the legacy tenant's. Job storage itself
+// (the job object store, see SetStore) stays a single, un-partitioned
+// keyspace across every tenant. The design doc makes the same carve-out
+// explicit for internal/cook and internal/facts: this is about which
+// connection a handler runs on, not about rescoping what the handler does
+// once it's there.
 //
-// This intentionally uses plain Subscribe (fan-out), not QueueSubscribe,
-// unlike internal/natsapi/router.go's request/response API handlers. Job
-// data is persisted to a local, per-process directory (config.JobLogDir);
-// with multiple farmer replicas and no shared job storage yet (workstream
-// A), a client's job-status query can land on any replica, so every
-// replica needs its own on-disk copy of every job event to be able to
-// answer it. Queue-grouping these subjects would mean only one replica
-// ever wrote a given job's data, leaving the others unable to serve it.
-// Once workstream A introduces shared job storage, revisit this: writing
-// the same event N times to shared storage becomes wasted work (and a
-// possible race) rather than useful replication, and QueueSubscribe would
-// become the correct choice.
+// This used to use plain Subscribe (fan-out), not QueueSubscribe, on
+// purpose. Job data was written to a local, per-process directory
+// (config.JobLogDir), and with several farmer replicas a client's
+// job-status query could land on any of them, so every replica needed its
+// own on-disk copy of every job event to answer it. Job logs now live in
+// object storage shared by every replica (store.go), and any replica reads
+// the same objects whichever one received an event. That makes fan-out
+// wasted work: every replica would write its own copy of each event into
+// the same shared job, so every step would show up N times, once per
+// replica. QueueSubscribe under the shared "grlx-core" group (the same
+// group internal/natsapi/router.go and internal/facts use) has exactly one
+// replica record each event. internal/facts made the same change once
+// props moved to PXC.
+//
+// Queue-grouping also means one job's events are spread across replicas
+// and handled concurrently. That is why store.go writes each event as its
+// own object instead of rewriting one shared object per job.
 func RegisterNatsConn(tenantID string, conn *nats.Conn) {
 	// conn is used directly below rather than stored in a package-level
 	// var, since RegisterNatsConn can now run concurrently for different
 	// tenants (docs/design/grlx-tenant-context-threading.md) — a shared var
 	// would race between one call's assignment and another's Subscribe, and
 	// nothing else in this package needs to read it back afterward.
-	_, err := conn.Subscribe("grlx.cook.*.*", logJobs)
+	_, err := conn.QueueSubscribe("grlx.cook.*.*", natsCoreQueueGroup, logJobs)
 	if err != nil {
 		log.Error(err)
 	}
-	_, err = conn.Subscribe("grlx.sprouts.*.cook", logJobCreation)
+	_, err = conn.QueueSubscribe("grlx.sprouts.*.cook", natsCoreQueueGroup, logJobCreation)
 	if err != nil {
-		log.Error(err)
-	}
-
-	// Create the jobs directory if it does not exist
-	// this cannot run in init, as the config is not yet loaded
-	if _, err := os.Stat(config.JobLogDir); os.IsNotExist(err) {
-		log.Noticef("Creating jobs directory %s\n", config.JobLogDir)
-		err = os.MkdirAll(config.JobLogDir, 0o700)
-		if err != nil {
-			log.Error(err)
-		}
-
-	} else if err != nil {
 		log.Error(err)
 	}
 }
@@ -100,44 +93,47 @@ func logJobCreation(msg *nats.Msg) {
 	if envelope.JobID == "" {
 		return
 	}
-
-	// Ensure the sprout directory exists.
-	sproutDir := filepath.Join(config.JobLogDir, sprout)
-	if err := os.MkdirAll(sproutDir, 0o700); err != nil {
-		log.Errorf("failed to create sprout job dir: %v", err)
+	if !validKeySegment(sprout) || !validKeySegment(envelope.JobID) {
+		log.Errorf("refusing to record job %q for sprout %q: not usable as an object key segment", envelope.JobID, sprout)
 		return
 	}
+	obj := objStore
+	if obj == nil {
+		log.Errorf("failed to record job %s for sprout %s: %v", envelope.JobID, sprout, ErrJobStoreNotConfigured)
+		return
+	}
+	ctx, cancel := opContext()
+	defer cancel()
 
 	// Write a creation marker so the job appears in listings immediately,
 	// even before any step completions arrive.
-	jobFile := filepath.Join(sproutDir, fmt.Sprintf("%s.jsonl", envelope.JobID))
-	if _, err := os.Stat(jobFile); err == nil {
-		// File already exists (shouldn't happen, but be safe).
+	exists, err := obj.Exists(ctx, createdKey(sprout, envelope.JobID))
+	if err != nil {
+		log.Errorf("failed to check for existing job %s: %v", envelope.JobID, err)
+		return
+	}
+	if exists {
+		// Already created (shouldn't happen, but be safe).
 		return
 	}
 
-	// Write job metadata with invoker info for audit attribution.
-	if envelope.InvokedBy != "" {
-		metaFile := filepath.Join(sproutDir, fmt.Sprintf("%s.meta.json", envelope.JobID))
-		meta := JobMeta{
-			JID:       envelope.JobID,
-			InvokedBy: envelope.InvokedBy,
-			CreatedAt: time.Now().UTC(),
-		}
-		if metaData, mErr := json.Marshal(meta); mErr == nil {
-			os.WriteFile(metaFile, metaData, 0o640)
+	// Write job metadata: invoker info for audit attribution, and the
+	// creation time the reaper dates a job by until its first event
+	// arrives. Written even without an invoker for that reason.
+	meta := JobMeta{
+		JID:       envelope.JobID,
+		InvokedBy: envelope.InvokedBy,
+		CreatedAt: time.Now().UTC(),
+	}
+	if metaData, mErr := json.Marshal(meta); mErr == nil {
+		if putErr := obj.Put(ctx, metaKey(sprout, envelope.JobID), metaData); putErr != nil {
+			log.Errorf("failed to write job metadata for %s: %v", envelope.JobID, putErr)
 		}
 	}
 
 	// Write a "not started" step for each step in the envelope so the job
 	// shows up with the correct total count right away.
-	f, err := os.Create(jobFile)
-	if err != nil {
-		log.Errorf("failed to create job file for %s: %v", envelope.JobID, err)
-		return
-	}
-	defer f.Close()
-
+	var buf bytes.Buffer
 	for _, step := range envelope.Steps {
 		placeholder := cook.StepCompletion{
 			ID:               step.ID,
@@ -149,16 +145,23 @@ func logJobCreation(msg *nats.Msg) {
 			log.Errorf("failed to marshal placeholder step: %v", marshalErr)
 			continue
 		}
-		f.Write(b)
-		f.WriteString("\n")
+		buf.Write(b)
+		buf.WriteString("\n")
+	}
+	if err := obj.Put(ctx, createdKey(sprout, envelope.JobID), buf.Bytes()); err != nil {
+		log.Errorf("failed to create job %s: %v", envelope.JobID, err)
+		return
 	}
 	log.Noticef("job %s created for sprout %s (%d steps)", envelope.JobID, sprout, len(envelope.Steps))
 }
 
 func logJobs(msg *nats.Msg) {
-	// Subscribe to the jobs topic
+	// Subject: grlx.cook.<sproutID>.<jid>
 	tComponents := strings.Split(msg.Subject, ".")
-	// subscription topic guaranteed to be in the form grlx.cook.<sprout>.<jid>
+	if len(tComponents) < 4 {
+		log.Errorf("unexpected subject format for job step: %s", msg.Subject)
+		return
+	}
 	sprout := tComponents[2]
 	JID := tComponents[3]
 
@@ -169,63 +172,28 @@ func logJobs(msg *nats.Msg) {
 		log.Error(err)
 		return
 	}
-	f := &os.File{}
-	// Create the job file
-	jobFile := filepath.Join(config.JobLogDir, sprout, fmt.Sprintf("%s.jsonl", JID))
-	log.Tracef("Job file: %s\n", jobFile)
-	st, err := os.Stat(jobFile)
-	if errors.Is(err, os.ErrNotExist) {
-		// File does not exist, create it
-		err = os.MkdirAll(filepath.Dir(jobFile), 0o700)
-		if err != nil {
-			log.Error(err)
-			return
-		}
-		f, err = os.Create(jobFile)
-		if err != nil {
-			log.Error(err)
-			return
-		}
-	} else if err != nil {
-		log.Error(err)
+	if !validKeySegment(sprout) || !validKeySegment(JID) {
+		log.Errorf("refusing to record step for job %q on sprout %q: not usable as an object key segment", JID, sprout)
 		return
-	} else if st.IsDir() {
-		log.Errorf("job file %s is a directory", jobFile)
-		return
-	} else {
-		// File exists, open it for appending
-		f, err = os.OpenFile(jobFile, os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			log.Error(err)
-			return
-		}
 	}
-
-	// Write the job data to the file
 	b, err := json.Marshal(completedStep)
 	if err != nil {
 		log.Error(err)
-		f.Close()
 		return
 	}
-	_, err = f.Write(b)
-	if err != nil {
-		log.Error(err)
-		f.Close()
+	obj := objStore
+	if obj == nil {
+		log.Errorf("failed to record step %s of job %s: %v", completedStep.ID, JID, ErrJobStoreNotConfigured)
 		return
 	}
-	_, err = f.WriteString("\n")
-	if err != nil {
-		log.Error(err)
-		f.Close()
-		return
+	ctx, cancel := opContext()
+	defer cancel()
 
-	}
-
-	// Close the file
-	err = f.Close()
-	if err != nil {
-		log.Error(err)
+	// Each event is its own object; see store.go for why.
+	key := eventKey(sprout, JID, time.Now())
+	log.Tracef("Job event object: %s\n", key)
+	if err := obj.Put(ctx, key, append(b, '\n')); err != nil {
+		log.Errorf("failed to record step %s of job %s: %v", completedStep.ID, JID, err)
 		return
 	}
 

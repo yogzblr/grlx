@@ -2,18 +2,21 @@ package jobs
 
 import (
 	"context"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	log "github.com/gogrlx/grlx/v2/internal/log"
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
 )
 
-// StartReaper launches a background goroutine that periodically removes job
-// log files older than the given TTL. It checks once per hour. A TTL of 0
-// disables expiration entirely. The reaper runs until the process exits; use
-// StartReaperCtx to bind its lifetime to a context.
+// StartReaper launches a background goroutine that periodically removes jobs
+// with no activity for longer than the given TTL. It checks once per hour. A
+// TTL of 0 disables expiration entirely. The reaper runs until the process
+// exits; use StartReaperCtx to bind its lifetime to a context.
+//
+// Every farmer replica runs its own reaper against the shared job bucket.
+// That repeats the listing work once per replica per hour, but is otherwise
+// harmless: deleting an already-deleted object succeeds, so replicas racing
+// to expire the same job all succeed.
 func (s *Store) StartReaper(ttl time.Duration) {
 	s.StartReaperCtx(context.Background(), ttl)
 }
@@ -43,51 +46,41 @@ func (s *Store) StartReaperCtx(ctx context.Context, ttl time.Duration) {
 	}()
 }
 
-// reap deletes job log files whose modification time is older than the TTL.
+// reap deletes every job whose last activity is older than the TTL. Object
+// storage has no modification time to go by the way the local-disk reaper
+// used file mtimes, so a job's last activity is the receive time of its
+// newest event (encoded in the event key), or its meta.json CreatedAt if
+// no events have arrived. logJobCreation always writes meta.json, so every
+// job can be dated. A job with neither is left alone.
 func (s *Store) reap(ttl time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	obj, err := s.backend()
+	if err != nil {
+		log.Errorf("reaper: %v", err)
+		return
+	}
+	ctx, cancel := opContext()
+	defer cancel()
 
 	cutoff := time.Now().Add(-ttl)
-	sprouts, err := s.listSproutDirsUnlocked()
+	keys, err := obj.List(ctx, jobKeyPrefix)
 	if err != nil {
-		log.Errorf("reaper: listing sprout dirs: %v", err)
+		log.Errorf("reaper: listing jobs: %v", err)
 		return
 	}
 
 	removed := 0
-	for _, sproutID := range sprouts {
-		sproutDir := filepath.Join(s.logDir, sproutID)
-		entries, readErr := os.ReadDir(sproutDir)
-		if readErr != nil {
+	// Deliberately indexJobs, not listJobs: a meta.json with no log
+	// objects (its job's created.jsonl Put failed) should expire too.
+	for ref, objs := range indexJobs(keys) {
+		last := lastActivity(ctx, obj, ref, objs)
+		if last.IsZero() || !last.Before(cutoff) {
 			continue
 		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-				continue
-			}
-			info, infoErr := entry.Info()
-			if infoErr != nil {
-				continue
-			}
-			if info.ModTime().Before(cutoff) {
-				jobFile := filepath.Join(sproutDir, entry.Name())
-				if rmErr := os.Remove(jobFile); rmErr != nil {
-					log.Errorf("reaper: removing %s: %v", jobFile, rmErr)
-				} else {
-					removed++
-				}
-				// Remove companion metadata file if it exists.
-				jid := strings.TrimSuffix(entry.Name(), ".jsonl")
-				metaFile := filepath.Join(sproutDir, jid+".meta.json")
-				os.Remove(metaFile) // ignore error — file may not exist
-			}
+		if err := deleteJobObjects(ctx, obj, ref, objs); err != nil {
+			log.Errorf("reaper: removing job %s for sprout %s: %v", ref.jid, ref.sproutID, err)
+			continue
 		}
-		// Remove empty sprout directories.
-		remaining, _ := os.ReadDir(sproutDir)
-		if len(remaining) == 0 {
-			os.Remove(sproutDir)
-		}
+		removed++
 	}
 
 	if removed > 0 {
@@ -95,26 +88,19 @@ func (s *Store) reap(ttl time.Duration) {
 	}
 }
 
-// listSproutDirsUnlocked is the same as listSproutDirs but assumes the caller
-// already holds the lock.
-func (s *Store) listSproutDirsUnlocked() ([]string, error) {
-	if s.logDir == "" {
-		return nil, ErrInvalidJobDir
-	}
-
-	entries, err := os.ReadDir(s.logDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var sprouts []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			sprouts = append(sprouts, entry.Name())
+// lastActivity returns when a job was last written to, or the zero time if
+// that can't be determined.
+func lastActivity(ctx context.Context, obj *objectstore.Store, ref jobRef, objs *jobObjects) time.Time {
+	var last time.Time
+	for _, key := range objs.events {
+		if t, ok := eventTime(key); ok && t.After(last) {
+			last = t
 		}
 	}
-	return sprouts, nil
+	if last.IsZero() && objs.meta {
+		if meta, err := readJobMeta(ctx, obj, ref); err == nil {
+			last = meta.CreatedAt
+		}
+	}
+	return last
 }
