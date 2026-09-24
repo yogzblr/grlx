@@ -41,9 +41,10 @@ const (
 func saasAPIUserSeedPath() string { return filepath.Join(natsAuthDir(), "saasapi-user.nk") }
 
 // SaaSAPIUserJWTPath is where EnsureSaaSAPICredential persists the SaaS
-// API's minted User JWT — the file an ops step copies into OpenBao KV for
-// External Secrets Operator to deliver as SAASAPI_NATS_USER_JWT (see the
-// design doc's "Getting the credential to the saasapi Deployment").
+// API's minted User JWT. It reaches OpenBao KV (and, via External Secrets
+// Operator, saasapi's SAASAPI_NATS_USER_JWT) through
+// PublishSaaSAPICredential, run by `farmer publish-saasapi-credential`
+// (see saasapi_publish.go and the design doc's "JWT -> OpenBao hand-off").
 func SaaSAPIUserJWTPath() string { return filepath.Join(natsAuthDir(), "users", "saasapi.jwt") }
 
 func sysAccountJWTPath() string { return filepath.Join(natsAuthDir(), "sys-account.jwt") }

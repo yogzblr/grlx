@@ -44,6 +44,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/props"
 	"github.com/gogrlx/grlx/v2/internal/pxc"
 	"github.com/gogrlx/grlx/v2/internal/rbac"
+	"github.com/gogrlx/grlx/v2/internal/saasapicred"
 	"github.com/gogrlx/grlx/v2/internal/tenantconn"
 
 	nats "github.com/nats-io/nats.go"
@@ -117,6 +118,14 @@ func readinessTenantStats() handlers.TenantConnStats {
 
 func main() {
 	config.LoadConfig("farmer")
+	// One-shot subcommands run before any server initialization (storage,
+	// Valkey, OpenBao PKI/Transit clients): they need only the config and
+	// PKI directory loaded above. See internal/saasapicred.
+	if len(os.Args) > 1 && os.Args[1] == saasapicred.Command {
+		code := saasapicred.Run(os.Args[2:], os.Stderr)
+		log.Flush()
+		os.Exit(code)
+	}
 	fmt.Printf("Starting Farmer (core) with bus URL %s\n", config.FarmerBusURL)
 	defer log.Flush()
 	initStorage()

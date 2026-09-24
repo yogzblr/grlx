@@ -259,11 +259,13 @@ the way an environment variable is. This matches `jwtauth.go`'s preference
 for the `GRLX_NATS_*_SEED_FILE` form. The JWT isn't secret and stays an
 environment variable.
 
-**Not in this repo:** the OpenBao KV path, the `ExternalSecret` manifest,
-and the Reloader annotation. This repo has no Kubernetes manifests at all;
-`deploy/` holds only Envoy config. They belong in the separate ops/infra
-repo, which this change doesn't have access to. That's the same situation
-as the gatewayjwt Envoy wiring. The intended production flow is:
+**Not in this repo:** the real OpenBao KV paths and policies, the
+`ExternalSecret` manifests, the Reloader annotation, and farmer's own
+Deployment/Helm chart. They belong in the separate ops/infra repo, which
+this change doesn't have access to. That's the same situation as the
+gatewayjwt Envoy wiring. `deploy/farmer/` holds reviewed *reference*
+versions of the parts this design depends on (see below). The intended
+production flow is:
 
 1. Ops generates the SaaS API's NKey seed and stores it in OpenBao KV.
 2. ESO syncs it to farmer as `GRLX_NATS_SAASAPI_USER_SEED_FILE`, so farmer
@@ -274,11 +276,10 @@ as the gatewayjwt Envoy wiring. The intended production flow is:
    and pushes the previous key if it rotated, and writes the JWT to
    `{FarmerPKI}/nats-auth/users/saasapi.jwt`.
 4. The JWT gets into OpenBao KV. It's not secret, but it has to travel
-   with the seed. ESO syncs it to saasapi as `SAASAPI_NATS_USER_JWT`, and
-   Reloader restarts saasapi.
-
-Step 4 is the one piece of glue that doesn't exist yet. See the open
-questions.
+   with the seed. `farmer publish-saasapi-credential`, run as a
+   Kubernetes Job with farmer's own image, writes it to a dedicated KV v2
+   path. ESO syncs it to saasapi as `SAASAPI_NATS_USER_JWT`, and
+   Reloader restarts saasapi. See "JWT -> OpenBao hand-off" below.
 
 Farmer holding the SaaS API's seed (step 2) grants farmer nothing new:
 farmer already holds the SYS Account key, which can mint any SYS User. If
@@ -364,6 +365,47 @@ response. Putting `err.Error()` back on the bus makes that test fail.
   deprovisioned tenant. It now returns the error instead
   (`TestTenantLookup_NotFoundVsDBError`).
 
+## JWT -> OpenBao hand-off (decided)
+
+Closes what was the last open question here. **FLAG FOR SECURITY
+REVIEW:** this adds the repo's first OpenBao *write* policy.
+
+- **SYS Account seed: an ops change only.** The SYS Account key already
+  loads through `loadOrCreateSeed(path, "SYS_ACCOUNT", ...)` like every
+  other key, so `GRLX_NATS_SYS_ACCOUNT_SEED_FILE` pointing at an
+  ESO-mounted Secret is all it takes. farmer's Deployment isn't in this
+  repo, so the exact volume, mount path and env var are specified in
+  `deploy/farmer/farmer-deployment-nats-seeds.patch.yaml` for the ops
+  repo. farmerbus needs the same seed, and an existing install must
+  import its current `sys-account.nk` rather than generate a new one
+  (`deploy/farmer/README.md`).
+- **The JWT: a farmer subcommand run as a Job, not farmer's server.** A
+  mounted Secret only flows from the secret store into the pod, so
+  publishing the minted JWT needs a real KV write.
+  `farmer publish-saasapi-credential` (`internal/saasapicred`) runs
+  `pki.EnsureSaaSAPICredential()` and then `pki.PublishSaaSAPICredential`.
+  That writes `{jwt, public_key}` (never the seed) to a configurable
+  KV v2 path through a hand-rolled client (`internal/openbaokv`; the
+  OpenBao SDK is MPL-2.0). It writes nothing when the published JWT is
+  already current by claims. The reference Job
+  (`deploy/farmer/saasapi-credential-publish-job.yaml`) runs farmer's image
+  with the same seed Secret and an emptyDir PKI directory. That means it
+  never pushes to the resolver, never reaches the bus, and never races
+  farmer on its PKI files. Revocation on rotation stays farmer's job, at
+  boot. The subcommand refuses to run if either key would have to be
+  generated.
+- **Least privilege.** Only the Job's own OpenBao role
+  (`grlx-saasapi-cred-publisher`, bound to its own ServiceAccount) gets
+  `create`/`update`/`read` on that one data path. farmer's server process
+  gets no capability on it, and none of the `GRLX_SAASAPI_CRED_OPENBAO_*`
+  configuration. The exact policy, and what farmer's policies must keep
+  excluding, is in `deploy/farmer/README.md`.
+- **When it runs:** automatically after every farmer deployment
+  (post-install/post-upgrade hook). Permission changes to the credential
+  only ship with a farmer deployment, and re-running is a read-only no-op.
+  Seed rotation isn't a deployment, so the rotation runbook also triggers
+  the Job explicitly.
+
 ## Deferred / open questions
 
 - **Outbox re-dispatch sweeper.** NATS core gives no redelivery guarantee
@@ -373,11 +415,6 @@ response. Putting `err.Error()` back on the bus makes that test fail.
   a periodic re-publish of stale `pending` jobs is safe. That's the
   natural follow-up and isn't built here. `attempts` is incremented on
   every dispatch so the sweeper has something to bound on.
-- **JWT → OpenBao hand-off (step 4 above).** Should farmer write the
-  minted JWT into OpenBao KV itself? That needs a new hand-rolled KV
-  client and an OpenBao policy granting farmer write access to one path.
-  Or should an ops Job copy it? It belongs in the ops repo either way,
-  and needs a decision.
 - **`internal.sprout.*` permissions.** Added when those handlers land (see
   above). `internal.sprout.mint`, `.revoke`, `.action`, and
   `internal.sprouts.list` are request-reply, so that change also has to
