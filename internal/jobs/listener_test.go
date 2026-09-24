@@ -681,10 +681,7 @@ func TestRegisterNatsConn_TwoReplicasRecordEachEventOnce(t *testing.T) {
 }
 
 func TestLogJobs_FailedStepWithError(t *testing.T) {
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+	obj := useTestObjStore(t)
 
 	_, conn := startTestNATSServer(t)
 	RegisterNatsConn("t_test", conn)
@@ -704,34 +701,27 @@ func TestLogJobs_FailedStepWithError(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Flush()
-	time.Sleep(300 * time.Millisecond)
 
-	steps, err := readJobFile(filepath.Join(dir, "sprout-fail", "job-fail-1.jsonl"))
-	if err != nil {
-		t.Fatalf("failed step was not recorded: %v", err)
+	summary := waitForSteps(t, obj, "sprout-fail", "job-fail-1", 1)
+	if len(summary.Steps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(summary.Steps))
 	}
-	if len(steps) != 1 {
-		t.Fatalf("expected 1 step, got %d", len(steps))
-	}
-	got := steps[0]
+	got := summary.Steps[0]
 	if got.ID != "step-fail" || got.CompletionStatus != cook.StepFailed {
 		t.Errorf("got step %+v", got)
 	}
 	if got.Error == nil || got.Error.Error() != "boom" {
 		t.Errorf("Error = %v, want boom", got.Error)
 	}
-	if s := buildSummary("job-fail-1", "sprout-fail", steps); s.Status != JobFailed || s.Failed != 1 {
-		t.Errorf("summary = %+v, want one failed step", s)
+	if summary.Status != JobFailed || summary.Failed != 1 {
+		t.Errorf("summary = %+v, want one failed step", summary)
 	}
 }
 
 func TestLogJobs_LegacyEmptyObjectError(t *testing.T) {
 	// Sprouts on an older version still send "Error":{}; the event must
 	// be recorded, not dropped.
-	dir := t.TempDir()
-	origJobLogDir := config.JobLogDir
-	config.JobLogDir = dir
-	t.Cleanup(func() { config.JobLogDir = origJobLogDir })
+	obj := useTestObjStore(t)
 
 	_, conn := startTestNATSServer(t)
 	RegisterNatsConn("t_test", conn)
@@ -741,13 +731,9 @@ func TestLogJobs_LegacyEmptyObjectError(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Flush()
-	time.Sleep(300 * time.Millisecond)
 
-	steps, err := readJobFile(filepath.Join(dir, "sprout-old", "job-old.jsonl"))
-	if err != nil {
-		t.Fatalf("legacy failed step was not recorded: %v", err)
-	}
-	if len(steps) != 1 || steps[0].CompletionStatus != cook.StepFailed || steps[0].Error == nil {
-		t.Errorf("got %+v, want one failed step with a non-nil Error", steps)
+	summary := waitForSteps(t, obj, "sprout-old", "job-old", 1)
+	if len(summary.Steps) != 1 || summary.Steps[0].CompletionStatus != cook.StepFailed || summary.Steps[0].Error == nil {
+		t.Errorf("got %+v, want one failed step with a non-nil Error", summary.Steps)
 	}
 }
