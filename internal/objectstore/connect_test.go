@@ -18,6 +18,16 @@ type retryCall struct {
 	err     error
 }
 
+// open builds a Store for cfg, failing the test on a config error.
+func open(t *testing.T, cfg objectstore.Config) *objectstore.Store {
+	t.Helper()
+	store, err := objectstore.Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	return store
+}
+
 // fastPolicy keeps real waits in the millisecond range and records every
 // retry.
 func fastPolicy(calls *[]retryCall) objectstore.RetryPolicy {
@@ -32,31 +42,28 @@ func fastPolicy(calls *[]retryCall) objectstore.RetryPolicy {
 	}
 }
 
-func TestConnectSucceedsFirstTry(t *testing.T) {
+func TestWaitReadySucceedsFirstTry(t *testing.T) {
 	srv := objectstoretest.NewServer(t)
+	store := open(t, srv.Config())
 	var calls []retryCall
 
-	store, err := objectstore.Connect(context.Background(), srv.Config(), fastPolicy(&calls))
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
+	if err := store.WaitReady(context.Background(), fastPolicy(&calls)); err != nil {
+		t.Fatalf("WaitReady: %v", err)
 	}
 	if len(calls) != 0 {
 		t.Errorf("expected no retries, got %+v", calls)
 	}
-	if err := store.Put(context.Background(), "k", []byte("v")); err != nil {
-		t.Errorf("connected store not usable: %v", err)
-	}
 }
 
-func TestConnectRetriesWithExponentialBackoff(t *testing.T) {
+func TestWaitReadyRetriesWithExponentialBackoff(t *testing.T) {
 	srv := objectstoretest.NewServer(t)
 	// The bucket "appears" on the third attempt, as when a bucket-creation
 	// job races farmer's startup.
 	srv.FailNext(2, 404, "NoSuchBucket")
 	var calls []retryCall
 
-	if _, err := objectstore.Connect(context.Background(), srv.Config(), fastPolicy(&calls)); err != nil {
-		t.Fatalf("Connect: %v", err)
+	if err := open(t, srv.Config()).WaitReady(context.Background(), fastPolicy(&calls)); err != nil {
+		t.Fatalf("WaitReady: %v", err)
 	}
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 retries, got %d: %+v", len(calls), calls)
@@ -75,13 +82,13 @@ func TestConnectRetriesWithExponentialBackoff(t *testing.T) {
 	}
 }
 
-func TestConnectGivesUpAfterMaxAttempts(t *testing.T) {
+func TestWaitReadyGivesUpAfterMaxAttempts(t *testing.T) {
 	srv := objectstoretest.NewServer(t)
 	cfg := srv.Config()
 	cfg.Bucket = "missing-bucket"
 	var calls []retryCall
 
-	_, err := objectstore.Connect(context.Background(), cfg, fastPolicy(&calls))
+	err := open(t, cfg).WaitReady(context.Background(), fastPolicy(&calls))
 	if !errors.Is(err, objectstore.ErrBucketNotFound) {
 		t.Fatalf("expected ErrBucketNotFound, got %v", err)
 	}
@@ -93,7 +100,7 @@ func TestConnectGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 }
 
-func TestConnectFailsFastOnRejectedCredentials(t *testing.T) {
+func TestWaitReadyFailsFastOnRejectedCredentials(t *testing.T) {
 	for _, code := range []string{"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"} {
 		t.Run(code, func(t *testing.T) {
 			srv := objectstoretest.NewServer(t)
@@ -102,7 +109,7 @@ func TestConnectFailsFastOnRejectedCredentials(t *testing.T) {
 			srv.FailNext(100, 403, code)
 			var calls []retryCall
 
-			if _, err := objectstore.Connect(context.Background(), srv.Config(), fastPolicy(&calls)); err == nil {
+			if err := open(t, srv.Config()).WaitReady(context.Background(), fastPolicy(&calls)); err == nil {
 				t.Fatal("expected an error")
 			}
 			if len(calls) != 0 {
@@ -112,17 +119,7 @@ func TestConnectFailsFastOnRejectedCredentials(t *testing.T) {
 	}
 }
 
-func TestConnectFailsFastOnBadConfig(t *testing.T) {
-	var calls []retryCall
-	if _, err := objectstore.Connect(context.Background(), objectstore.Config{Bucket: "recipes"}, fastPolicy(&calls)); err == nil {
-		t.Fatal("expected an error for an empty endpoint")
-	}
-	if len(calls) != 0 {
-		t.Errorf("config errors must not be retried, got %d retries", len(calls))
-	}
-}
-
-func TestConnectUnreachableEndpoint(t *testing.T) {
+func TestWaitReadyUnreachableEndpoint(t *testing.T) {
 	// A port that was just listening and is now closed: connection refused.
 	dead := httptest.NewServer(nil)
 	endpoint := strings.TrimPrefix(dead.URL, "http://")
@@ -135,7 +132,7 @@ func TestConnectUnreachableEndpoint(t *testing.T) {
 	cfg := objectstore.Config{Endpoint: endpoint, AccessKeyID: "x", SecretAccessKey: "x", Bucket: "recipes"}
 
 	start := time.Now()
-	if _, err := objectstore.Connect(context.Background(), cfg, p); err == nil {
+	if err := open(t, cfg).WaitReady(context.Background(), p); err == nil {
 		t.Fatal("expected an error for an unreachable endpoint")
 	}
 	if len(calls) != 2 {
@@ -146,7 +143,7 @@ func TestConnectUnreachableEndpoint(t *testing.T) {
 	}
 }
 
-func TestConnectStopsWhenContextCancelled(t *testing.T) {
+func TestWaitReadyStopsWhenContextCancelled(t *testing.T) {
 	srv := objectstoretest.NewServer(t)
 	cfg := srv.Config()
 	cfg.Bucket = "missing-bucket"
@@ -158,17 +155,44 @@ func TestConnectStopsWhenContextCancelled(t *testing.T) {
 		OnRetry:        func(int, time.Duration, error) { cancel() },
 	}
 
+	store := open(t, cfg)
 	done := make(chan error, 1)
-	go func() {
-		_, err := objectstore.Connect(ctx, cfg, p)
-		done <- err
-	}()
+	go func() { done <- store.WaitReady(ctx, p) }()
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context.Canceled, got %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Connect did not return after its context was cancelled")
+		t.Fatal("WaitReady did not return after its context was cancelled")
+	}
+}
+
+// TestStoreUsableAfterWaitReadyGivesUp: giving up is not fatal. The same
+// Store keeps sending requests to the endpoint, so a request while it's
+// still failing fails on its own, and the next one after it recovers
+// succeeds without reopening anything.
+func TestStoreUsableAfterWaitReadyGivesUp(t *testing.T) {
+	srv := objectstoretest.NewServer(t)
+	store := open(t, srv.Config())
+	// Two failures spent by WaitReady (MaxAttempts 2), one left over for
+	// the first request after it.
+	srv.FailNext(3, 404, "NoSuchBucket")
+	var calls []retryCall
+	p := fastPolicy(&calls)
+	p.MaxAttempts = 2
+
+	if err := store.WaitReady(context.Background(), p); err == nil {
+		t.Fatal("expected WaitReady to give up")
+	}
+	ctx := context.Background()
+	if err := store.Put(ctx, "k", []byte("v")); err == nil {
+		t.Fatal("expected the request made while the store is failing to fail")
+	}
+	if err := store.Put(ctx, "k", []byte("v")); err != nil {
+		t.Fatalf("request after the store recovered: %v", err)
+	}
+	if got, err := store.Get(ctx, "k"); err != nil || string(got) != "v" {
+		t.Fatalf("Get after recovery = %q, %v", got, err)
 	}
 }

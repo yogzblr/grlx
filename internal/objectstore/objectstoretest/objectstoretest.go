@@ -44,7 +44,7 @@ type failure struct {
 }
 
 // Server is a handle on a fake S3 server, for tests that open their own
-// clients against it (e.g. objectstore.Connect) or inject failures.
+// clients against it (e.g. to exercise Store.WaitReady) or inject failures.
 type Server struct {
 	f   *fakeS3
 	srv *httptest.Server

@@ -44,7 +44,7 @@ type Config struct {
 
 // Open builds a client for the configured S3/MinIO endpoint. It makes no
 // network calls, so it does not verify the endpoint is reachable or the
-// bucket exists — use Connect for that (with retries), or Ping.
+// bucket exists — use WaitReady for that (with retries), or Ping.
 func Open(cfg Config) (*Store, error) {
 	if cfg.Endpoint == "" {
 		return nil, fmt.Errorf("objectstore: empty endpoint")

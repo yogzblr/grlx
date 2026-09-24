@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http/httptest"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/gogrlx/grlx/v2/internal/objectstore"
 	"github.com/gogrlx/grlx/v2/internal/objectstore/objectstoretest"
 	"github.com/gogrlx/grlx/v2/internal/props"
 )
@@ -222,4 +226,30 @@ func TestReplicasResolveIdentically(t *testing.T) {
 	if _, err := resolveRecipeSteps(context.Background(), testPropsTenantID, sproutID, "web"); !errors.Is(err, ErrNoRecipe) {
 		t.Fatalf("expected ErrNoRecipe from an unshared store, got %v", err)
 	}
+}
+
+// TestUnreachableStoreFailsTheRequest: with the store installed but its
+// endpoint down, a cook fails that one request, reported as neither
+// "no recipe" nor "not configured", instead of anything process-wide.
+func TestUnreachableStoreFailsTheRequest(t *testing.T) {
+	dead := httptest.NewServer(nil)
+	endpoint := strings.TrimPrefix(dead.URL, "http://")
+	dead.Close()
+	s, err := objectstore.Open(objectstore.Config{Endpoint: endpoint, AccessKeyID: "x", SecretAccessKey: "x", Bucket: "recipes"})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	useRecipeStore(t, s)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = resolveRecipeSteps(ctx, testPropsTenantID, "unreachable-sprout", "independent")
+	if err == nil {
+		t.Fatal("expected the request to fail against an unreachable store")
+	}
+	if errors.Is(err, ErrNoRecipe) || errors.Is(err, ErrRecipeStoreNotConfigured) {
+		t.Errorf("unreachable store misreported as %v", err)
+	}
+	t.Logf("failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
 }

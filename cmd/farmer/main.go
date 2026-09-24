@@ -131,7 +131,10 @@ func main() {
 	fmt.Printf("Starting Farmer (core) with bus URL %s\n", config.FarmerBusURL)
 	defer log.Flush()
 	initStorage()
-	initRecipeStore()
+	if shutdown := initRecipeStore(); shutdown {
+		log.Info("Shutdown signal received during startup, stopping farmer")
+		return
+	}
 	initGatewaySigner()
 	initHeartbeatClient()
 	props.LoadStaticProps(config.StaticProps())
@@ -256,32 +259,48 @@ func initStorage() {
 // truth; syncing a merged commit into this bucket is a deploy-time
 // concern, not something farmer does at runtime.
 //
-// The store is checked before boot continues, retrying with exponential
+// The object store is never a reason for farmer to exit. The store is
+// installed as soon as it's configured, then checked with exponential
 // backoff (objectstore.DefaultRetryPolicy, about 90s) so a MinIO that's
-// still starting alongside farmer doesn't fail it. If the store is still
-// unreachable after that, startup fails and Kubernetes' restart backoff
-// takes over, as with the other backends here. SIGINT/SIGTERM during the
-// wait aborts it.
-func initRecipeStore() {
+// still starting alongside farmer is logged rather than silently missed.
+// If it's still unreachable after that, boot continues: recipe requests
+// fail individually until it's back, then succeed without a restart. If
+// it isn't configured at all, recipe requests fail with "recipe store not
+// configured".
+//
+// SIGINT/SIGTERM during the wait is a request to stop farmer, not an
+// object-store failure: the signal is consumed here, so initRecipeStore
+// reports it (shutdown=true) for main to stop instead of booting on.
+func initRecipeStore() (shutdown bool) {
+	store, err := objectstore.Open(objectstore.Config{
+		Endpoint:        config.S3Endpoint,
+		AccessKeyID:     config.S3AccessKeyID,
+		SecretAccessKey: config.S3SecretAccessKey,
+		UseSSL:          config.S3UseSSL,
+		Bucket:          config.S3Bucket,
+	})
+	if err != nil {
+		log.Errorf("recipe object store not configured (recipe requests will fail until it is): %v", err)
+		return false
+	}
+	cook.SetStore(store)
+	handlers.SetRecipeStore(store)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	policy := objectstore.DefaultRetryPolicy()
 	policy.OnRetry = func(attempt int, wait time.Duration, err error) {
 		log.Errorf("recipe object store not ready (attempt %d/%d), retrying in %s: %v", attempt, policy.MaxAttempts, wait.Round(time.Millisecond), err)
 	}
-	store, err := objectstore.Connect(ctx, objectstore.Config{
-		Endpoint:        config.S3Endpoint,
-		AccessKeyID:     config.S3AccessKeyID,
-		SecretAccessKey: config.S3SecretAccessKey,
-		UseSSL:          config.S3UseSSL,
-		Bucket:          config.S3Bucket,
-	}, policy)
-	if err != nil {
-		log.Fatalf("failed to connect to recipe object store: %v", err)
+	if err := store.WaitReady(ctx, policy); err != nil {
+		if ctx.Err() != nil {
+			return true
+		}
+		log.Errorf("recipe object store still unreachable after retries; starting anyway (recipe requests will fail until it's back): %v", err)
+		return false
 	}
 	log.Infof("Connected to recipe object store %s (bucket %s)", config.S3Endpoint, config.S3Bucket)
-	cook.SetStore(store)
-	handlers.SetRecipeStore(store)
+	return false
 }
 
 // initGatewaySigner wires up the OpenBao Transit-backed signer for
