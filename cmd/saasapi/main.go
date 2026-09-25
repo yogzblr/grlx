@@ -16,6 +16,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
+	"github.com/gogrlx/grlx/v2/internal/heartbeat"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 	"github.com/gogrlx/grlx/v2/internal/saasapi"
 )
@@ -37,7 +38,7 @@ func main() {
 	// multiply the limit by the replica count. Once running, a Valkey
 	// error on an individual request falls back to this pod's own limit
 	// instead (see saasapi.NewValkeyLimiter). Client-side caching is off:
-	// the limiter never reads a cacheable value.
+	// neither the limiter nor heartbeat.IsOnline reads a cacheable value.
 	var vc valkey.Client
 	if len(cfg.ValkeyAddrs) > 0 {
 		vc, err = valkey.NewClient(valkey.ClientOption{InitAddress: cfg.ValkeyAddrs, DisableCache: true})
@@ -46,6 +47,7 @@ func main() {
 		}
 		defer vc.Close()
 	}
+	initHeartbeatClient(vc)
 
 	// Before NewRouter, which wires the limiter in effect at that moment
 	// into POST .../enrollment-keys.
@@ -127,4 +129,18 @@ func main() {
 		time.Sleep(50 * time.Millisecond)
 	}
 	log.Info("saasapi: stopped")
+}
+
+// initHeartbeatClient points internal/heartbeat at the same Valkey client
+// the enrollment-key limiter uses, so heartbeat.IsOnline — which fills
+// the `connected` field of GET .../sprouts?asset_ids= (§1.4) — reads the
+// live keys farmer's heartbeat listener writes. It's the saasapi counterpart of
+// cmd/farmer's initHeartbeatClient. SAASAPI_VALKEY_ADDRS must therefore
+// name the Valkey farmer writes heartbeats to. With it unset, vc is nil
+// and heartbeat is left unwired: IsOnline reports false for every sprout,
+// i.e. `connected: false`.
+func initHeartbeatClient(vc valkey.Client) {
+	if vc != nil {
+		heartbeat.SetClient(vc)
+	}
 }

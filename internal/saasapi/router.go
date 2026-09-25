@@ -61,7 +61,7 @@ func SetEnrollmentKeyRateLimit(perSecond float64, burst int, vc valkey.Client) e
 	return nil
 }
 
-// NewRouter builds the SaaS API's HTTP router (design doc §1.1, §1.2).
+// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.4).
 // Every route is wrapped in Auth — see middleware.go for the two-layer
 // shared-secret + Keycloak-JWT check it performs, and SetAuthConfig,
 // which must be called (from main, after NewAuthConfig) before this
@@ -87,6 +87,12 @@ func NewRouter() *http.ServeMux {
 		"CreateEnrollmentKey", enrollmentKeyIssuanceLimiter)
 	route(mux, "GET /v1/tenants/{tenant_id}/enrollment-keys", ListEnrollmentKeys, "ListEnrollmentKeys")
 	route(mux, "DELETE /v1/tenants/{tenant_id}/enrollment-keys/{key_id}", DeleteEnrollmentKey, "DeleteEnrollmentKey")
+
+	// Asset linking (§1.3) and lookup by asset id (§1.4). See
+	// asset_links.go for why POST .../asset-link needs no rate limit.
+	route(mux, "POST /v1/tenants/{tenant_id}/sprouts/{sprout_id}/asset-link", LinkAsset, "LinkAsset")
+	route(mux, "DELETE /v1/tenants/{tenant_id}/sprouts/{sprout_id}/asset-link", UnlinkAsset, "UnlinkAsset")
+	route(mux, "GET /v1/tenants/{tenant_id}/sprouts", ListSproutsByAssetIDs, "ListSproutsByAssetIDs")
 
 	return mux
 }
