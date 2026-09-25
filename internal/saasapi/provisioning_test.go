@@ -264,7 +264,10 @@ func TestConnectBus_FailsClosedOnMissingOrMismatchedCredential(t *testing.T) {
 func TestLoadConfig_SeedIsReadFromFileOnly(t *testing.T) {
 	t.Setenv("SAASAPI_NATS_NKEY_SEED", "SUAIGNOREDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 	t.Setenv("SAASAPI_NATS_NKEY_SEED_FILE", "/run/secrets/saasapi-nats/nkey.seed")
-	cfg := LoadConfig()
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
 	if cfg.NATSNKeySeedFile != "/run/secrets/saasapi-nats/nkey.seed" {
 		t.Fatalf("NATSNKeySeedFile = %q", cfg.NATSNKeySeedFile)
 	}

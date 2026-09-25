@@ -1,12 +1,14 @@
 package saasapi
 
 import (
+	"fmt"
 	"net/http"
 
+	"github.com/valkey-io/valkey-go"
 	"golang.org/x/time/rate"
 )
 
-// enrollmentKeyIssuanceRate/Burst bound how often a single caller (see
+// enrollmentKeyIssuanceRate/Burst bound how often a single tenant (see
 // RateLimit's key choice in middleware.go) may call POST
 // .../enrollment-keys. This is a mutating, credential-issuing endpoint
 // sitting behind Auth, not an unauthenticated guessing target — unlike
@@ -14,16 +16,50 @@ import (
 // verification attempts against a secret at the not-yet-built §3.2/§3.3
 // redemption endpoint, this number only needs to bound ordinary abuse of
 // a leaked or over-eager bearer token (someone scripting key creation in
-// a loop), not defend against brute-forcing a secret. 1 request/second
-// sustained with a burst of 5 comfortably covers a legitimate
-// bulk-onboarding script while still capping a spamming caller at a few
-// hundred enrollment_keys rows/minute instead of an unbounded flood.
+// a loop), not defend against brute-forcing a secret. The budget is
+// shared by every user of a tenant. 1 request/second sustained with a
+// burst of 5 is still ample for that: one key covers up to maxMaxUses
+// machines, so even bulk onboarding needs few keys, and a spamming
+// caller is capped at about 60 enrollment_keys rows/minute per tenant
+// instead of an unbounded flood.
 const (
 	enrollmentKeyIssuanceRate  rate.Limit = 1
 	enrollmentKeyIssuanceBurst int        = 5
 )
 
-var enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
+// enrollmentKeyIssuanceLimiterName namespaces this limiter's Valkey keys.
+const enrollmentKeyIssuanceLimiterName = "enrollment-keys"
+
+// enrollmentKeyIssuanceLimiter starts as a per-pod limiter at the
+// defaults. main replaces it via SetEnrollmentKeyRateLimit with the
+// deployment's configured values (SAASAPI_ENROLLMENT_KEY_RATE_LIMIT/
+// _BURST, see config.go and deploy/saasapi/), backed by Valkey when
+// SAASAPI_VALKEY_ADDRS is set.
+var enrollmentKeyIssuanceLimiter callerLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
+
+// SetEnrollmentKeyRateLimit replaces the per-tenant limiter on POST
+// .../enrollment-keys with one allowing perSecond requests/second
+// sustained and bursts up to burst.
+//
+// With a non-nil vc, the limit is shared across every saasapi pod via
+// Valkey (see NewValkeyLimiter, including how it degrades if Valkey is
+// unreachable). With a nil vc, each pod enforces the limit on its own,
+// so N pods allow a tenant up to N times as much.
+//
+// Like SetDB and SetAuthConfig, call it once at startup: it must run
+// before NewRouter, which wires the limiter in effect at that moment
+// into the route.
+func SetEnrollmentKeyRateLimit(perSecond float64, burst int, vc valkey.Client) error {
+	if err := validateRateLimit(perSecond, burst); err != nil {
+		return fmt.Errorf("saasapi: enrollment-key rate limit: %w", err)
+	}
+	if vc != nil {
+		enrollmentKeyIssuanceLimiter = NewValkeyLimiter(vc, enrollmentKeyIssuanceLimiterName, rate.Limit(perSecond), burst)
+	} else {
+		enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(rate.Limit(perSecond), burst)
+	}
+	return nil
+}
 
 // NewRouter builds the SaaS API's HTTP router (design doc §1.1, §1.2).
 // Every route is wrapped in Auth — see middleware.go for the two-layer
@@ -59,9 +95,10 @@ func route(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string) 
 	mux.Handle(pattern, Logger(Auth(h, name), name))
 }
 
-// routeRateLimited is route plus a per-caller RateLimit gate, applied
-// after Auth so an unauthenticated request (rejected by Auth before it
-// ever reaches RateLimit) doesn't consume rate-limit bookkeeping.
-func routeRateLimited(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string, limiter *perCallerLimiter) {
+// routeRateLimited is route plus a per-tenant RateLimit gate. RateLimit
+// must sit inside Auth: it keys by the organization Auth puts on the
+// request context, and an unauthenticated request (rejected by Auth
+// first) never consumes rate-limit bookkeeping.
+func routeRateLimited(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string, limiter callerLimiter) {
 	mux.Handle(pattern, Logger(Auth(RateLimit(h, limiter), name), name))
 }

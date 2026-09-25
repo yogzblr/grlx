@@ -1,6 +1,7 @@
 package saasapi
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"sync"
@@ -141,13 +142,22 @@ func Auth(inner http.Handler, name string) http.Handler {
 }
 
 // callerBucketTTL bounds how long an idle per-caller bucket is kept
-// around. Without eviction, perCallerLimiter's map would grow without
-// bound under Auth's current stopgap keying (see below) — a caller can
-// trivially get a fresh bucket per request just by varying the
-// Authorization header value, which is also why this limiter is not a
-// real defense yet, only a bound on accidental/lazy abuse (a script or a
-// leaked token hammering the same header value repeatedly).
+// around. RateLimit keys by tenant (see below), so the map is already
+// bounded by the number of tenants actively calling; eviction just
+// keeps it from holding a bucket for every tenant that ever called. A
+// future caller of NewPerCallerLimiter keyed by something the caller
+// controls (e.g. source IP at the /v1/enroll redemption endpoint) relies
+// on this eviction far more.
 const callerBucketTTL = 10 * time.Minute
+
+// callerLimiter decides whether one more request from a caller key is
+// allowed right now. RateLimit takes this rather than a concrete type so
+// a route can use either the per-pod perCallerLimiter or the
+// Valkey-backed valkeyLimiter (ratelimit_valkey.go), which enforces the
+// limit across all pods.
+type callerLimiter interface {
+	allow(ctx context.Context, key string) bool
+}
 
 // callerBucket is one caller's token bucket plus bookkeeping for
 // eviction.
@@ -157,7 +167,9 @@ type callerBucket struct {
 }
 
 // perCallerLimiter is a small, reusable per-caller token-bucket rate
-// limiter. It exists as its own named type (rather than inlined into the
+// limiter, held in this pod's memory: with N pods, a caller spread
+// across them gets up to N times the limit. NewValkeyLimiter builds the
+// shared equivalent, and uses one of these as its fallback. It exists as its own named type (rather than inlined into the
 // RateLimit middleware function) so the future /v1/enroll redemption
 // endpoint (design doc §3.2/§3.3 — the caller-presents-a-key,
 // server-validates-it flow; not implemented anywhere in this codebase
@@ -183,7 +195,7 @@ func NewPerCallerLimiter(r rate.Limit, burst int) *perCallerLimiter {
 }
 
 // allow reports whether a request from key is allowed right now.
-func (l *perCallerLimiter) allow(key string) bool {
+func (l *perCallerLimiter) allow(_ context.Context, key string) bool {
 	return l.allowAt(key, time.Now())
 }
 
@@ -216,22 +228,34 @@ func (l *perCallerLimiter) evictLocked(now time.Time) {
 	}
 }
 
-// RateLimit wraps a handler with a per-caller rate limit (design doc §3's
+// RateLimit wraps a handler with a per-tenant rate limit (design doc §3's
 // security-review concerns, extended here to enrollment-key issuance —
 // see router.go for which routes use this).
 //
-// Keying: this keys buckets by the raw Authorization header value,
-// still a stopgap even now that Auth verifies the bearer JWT for real —
-// RateLimit runs without access to Auth's parsed Organization, and a
-// caller can still get a fresh bucket by presenting a different (but
-// individually valid) token each time. A follow-up should key by the
-// authenticated organization.id instead (available via
-// OrganizationFromContext once Auth has run), which can't be varied by
-// the caller.
-func RateLimit(inner http.Handler, limiter *perCallerLimiter) http.Handler {
+// Keying: buckets are keyed by the authenticated tenant — the verified
+// JWT's organization.id (tenant_id, design doc §1.7/§6), which Auth puts
+// on the request context. RateLimit must therefore run inside Auth (see
+// routeRateLimited). Keying by tenant rather than by token means a
+// caller can't dodge the limit by presenting a different, individually
+// valid token per request; the trade-off is that every user of a tenant
+// shares one bucket.
+//
+// If no organization is on the context, RateLimit fails closed with 403,
+// the same response Auth gives for a missing organization claim. On a
+// {tenant_id} route that can't happen (Auth already rejected the
+// request); it means RateLimit was wired without Auth, or onto a route
+// without {tenant_id} where Auth tolerates a missing claim. Either way,
+// letting the request through with no bucket would silently disable the
+// limit.
+func RateLimit(inner http.Handler, limiter callerLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("Authorization")
-		if !limiter.allow(key) {
+		org, ok := OrganizationFromContext(r.Context())
+		if !ok || org.ID == "" {
+			log.Warnf("saasapi: RateLimit: no authenticated organization on request context; rejecting (is RateLimit wired inside Auth?)")
+			writeError(w, http.StatusForbidden, "forbidden", "forbidden")
+			return
+		}
+		if !limiter.allow(r.Context(), org.ID) {
 			writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests, slow down and retry later")
 			return
 		}
