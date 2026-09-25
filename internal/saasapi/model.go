@@ -92,3 +92,20 @@ type EnrollmentKey struct {
 }
 
 func (EnrollmentKey) TableName() string { return "enrollment_keys" }
+
+// AssetLink is the `saas.asset_links` table (design doc §4.2, §1.3): the
+// only place CloudXP's asset_id enters the system. Both sprout_id and
+// asset_id are globally UNIQUE per §4.2 — one sprout carries at most one
+// asset_id, and one asset_id resolves to at most one sprout, across every
+// tenant. Every query that resolves a caller-supplied sprout_id or
+// asset_id against this table still includes tenant_id in its WHERE
+// clause (§4 "Tenant safety"); see asset_links.go.
+type AssetLink struct {
+	ID       string    `gorm:"column:id;primaryKey;size:32" json:"-"`
+	TenantID string    `gorm:"column:tenant_id;size:32;not null;index" json:"tenant_id"`
+	SproutID string    `gorm:"column:sprout_id;size:253;not null;uniqueIndex" json:"sprout_id"`
+	AssetID  string    `gorm:"column:asset_id;size:191;not null;uniqueIndex" json:"asset_id"`
+	LinkedAt time.Time `gorm:"column:linked_at;not null" json:"linked_at"`
+}
+
+func (AssetLink) TableName() string { return "asset_links" }
