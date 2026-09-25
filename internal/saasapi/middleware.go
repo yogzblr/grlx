@@ -1,6 +1,7 @@
 package saasapi
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"sync"
@@ -149,6 +150,15 @@ func Auth(inner http.Handler, name string) http.Handler {
 // on this eviction far more.
 const callerBucketTTL = 10 * time.Minute
 
+// callerLimiter decides whether one more request from a caller key is
+// allowed right now. RateLimit takes this rather than a concrete type so
+// a route can use either the per-pod perCallerLimiter or the
+// Valkey-backed valkeyLimiter (ratelimit_valkey.go), which enforces the
+// limit across all pods.
+type callerLimiter interface {
+	allow(ctx context.Context, key string) bool
+}
+
 // callerBucket is one caller's token bucket plus bookkeeping for
 // eviction.
 type callerBucket struct {
@@ -157,7 +167,9 @@ type callerBucket struct {
 }
 
 // perCallerLimiter is a small, reusable per-caller token-bucket rate
-// limiter. It exists as its own named type (rather than inlined into the
+// limiter, held in this pod's memory: with N pods, a caller spread
+// across them gets up to N times the limit. NewValkeyLimiter builds the
+// shared equivalent, and uses one of these as its fallback. It exists as its own named type (rather than inlined into the
 // RateLimit middleware function) so the future /v1/enroll redemption
 // endpoint (design doc §3.2/§3.3 — the caller-presents-a-key,
 // server-validates-it flow; not implemented anywhere in this codebase
@@ -183,7 +195,7 @@ func NewPerCallerLimiter(r rate.Limit, burst int) *perCallerLimiter {
 }
 
 // allow reports whether a request from key is allowed right now.
-func (l *perCallerLimiter) allow(key string) bool {
+func (l *perCallerLimiter) allow(_ context.Context, key string) bool {
 	return l.allowAt(key, time.Now())
 }
 
@@ -235,7 +247,7 @@ func (l *perCallerLimiter) evictLocked(now time.Time) {
 // without {tenant_id} where Auth tolerates a missing claim. Either way,
 // letting the request through with no bucket would silently disable the
 // limit.
-func RateLimit(inner http.Handler, limiter *perCallerLimiter) http.Handler {
+func RateLimit(inner http.Handler, limiter callerLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		org, ok := OrganizationFromContext(r.Context())
 		if !ok || org.ID == "" {
@@ -243,7 +255,7 @@ func RateLimit(inner http.Handler, limiter *perCallerLimiter) http.Handler {
 			writeError(w, http.StatusForbidden, "forbidden", "forbidden")
 			return
 		}
-		if !limiter.allow(org.ID) {
+		if !limiter.allow(r.Context(), org.ID) {
 			writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests, slow down and retry later")
 			return
 		}

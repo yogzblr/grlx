@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/valkey-io/valkey-go"
 	"golang.org/x/time/rate"
 )
 
@@ -26,24 +27,37 @@ const (
 	enrollmentKeyIssuanceBurst int        = 5
 )
 
-// These are the defaults; a deployment overrides them with
-// SAASAPI_ENROLLMENT_KEY_RATE_LIMIT/_BURST (see config.go, and
-// deploy/saasapi/ for the Helm wiring), which main applies via
-// SetEnrollmentKeyRateLimit. The buckets are in-memory, so every figure
-// here is per pod: N replicas allow a tenant up to N times as much.
-var enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
+// enrollmentKeyIssuanceLimiterName namespaces this limiter's Valkey keys.
+const enrollmentKeyIssuanceLimiterName = "enrollment-keys"
+
+// enrollmentKeyIssuanceLimiter starts as a per-pod limiter at the
+// defaults. main replaces it via SetEnrollmentKeyRateLimit with the
+// deployment's configured values (SAASAPI_ENROLLMENT_KEY_RATE_LIMIT/
+// _BURST, see config.go and deploy/saasapi/), backed by Valkey when
+// SAASAPI_VALKEY_ADDRS is set.
+var enrollmentKeyIssuanceLimiter callerLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
 
 // SetEnrollmentKeyRateLimit replaces the per-tenant limiter on POST
 // .../enrollment-keys with one allowing perSecond requests/second
-// sustained and bursts up to burst. Like SetDB and SetAuthConfig, call it
-// once at startup: it must run before NewRouter, which wires the limiter
-// in effect at that moment into the route. It replaces any existing
-// per-tenant bucket state.
-func SetEnrollmentKeyRateLimit(perSecond float64, burst int) error {
+// sustained and bursts up to burst.
+//
+// With a non-nil vc, the limit is shared across every saasapi pod via
+// Valkey (see NewValkeyLimiter, including how it degrades if Valkey is
+// unreachable). With a nil vc, each pod enforces the limit on its own,
+// so N pods allow a tenant up to N times as much.
+//
+// Like SetDB and SetAuthConfig, call it once at startup: it must run
+// before NewRouter, which wires the limiter in effect at that moment
+// into the route.
+func SetEnrollmentKeyRateLimit(perSecond float64, burst int, vc valkey.Client) error {
 	if err := validateRateLimit(perSecond, burst); err != nil {
 		return fmt.Errorf("saasapi: enrollment-key rate limit: %w", err)
 	}
-	enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(rate.Limit(perSecond), burst)
+	if vc != nil {
+		enrollmentKeyIssuanceLimiter = NewValkeyLimiter(vc, enrollmentKeyIssuanceLimiterName, rate.Limit(perSecond), burst)
+	} else {
+		enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(rate.Limit(perSecond), burst)
+	}
 	return nil
 }
 
@@ -85,6 +99,6 @@ func route(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string) 
 // must sit inside Auth: it keys by the organization Auth puts on the
 // request context, and an unauthenticated request (rejected by Auth
 // first) never consumes rate-limit bookkeeping.
-func routeRateLimited(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string, limiter *perCallerLimiter) {
+func routeRateLimited(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string, limiter callerLimiter) {
 	mux.Handle(pattern, Logger(Auth(RateLimit(h, limiter), name), name))
 }

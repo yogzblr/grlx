@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/valkey-io/valkey-go"
+
 	log "github.com/gogrlx/grlx/v2/internal/log"
 	"github.com/gogrlx/grlx/v2/internal/saasapi"
 )
@@ -30,13 +32,32 @@ func main() {
 	}
 	saasapi.SetDB(db)
 
+	// Fail closed on Valkey when it's configured: a pod that silently
+	// fell back to per-pod limiting for its whole life would quietly
+	// multiply the limit by the replica count. Once running, a Valkey
+	// error on an individual request falls back to this pod's own limit
+	// instead (see saasapi.NewValkeyLimiter). Client-side caching is off:
+	// the limiter never reads a cacheable value.
+	var vc valkey.Client
+	if len(cfg.ValkeyAddrs) > 0 {
+		vc, err = valkey.NewClient(valkey.ClientOption{InitAddress: cfg.ValkeyAddrs, DisableCache: true})
+		if err != nil {
+			log.Fatalf("saasapi: failed to connect to Valkey at %v: %v", cfg.ValkeyAddrs, err)
+		}
+		defer vc.Close()
+	}
+
 	// Before NewRouter, which wires the limiter in effect at that moment
 	// into POST .../enrollment-keys.
-	if err := saasapi.SetEnrollmentKeyRateLimit(cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst); err != nil {
+	if err := saasapi.SetEnrollmentKeyRateLimit(cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst, vc); err != nil {
 		log.Fatalf("saasapi: %v", err)
 	}
-	log.Infof("saasapi: enrollment-key issuance limited to %g req/s per tenant per pod, burst %d",
-		cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst)
+	scope := "per pod (SAASAPI_VALKEY_ADDRS unset)"
+	if vc != nil {
+		scope = "across all pods via Valkey"
+	}
+	log.Infof("saasapi: enrollment-key issuance limited to %g req/s per tenant, burst %d, %s",
+		cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst, scope)
 
 	// A background context: the JWKS cache's auto-refresh goroutine
 	// (see NewAuthConfig) should live for the whole process, not just

@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -65,6 +66,13 @@ import (
 // An unparseable or out-of-range value is a startup error, not a silent
 // fallback to the default: a typo in a Helm value shouldn't quietly
 // leave the limit somewhere the operator didn't intend.
+//
+//   - SAASAPI_VALKEY_ADDRS: comma-separated Valkey node addresses (the
+//     same format as farmer's GRLX_VALKEY_ADDRS). When set, the limit
+//     above is enforced across all saasapi pods (see NewValkeyLimiter)
+//     and saasapi refuses to start if it can't reach Valkey. When unset,
+//     each pod enforces it on its own, so N pods allow up to N times as
+//     much.
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to, e.g. ":8081".
 	ListenAddr string
@@ -110,6 +118,10 @@ type Config struct {
 	// EnrollmentKeyRateBurst is the per-tenant burst size for POST
 	// .../enrollment-keys.
 	EnrollmentKeyRateBurst int
+
+	// ValkeyAddrs are the Valkey nodes holding the shared rate-limit
+	// state. Empty means per-pod limiting only.
+	ValkeyAddrs []string
 }
 
 // LoadConfig reads the saasapi service's configuration from environment
@@ -138,6 +150,8 @@ func LoadConfig() (Config, error) {
 
 		EnrollmentKeyRateLimit: float64(enrollmentKeyIssuanceRate),
 		EnrollmentKeyRateBurst: enrollmentKeyIssuanceBurst,
+
+		ValkeyAddrs: splitAddrs(os.Getenv("SAASAPI_VALKEY_ADDRS")),
 	}
 
 	if v := os.Getenv("SAASAPI_ENROLLMENT_KEY_RATE_LIMIT"); v != "" {
@@ -172,6 +186,18 @@ func validateRateLimit(perSecond float64, burst int) error {
 		return fmt.Errorf("burst must be >= 1, got %d", burst)
 	}
 	return nil
+}
+
+// splitAddrs splits a comma-separated address list, dropping blanks and
+// surrounding whitespace, so "" and " , " both mean no addresses.
+func splitAddrs(v string) []string {
+	var addrs []string
+	for _, a := range strings.Split(v, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			addrs = append(addrs, a)
+		}
+	}
+	return addrs
 }
 
 func envOrDefault(key, def string) string {

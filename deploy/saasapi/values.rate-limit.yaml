@@ -6,12 +6,22 @@
 #
 # These are the compiled-in defaults (internal/saasapi/router.go). Setting
 # a value to null (or leaving the block out) emits no env var, which also
-# gives the default. See README.md before changing them: the limit is per
-# pod, not cluster-wide.
+# gives the default. See README.md: the limit is shared across pods only
+# when valkey.addrs is set.
+valkey:
+  # Valkey nodes (host:port) holding the shared rate-limit state. Set this
+  # in any deployment with more than one replica. Empty: each pod enforces
+  # the limit on its own. Set but unreachable: saasapi won't start.
+  addrs: []
+  # e.g.
+  # addrs:
+  #   - valkey-0.valkey:6379
+  #   - valkey-1.valkey:6379
+
 enrollmentKeys:
   rateLimit:
-    # Sustained POST .../enrollment-keys requests per second, per tenant,
-    # per pod. A decimal > 0: 0.5 means one every two seconds.
+    # Sustained POST .../enrollment-keys requests per second, per tenant.
+    # A decimal > 0: 0.5 means one every two seconds.
     perSecond: 1
     # Requests a tenant may make back to back before perSecond applies.
     # An integer >= 1.

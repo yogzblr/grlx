@@ -80,7 +80,7 @@ func TestSetEnrollmentKeyRateLimitRejectsInvalid(t *testing.T) {
 		perSecond float64
 		burst     int
 	}{{0, 5}, {-1, 5}, {1, 0}} {
-		if err := SetEnrollmentKeyRateLimit(c.perSecond, c.burst); err == nil {
+		if err := SetEnrollmentKeyRateLimit(c.perSecond, c.burst, nil); err == nil {
 			t.Fatalf("SetEnrollmentKeyRateLimit(%v, %d): expected an error", c.perSecond, c.burst)
 		}
 		if enrollmentKeyIssuanceLimiter != saved {
@@ -100,7 +100,7 @@ func TestSetEnrollmentKeyRateLimitAppliesToRouter(t *testing.T) {
 	t.Cleanup(func() { enrollmentKeyIssuanceLimiter = saved })
 
 	const burst = enrollmentKeyIssuanceBurst + 3
-	if err := SetEnrollmentKeyRateLimit(0.001, burst); err != nil {
+	if err := SetEnrollmentKeyRateLimit(0.001, burst, nil); err != nil {
 		t.Fatalf("SetEnrollmentKeyRateLimit: %v", err)
 	}
 	mux := NewRouter()
