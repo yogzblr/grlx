@@ -142,11 +142,12 @@ func Auth(inner http.Handler, name string) http.Handler {
 
 // callerBucketTTL bounds how long an idle per-caller bucket is kept
 // around. Without eviction, perCallerLimiter's map would grow without
-// bound under Auth's current stopgap keying (see below) — a caller can
-// trivially get a fresh bucket per request just by varying the
-// Authorization header value, which is also why this limiter is not a
-// real defense yet, only a bound on accidental/lazy abuse (a script or a
-// leaked token hammering the same header value repeatedly).
+// bound under RateLimit's current stopgap keying (see below): every
+// distinct Authorization value gets its own bucket, so a caller holding
+// many valid tokens can both dodge the limit and grow this map. That's
+// why this limiter is only a bound on accidental/lazy abuse (a script or
+// a leaked token hammering the same header value repeatedly), not a hard
+// per-tenant cap yet.
 const callerBucketTTL = 10 * time.Minute
 
 // callerBucket is one caller's token bucket plus bookkeeping for
@@ -220,14 +221,16 @@ func (l *perCallerLimiter) evictLocked(now time.Time) {
 // security-review concerns, extended here to enrollment-key issuance —
 // see router.go for which routes use this).
 //
-// Keying: this keys buckets by the raw Authorization header value,
-// still a stopgap even now that Auth verifies the bearer JWT for real —
-// RateLimit runs without access to Auth's parsed Organization, and a
-// caller can still get a fresh bucket by presenting a different (but
-// individually valid) token each time. A follow-up should key by the
-// authenticated organization.id instead (available via
-// OrganizationFromContext once Auth has run), which can't be varied by
-// the caller.
+// Keying: this keys buckets by the raw Authorization header value. That
+// is a stopgap: a caller holding several individually valid tokens (or
+// able to re-mint one) gets a fresh bucket per token. A follow-up should
+// key by the authenticated organization.id (tenant_id, design doc
+// §1.7/§6) instead, which the caller can't vary. That value is already
+// reachable here: routeRateLimited nests RateLimit inside Auth, so
+// OrganizationFromContext(r.Context()) is populated by the time this
+// runs. The switch is left for the security review to decide, since it
+// changes the limit from per-token to per-tenant (every user of a tenant
+// would share one bucket).
 func RateLimit(inner http.Handler, limiter *perCallerLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("Authorization")

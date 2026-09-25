@@ -2,6 +2,17 @@
 // secrets (design doc §3.1). FLAG FOR SECURITY REVIEW per the task brief —
 // review the randomness source, encoding, and the fact that the raw
 // secret is never persisted, only its SHA-256 hash.
+//
+// Logging safety: this file deliberately has no logging of any kind — it
+// does not import internal/log (or any other logger), never writes to
+// stdout/stderr, and its only fmt use is fmt.Errorf wrapping the
+// underlying crypto/rand error, never the secret, its bytes, or its hash.
+// Verified by read-through for the enrollment-key logging-safety review
+// and pinned by TestIdgenHasNoLoggingOrSecretBearingErrors in
+// idgen_test.go, which parses this file and fails if that ever changes.
+// Don't add a "debug" log line here: every value this file produces is
+// either a secret or derived from one, and errors should be logged (if at
+// all) by the caller, which only ever sees the wrapped rand error.
 package saasapi
 
 import (
