@@ -6,6 +6,8 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 	"golang.org/x/time/rate"
+
+	log "github.com/gogrlx/grlx/v2/internal/log"
 )
 
 // enrollmentKeyIssuanceRate/Burst bound how often a single tenant (see
@@ -77,8 +79,21 @@ const (
 
 var sproutActionLimiter callerLimiter = NewPerCallerLimiter(sproutActionRate, sproutActionBurst)
 
-// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.5, and
-// §1.8's catalog and update-policy routes).
+// fleetUpdateRate/Burst bound how often a single tenant may call POST
+// .../sprouts/updates (§1.8), when it's enabled. A rollout covers up to
+// maxAssetIDsPerLookup machines and runs for a long time, so one every ten
+// seconds sustained, bursts of 2, is ample and tighter than §1.5's
+// limit. Per pod only, like sproutActionLimiter.
+const (
+	fleetUpdateRate  rate.Limit = 0.1
+	fleetUpdateBurst int        = 2
+)
+
+var fleetUpdateLimiter callerLimiter = NewPerCallerLimiter(fleetUpdateRate, fleetUpdateBurst)
+
+// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.5 and
+// §1.8, the last one's dispatch routes only with the feature flag on; see
+// SetFleetUpdateDispatchEnabled).
 // Every route is wrapped in Auth — see middleware.go for the two-layer
 // shared-secret + Keycloak-JWT check it performs, and SetAuthConfig,
 // which must be called (from main, after NewAuthConfig) before this
@@ -118,15 +133,23 @@ func NewRouter() *http.ServeMux {
 		"CreateSproutActionBatch", sproutActionLimiter)
 	route(mux, "GET /v1/tenants/{tenant_id}/sprouts/actions/{batch_id}", GetSproutActionBatch, "GetSproutActionBatch")
 
-	// Fleet updates (§1.8), catalog and policy only — see
-	// fleet_updates.go. POST .../sprouts/updates and its status endpoint
-	// aren't registered: they depend on a working signed sprout
-	// self-update path. PATCH .../update-policy
-	// only rewrites the tenant's single policy row, so it can't grow
-	// state and needs no rate limit.
+	// Fleet updates (§1.8): catalog and policy (fleet_updates.go). PATCH
+	// .../update-policy only rewrites the tenant's single policy row, so
+	// it can't grow state and needs no rate limit.
 	route(mux, "GET /v1/versions", ListFleetVersions, "ListFleetVersions")
 	route(mux, "GET /v1/tenants/{tenant_id}/update-policy", GetUpdatePolicy, "GetUpdatePolicy")
 	route(mux, "PATCH /v1/tenants/{tenant_id}/update-policy", PatchUpdatePolicy, "PatchUpdatePolicy")
+
+	// Fleet update dispatch (§1.8, fleet_update_dispatch.go) is only
+	// registered with the feature flag on, which it is not by default:
+	// sprout has no working signed self-update path yet (gogrlx/grlx#286).
+	// With the flag off, neither route exists.
+	if fleetUpdateDispatchEnabled {
+		log.Warnf("saasapi: fleet update dispatch is ENABLED, but sprout self-update is still disabled upstream (gogrlx/grlx#286)")
+		routeRateLimited(mux, "POST /v1/tenants/{tenant_id}/sprouts/updates", CreateFleetUpdateBatch,
+			"CreateFleetUpdateBatch", fleetUpdateLimiter)
+		route(mux, "GET /v1/tenants/{tenant_id}/sprouts/updates/{batch_id}", GetFleetUpdateBatch, "GetFleetUpdateBatch")
+	}
 
 	return mux
 }

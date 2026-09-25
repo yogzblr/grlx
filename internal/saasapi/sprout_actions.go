@@ -139,6 +139,13 @@ var actionErrorMessages = map[string]string{
 	errCodeCommandFailed:          "the command exited with a non-zero status",
 	errCodeJobFailed:              "the job finished unsuccessfully",
 	errCodeDispatchOutcomeUnknown: "no reply was received for the action; it may or may not have run",
+
+	// Fleet update rollouts (fleet_update_dispatch.go).
+	errCodeRolloutHalted:           "an earlier wave of this rollout did not fully succeed, so the update was not sent to this sprout",
+	errCodeRolloutWindowClosed:     "the tenant's rollout window closed before the update was sent to this sprout",
+	errCodeApprovalWithdrawn:       "the tenant's approved version changed before the update was sent to this sprout",
+	errCodeUpdateInProgress:        "the sprout already has an update in progress, so this update was not sent",
+	errCodeUnresponsiveAfterUpdate: "the sprout did not report the update's outcome in time; it may be unreachable, or may have restored its previous version",
 }
 
 func actionErrorMessage(code string) string {
@@ -220,11 +227,14 @@ type createActionBatchResponse struct {
 	BatchID string `json:"batch_id"`
 }
 
+// actionBatchResponse is the GET response for both §1.5 batches and §1.8
+// update batches. Rollout is set only for an update batch.
 type actionBatchResponse struct {
 	BatchID    string               `json:"batch_id"`
 	Status     string               `json:"status"`
 	ActionType string               `json:"action_type"`
 	CreatedAt  time.Time            `json:"created_at"`
+	Rollout    *rolloutResponse     `json:"rollout,omitempty"`
 	Items      []actionItemResponse `json:"items"`
 }
 
@@ -299,7 +309,17 @@ func CreateSproutActionBatch(w http.ResponseWriter, r *http.Request) {
 // items (a cook with a known jid) are refreshed through the installed
 // JobStatusReader (see refreshRunningItems). The batch is in_progress
 // while any item is queued, dispatching or running, completed otherwise.
+//
+// A §1.8 update batch is found here too, since it's stored in the same
+// tables. GET .../sprouts/updates/{batch_id} finds only update batches.
 func GetSproutActionBatch(w http.ResponseWriter, r *http.Request) {
+	writeBatchStatus(w, r, "")
+}
+
+// writeBatchStatus serves both batch-status GETs. A non-empty actionType
+// limits the lookup to batches of that type; any other batch gives the
+// same 404 as one that doesn't exist.
+func writeBatchStatus(w http.ResponseWriter, r *http.Request, actionType string) {
 	tenantID := r.PathValue("tenant_id")
 	batchID := r.PathValue("batch_id")
 	if !tenantExists(w, tenantID) {
@@ -311,7 +331,11 @@ func GetSproutActionBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var batch AssetActionBatch
-	err := db.Where("id = ? AND tenant_id = ?", batchID, tenantID).First(&batch).Error
+	q := db.Where("id = ? AND tenant_id = ?", batchID, tenantID)
+	if actionType != "" {
+		q = q.Where("action_type = ?", actionType)
+	}
+	err := q.First(&batch).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		writeError(w, http.StatusNotFound, "batch_not_found", "no such action batch")
 		return
@@ -333,6 +357,7 @@ func GetSproutActionBatch(w http.ResponseWriter, r *http.Request) {
 		Status:     actionBatchCompleted,
 		ActionType: batch.ActionType,
 		CreatedAt:  batch.CreatedAt,
+		Rollout:    rolloutOf(batch),
 		Items:      make([]actionItemResponse, 0, len(items)),
 	}
 	for _, it := range items {
@@ -413,8 +438,9 @@ func parseActionAssetIDs(w http.ResponseWriter, raw []string) ([]string, bool) {
 
 // translateAction validates the caller's action and maps it onto the
 // controlplane.SproutAction farmer takes. Only cmd.run and cook are
-// accepted: self_update is §1.8's, and stays unexposed until sprout has a
-// working signed update path (design doc §6).
+// accepted. self_update is only sent by §1.8's POST .../sprouts/updates
+// (fleet_update_dispatch.go), which builds its params from the version
+// catalog and is behind a feature flag. It's never accepted here.
 func translateAction(w http.ResponseWriter, in sproutActionInput) (controlplane.SproutAction, bool) {
 	invalid := func(msg string) (controlplane.SproutAction, bool) {
 		writeError(w, http.StatusBadRequest, "invalid_request", msg)
@@ -532,9 +558,21 @@ func translateCook(p cookInput) (farmerCook, string) {
 	return farmerCook{Recipe: recipe, Test: p.Test}, ""
 }
 
-// createActionBatch writes the batch and its items in one transaction and
-// returns the items that need dispatching.
+// createActionBatch writes a §1.5 batch and its items in one transaction
+// and returns the items that need dispatching.
 func createActionBatch(tenantID string, assetIDs []string, action controlplane.SproutAction, resolved []sproutByAssetItem) (AssetActionBatch, []AssetActionItem, error) {
+	return createBatch(AssetActionBatch{
+		TenantID:     tenantID,
+		ActionType:   action.Type,
+		ActionParams: string(action.Params),
+	}, assetIDs, resolved, nil)
+}
+
+// createBatch writes batch (its ID and RequestedAssetIDs are filled in
+// here) and one item per asset_id in one transaction, and returns the
+// queued items in request order. blocked maps a resolved, accepted
+// sprout_id to the error code its item fails with instead of being queued.
+func createBatch(batch AssetActionBatch, assetIDs []string, resolved []sproutByAssetItem, blocked map[string]string) (AssetActionBatch, []AssetActionItem, error) {
 	id, err := newID(actionBatchIDPrefix)
 	if err != nil {
 		return AssetActionBatch{}, nil, err
@@ -543,13 +581,9 @@ func createActionBatch(tenantID string, assetIDs []string, action controlplane.S
 	if err != nil {
 		return AssetActionBatch{}, nil, err
 	}
-	batch := AssetActionBatch{
-		ID:                id,
-		TenantID:          tenantID,
-		ActionType:        action.Type,
-		ActionParams:      string(action.Params),
-		RequestedAssetIDs: string(requested),
-	}
+	batch.ID = id
+	batch.RequestedAssetIDs = string(requested)
+	tenantID := batch.TenantID
 
 	byAsset := make(map[string]sproutByAssetItem, len(resolved))
 	for _, row := range resolved {
@@ -567,6 +601,10 @@ func createActionBatch(tenantID string, assetIDs []string, action controlplane.S
 			item.SproutID = row.SproutID
 			item.Status = ActionItemFailed
 			item.ErrorCode = errCodeSproutNotAccepted
+		case blocked[row.SproutID] != "":
+			item.SproutID = row.SproutID
+			item.Status = ActionItemFailed
+			item.ErrorCode = blocked[row.SproutID]
 		default:
 			item.SproutID = row.SproutID
 			item.Status = ActionItemQueued
@@ -732,6 +770,15 @@ func dispatchItem(d *gorm.DB, nc *nats.Conn, batch AssetActionBatch, item AssetA
 	}
 }
 
+// jobTracked reports whether actionType is answered with a jid and then
+// followed through farmer.job_status: cook, and self_update. Farmer has no
+// self_update handler yet. The contract assumed here, the same as cook's,
+// is that it replies dispatched with the jid of a job whose outcome is
+// the update's.
+func jobTracked(actionType string) bool {
+	return actionType == controlplane.ActionCook || actionType == controlplane.ActionSelfUpdate
+}
+
 func failedUpdate(code string) map[string]any {
 	return map[string]any{"status": ActionItemFailed, "error_code": code}
 }
@@ -761,7 +808,7 @@ func replyUpdate(batch AssetActionBatch, item AssetActionItem, data []byte) map[
 			return map[string]any{"status": ActionItemSucceeded, "exit_code": exit}
 		}
 		return map[string]any{"status": ActionItemFailed, "error_code": errCodeCommandFailed, "exit_code": exit}
-	case reply.Status == controlplane.StatusDispatched && batch.ActionType == controlplane.ActionCook && controlplane.ValidJobID(reply.JID):
+	case reply.Status == controlplane.StatusDispatched && jobTracked(batch.ActionType) && controlplane.ValidJobID(reply.JID):
 		return map[string]any{"status": ActionItemRunning, "jid": reply.JID}
 	default:
 		log.Errorf("saasapi: unexpected %s reply for batch %s asset %s (%s): status %q, jid %q, result set %t",
@@ -812,7 +859,12 @@ func SetJobStatusReader(r JobStatusReader) { jobStatusReader = r }
 // the same outcome is a no-op). A reader error leaves every item as
 // stored — polling degrades to stale, never to a failed request.
 func refreshRunningItems(ctx context.Context, tenantID string, items []AssetActionItem) {
-	reader := jobStatusReader
+	refreshItems(ctx, db, jobStatusReader, tenantID, items)
+}
+
+// refreshItems is refreshRunningItems with the database and reader passed
+// in, for callers (the fleet update rollout) that captured them earlier.
+func refreshItems(ctx context.Context, d *gorm.DB, reader JobStatusReader, tenantID string, items []AssetActionItem) {
 	if reader == nil {
 		return
 	}
@@ -846,7 +898,7 @@ func refreshRunningItems(ctx context.Context, tenantID string, items []AssetActi
 		default:
 			continue
 		}
-		if _, err := updateItem(db, *it, ActionItemRunning, update); err != nil {
+		if _, err := updateItem(d, *it, ActionItemRunning, update); err != nil {
 			log.Errorf("saasapi: recording job %s outcome for batch %s asset %s: %v", it.JID, it.BatchID, it.AssetID, err)
 			continue
 		}
