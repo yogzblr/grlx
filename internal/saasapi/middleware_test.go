@@ -2,6 +2,7 @@ package saasapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,24 +74,31 @@ func TestPerCallerLimiterEvictsIdleBuckets(t *testing.T) {
 	}
 }
 
-func TestRateLimitMiddlewareReturns429(t *testing.T) {
-	limiter := NewPerCallerLimiter(rate.Limit(1), 1)
-	h := RateLimit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}), limiter)
+// newTenantRequest builds a request as RateLimit sees it inside Auth:
+// with the verified organization already on the context.
+func newTenantRequest(tenantID, authorization string) *http.Request {
+	r := httptest.NewRequest("POST", "/v1/tenants/"+tenantID+"/enrollment-keys", nil)
+	r.Header.Set("Authorization", authorization)
+	return r.WithContext(withOrganization(r.Context(), Organization{ID: tenantID}))
+}
 
-	r1 := httptest.NewRequest("POST", "/v1/tenants/t_x/enrollment-keys", nil)
-	r1.Header.Set("Authorization", "Bearer same-token")
+func okHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+func TestRateLimitMiddlewareReturns429(t *testing.T) {
+	h := RateLimit(okHandler(), NewPerCallerLimiter(rate.Limit(1), 1))
+
 	w1 := httptest.NewRecorder()
-	h.ServeHTTP(w1, r1)
+	h.ServeHTTP(w1, newTenantRequest("t_x", "Bearer same-token"))
 	if w1.Code != http.StatusOK {
 		t.Fatalf("first request status = %d, want 200", w1.Code)
 	}
 
-	r2 := httptest.NewRequest("POST", "/v1/tenants/t_x/enrollment-keys", nil)
-	r2.Header.Set("Authorization", "Bearer same-token")
 	w2 := httptest.NewRecorder()
-	h.ServeHTTP(w2, r2)
+	h.ServeHTTP(w2, newTenantRequest("t_x", "Bearer same-token"))
 	if w2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second request status = %d, want 429, body=%s", w2.Code, w2.Body.String())
 	}
@@ -104,23 +112,52 @@ func TestRateLimitMiddlewareReturns429(t *testing.T) {
 	}
 }
 
-func TestRateLimitMiddlewareKeysByAuthorizationHeader(t *testing.T) {
-	limiter := NewPerCallerLimiter(rate.Limit(1), 1)
-	h := RateLimit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}), limiter)
+// TestRateLimitMiddlewareKeysByTenantNotToken pins the per-tenant key:
+// a different Authorization value for the same tenant shares the
+// tenant's bucket (varying the token no longer dodges the limit), while
+// a different tenant gets a bucket of its own.
+func TestRateLimitMiddlewareKeysByTenantNotToken(t *testing.T) {
+	h := RateLimit(okHandler(), NewPerCallerLimiter(rate.Limit(1), 1))
 
-	// Two distinct Authorization values get independent buckets — this
-	// pins the documented stopgap behavior (and its known weakness: a
-	// caller can dodge the limit just by varying the header).
-	for _, token := range []string{"Bearer token-a", "Bearer token-b"} {
-		r := httptest.NewRequest("POST", "/v1/tenants/t_x/enrollment-keys", nil)
-		r.Header.Set("Authorization", token)
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		if w.Code != http.StatusOK {
-			t.Fatalf("token %q: status = %d, want 200", token, w.Code)
-		}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, newTenantRequest("t_a", "Bearer token-1"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("t_a first request: status = %d, want 200", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, newTenantRequest("t_a", "Bearer token-2"))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("t_a with a different token: status = %d, want 429 (same tenant, same bucket)", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, newTenantRequest("t_b", "Bearer token-1"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("t_b: status = %d, want 200 (different tenant, own bucket)", w.Code)
+	}
+}
+
+// TestRateLimitMiddlewareFailsClosedWithoutOrganization covers RateLimit
+// wired without Auth in front of it: no organization on the context
+// must be rejected, not let through with the limit silently disabled.
+func TestRateLimitMiddlewareFailsClosedWithoutOrganization(t *testing.T) {
+	called := false
+	h := RateLimit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}), NewPerCallerLimiter(rate.Limit(1), 1))
+
+	r := httptest.NewRequest("POST", "/v1/tenants/t_x/enrollment-keys", nil)
+	r.Header.Set("Authorization", "Bearer some-token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403, body=%s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatalf("inner handler must not run when no organization is on the context")
 	}
 }
 
@@ -134,18 +171,29 @@ func TestRouterRateLimitsEnrollmentKeyIssuance(t *testing.T) {
 
 	mux := NewRouter()
 	body := `{"expires_in_hours":24,"max_uses":50}`
-	// RateLimit keys by the raw Authorization header value (see
-	// middleware.go), so every iteration must reuse the same signed
-	// token, not mint a fresh one each time.
-	bearer := "Bearer " + auth.mintTokenForTenant(tenantID)
 
+	// Every request presents a different, individually valid token for
+	// the same tenant (a distinct organization.name makes each one unique;
+	// Ed25519 signing is deterministic, so identical claims minted within
+	// the same second would otherwise yield identical tokens). The limit
+	// must still trip, because RateLimit keys by the tenant, not the token.
+	seen := map[string]bool{}
 	var last *httptest.ResponseRecorder
 	for i := 0; i < enrollmentKeyIssuanceBurst+1; i++ {
+		tok := auth.mintToken(tokenOpts{org: &Organization{ID: tenantID, Name: fmt.Sprintf("user-%d", i)}})
+		if seen[tok] {
+			t.Fatalf("request %d reused a token; this test needs a distinct token per request", i)
+		}
+		seen[tok] = true
+
 		r := httptest.NewRequest("POST", "/v1/tenants/"+tenantID+"/enrollment-keys", strings.NewReader(body))
 		r.Header.Set(InternalAuthHeader, testInternalAuthSecretCurrent)
-		r.Header.Set("Authorization", bearer)
+		r.Header.Set("Authorization", "Bearer "+tok)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
+		if i < enrollmentKeyIssuanceBurst && w.Code != http.StatusOK {
+			t.Fatalf("request %d within burst: status = %d, want 200, body=%s", i, w.Code, w.Body.String())
+		}
 		last = w
 	}
 	if last.Code != http.StatusTooManyRequests {

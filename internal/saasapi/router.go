@@ -6,7 +6,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// enrollmentKeyIssuanceRate/Burst bound how often a single caller (see
+// enrollmentKeyIssuanceRate/Burst bound how often a single tenant (see
 // RateLimit's key choice in middleware.go) may call POST
 // .../enrollment-keys. This is a mutating, credential-issuing endpoint
 // sitting behind Auth, not an unauthenticated guessing target — unlike
@@ -14,10 +14,12 @@ import (
 // verification attempts against a secret at the not-yet-built §3.2/§3.3
 // redemption endpoint, this number only needs to bound ordinary abuse of
 // a leaked or over-eager bearer token (someone scripting key creation in
-// a loop), not defend against brute-forcing a secret. 1 request/second
-// sustained with a burst of 5 comfortably covers a legitimate
-// bulk-onboarding script while still capping a spamming caller at a few
-// hundred enrollment_keys rows/minute instead of an unbounded flood.
+// a loop), not defend against brute-forcing a secret. The budget is
+// shared by every user of a tenant. 1 request/second sustained with a
+// burst of 5 is still ample for that: one key covers up to maxMaxUses
+// machines, so even bulk onboarding needs few keys, and a spamming
+// caller is capped at about 60 enrollment_keys rows/minute per tenant
+// instead of an unbounded flood.
 const (
 	enrollmentKeyIssuanceRate  rate.Limit = 1
 	enrollmentKeyIssuanceBurst int        = 5
@@ -59,9 +61,10 @@ func route(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string) 
 	mux.Handle(pattern, Logger(Auth(h, name), name))
 }
 
-// routeRateLimited is route plus a per-caller RateLimit gate, applied
-// after Auth so an unauthenticated request (rejected by Auth before it
-// ever reaches RateLimit) doesn't consume rate-limit bookkeeping.
+// routeRateLimited is route plus a per-tenant RateLimit gate. RateLimit
+// must sit inside Auth: it keys by the organization Auth puts on the
+// request context, and an unauthenticated request (rejected by Auth
+// first) never consumes rate-limit bookkeeping.
 func routeRateLimited(mux *http.ServeMux, pattern string, h http.HandlerFunc, name string, limiter *perCallerLimiter) {
 	mux.Handle(pattern, Logger(Auth(RateLimit(h, limiter), name), name))
 }
