@@ -83,19 +83,18 @@ type sproutsByAssetResponse struct {
 //
 // The sprout must belong to the caller's tenant in farmer.pki_nkeys (in
 // any key state); a sprout that doesn't exist and one that belongs to
-// another tenant are both 404 sprout_not_found (§4 "Tenant safety"). Without this check a
-// tenant could create a link row pointing at another tenant's sprout_id,
-// squatting on it (sprout_id is globally UNIQUE, §4.2) so its real owner
-// could never link it.
+// another tenant are both 404 sprout_not_found (§4 "Tenant safety"), so
+// no link row can ever point at a sprout outside its own tenant.
 //
 // Re-linking the exact same (sprout, asset) pair is idempotent: 200 with
-// the existing link. Any other collision with the global sprout_id /
-// asset_id uniqueness is 409 asset_link_conflict, with one fixed body
-// regardless of which row it collided with or which tenant owns that
-// row. See the PR description for the residual oracle this leaves: a
-// 409 on an asset_id (or sprout_id) the caller can't see via §1.4
-// implies another tenant has linked it — inherent to §4.2 declaring both
-// columns globally UNIQUE.
+// the existing link. Any other collision — this tenant's sprout already
+// carrying an asset_id, or the asset_id already being linked anywhere —
+// is 409 asset_link_conflict, with one fixed body whichever it was.
+// sprout_id uniqueness is per tenant, so only the asset_id collision can
+// involve another tenant's row; a 409 for an asset_id the caller can't
+// see via §1.4 does imply another tenant holds it. That's accepted:
+// asset_ids are CloudXP-generated and globally unique by design, so one
+// VM's asset_id legitimately can't be claimed by two tenants.
 //
 // Not rate-limited: a tenant can create at most one link per sprout it
 // owns, so the table can't grow faster than the tenant's own fleet.
@@ -159,7 +158,7 @@ func LinkAsset(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "failed to link asset")
 			return
 		}
-		conflict, err := assetLinkConflictExists(sproutID, assetID)
+		conflict, err := assetLinkConflictExists(tenantID, sproutID, assetID)
 		if err != nil || !conflict {
 			// Not a uniqueness collision: a genuine write failure.
 			writeError(w, http.StatusInternalServerError, "internal_error", "failed to link asset")
@@ -333,13 +332,17 @@ func sproutOwnedByTenant(tenantID, sproutID string) (bool, error) {
 	return count > 0, err
 }
 
-// assetLinkConflictExists reports whether some link row already holds
-// sproutID or assetID. Deliberately not tenant-scoped: it's checking the
-// global UNIQUE constraints of §4.2, not resolving an id for the caller,
-// and its answer only ever surfaces as LinkAsset's fixed 409 body.
-func assetLinkConflictExists(sproutID, assetID string) (bool, error) {
+// assetLinkConflictExists reports whether an existing row collides with
+// one of AssetLink's UNIQUE indexes: this tenant's (tenant_id, sprout_id)
+// pair, or assetID in any tenant. The asset_id half is deliberately not
+// tenant-scoped — it checks the global asset_id constraint rather than
+// resolving an id for the caller, and its answer only ever surfaces as
+// LinkAsset's fixed 409 body.
+func assetLinkConflictExists(tenantID, sproutID, assetID string) (bool, error) {
 	var count int64
-	err := db.Model(&AssetLink{}).Where("sprout_id = ? OR asset_id = ?", sproutID, assetID).Count(&count).Error
+	err := db.Model(&AssetLink{}).
+		Where("(tenant_id = ? AND sprout_id = ?) OR asset_id = ?", tenantID, sproutID, assetID).
+		Count(&count).Error
 	return count > 0, err
 }
 

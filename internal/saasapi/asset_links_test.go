@@ -29,8 +29,8 @@ import (
 //
 // ATTACH is per-connection in sqlite, so the pool is pinned to a single
 // connection. asset_links is also cleared: newTestDB's shared-cache
-// database outlives each test, and asset_id/sprout_id are globally
-// UNIQUE, so rows left by an earlier test would collide.
+// database outlives each test, and asset_id is globally UNIQUE, so rows
+// left by an earlier test would collide.
 func newTestDBWithFarmer(t *testing.T) *gorm.DB {
 	t.Helper()
 	gdb := newTestDB(t)
@@ -315,6 +315,33 @@ func TestLinkAssetConflictsShareOneBody(t *testing.T) {
 	}
 }
 
+// TestLinkAssetSproutUniquenessIsPerTenant: sprout_id is only unique
+// within a tenant (matching pki_nkeys), so two tenants' same-named
+// sprouts each take their own link, and one tenant linking or unlinking
+// its "web-01" never touches the other's.
+func TestLinkAssetSproutUniquenessIsPerTenant(t *testing.T) {
+	gdb := newTestDBWithFarmer(t)
+	tenantA := mustCreateTenant(t, "Tenant A")
+	tenantB := mustCreateTenant(t, "Tenant B")
+	mustInsertFarmerSprout(t, gdb, tenantA, "web-01", "accepted")
+	mustInsertFarmerSprout(t, gdb, tenantB, "web-01", "accepted")
+
+	mustLinkAsset(t, tenantA, "web-01", "asset_a")
+	mustLinkAsset(t, tenantB, "web-01", "asset_b")
+
+	// Still one asset per sprout within a tenant.
+	assertErrorCode(t, linkAssetReq(t, tenantA, "web-01", linkAssetRequest{AssetID: "asset_a2"}),
+		http.StatusConflict, "asset_link_conflict")
+
+	if w := unlinkAssetReq(t, tenantA, "web-01"); w.Code != http.StatusOK {
+		t.Fatalf("unlink: status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var bLink AssetLink
+	if err := gdb.First(&bLink, "tenant_id = ? AND sprout_id = ?", tenantB, "web-01").Error; err != nil || bLink.AssetID != "asset_b" {
+		t.Fatalf("tenant B's web-01 link was disturbed: %+v, err=%v", bLink, err)
+	}
+}
+
 // --- §1.3 DELETE .../asset-link ---
 
 func TestUnlinkAsset(t *testing.T) {
@@ -431,9 +458,9 @@ func TestListSproutsByAssetIDsKeyStateAndConnected(t *testing.T) {
 }
 
 // TestListSproutsByAssetIDsHeartbeatIsTenantScoped: pki_nkeys only keys a
-// sprout_id per tenant, so two tenants can each have a sprout named
-// "web-01". Another tenant's same-named sprout being online must not make
-// the caller's show as connected.
+// sprout_id per tenant, so two tenants can each have (and each link) a
+// sprout named "web-01". Each tenant's `connected` must reflect only its
+// own web-01's heartbeat.
 func TestListSproutsByAssetIDsHeartbeatIsTenantScoped(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	mr := newTestHeartbeat(t)
@@ -442,11 +469,16 @@ func TestListSproutsByAssetIDsHeartbeatIsTenantScoped(t *testing.T) {
 	mustInsertFarmerSprout(t, gdb, tenantA, "web-01", "accepted")
 	mustInsertFarmerSprout(t, gdb, tenantB, "web-01", "accepted")
 	mustLinkAsset(t, tenantA, "web-01", "asset_a")
+	mustLinkAsset(t, tenantB, "web-01", "asset_b")
 	markOnline(t, mr, tenantB, "web-01")
 
-	resp := decodeSproutsByAsset(t, listByAssetReq(t, tenantA, "asset_ids=asset_a"))
-	if len(resp.Results) != 1 || resp.Results[0].Connected {
-		t.Fatalf("results = %+v, want web-01 resolved but not connected", resp.Results)
+	respA := decodeSproutsByAsset(t, listByAssetReq(t, tenantA, "asset_ids=asset_a,asset_b"))
+	if len(respA.Results) != 1 || respA.Results[0].AssetID != "asset_a" || respA.Results[0].Connected {
+		t.Fatalf("tenant A: results = %+v, want only asset_a, not connected", respA.Results)
+	}
+	respB := decodeSproutsByAsset(t, listByAssetReq(t, tenantB, "asset_ids=asset_a,asset_b"))
+	if len(respB.Results) != 1 || respB.Results[0].AssetID != "asset_b" || !respB.Results[0].Connected {
+		t.Fatalf("tenant B: results = %+v, want only asset_b, connected", respB.Results)
 	}
 }
 
