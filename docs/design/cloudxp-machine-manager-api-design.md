@@ -95,10 +95,13 @@ The only place `asset_id` (CloudXP's own, stable-for-life VM identifier) enters 
 
 Implementation note: this is a single local SQL statement, no NATS round-trip —
 ```sql
-SELECT s.* FROM farmer.sprouts s
-JOIN saas.asset_links a ON a.sprout_id = s.id
+SELECT a.asset_id, n.sprout_id, n.state AS key_state
+FROM saas.asset_links a
+JOIN farmer.pki_nkeys n
+  ON n.tenant_id = a.tenant_id AND n.sprout_id = a.sprout_id
 WHERE a.tenant_id = ? AND a.asset_id IN (?, ...);
 ```
+The join is on the composite `(tenant_id, sprout_id)` — `pki_nkeys`' primary key — because a `sprout_id` is only unique within a tenant (§4, *Tenant safety*). `connected` is not a column in either table: it comes from `internal/heartbeat.IsOnline` (the sprout's live Valkey heartbeat key), filled in per resolved row after the join, and degrades to `false` on a heartbeat-store error rather than failing the request.
 
 ### 1.5 Sprout actions — batch, async
 
@@ -419,6 +422,7 @@ Unknown key, expired, revoked, and exhausted all return the same `enrollment_fai
 - **Pagination**: 100-item cap on caller-supplied ID batches (§1.4, §1.5); cursor-based for open-ended lists (`internal.sprouts.list`) — the existing `sprouts.list`/`jobs.list` farmer subjects lack this and should not be exposed externally as-is.
 - **Async pattern**: every long-running operation (tenant provision/deprovision, batch actions, fleet updates) follows create-row-then-poll — `202` + a status endpoint, backed by an outbox-style table in `saas` schema, never a bare NATS publish, because NATS core (no JetStream, per the settled architecture) gives no redelivery guarantee.
 - **Tenant safety**: every query that resolves a caller-supplied ID (`asset_id`, `sprout_id`) always includes `tenant_id` in the same `WHERE` clause — a mismatch resolves to "not found," never a distinguishable authorization error.
+  - `sprout_id` is unique **per tenant only**, not globally: enrollment derives it from the sprout's hostname and de-duplicates only against that tenant's own sprouts (`internal/pki/enroll.go`, `resolveEnrollSproutID`), so two tenants can — and routinely will — both have a `web-01`. Any table, index, cache key, or map keyed on `sprout_id` alone (rather than `(tenant_id, sprout_id)`) is a cross-tenant collision bug.
 - **Versioning**: `/v1` prefix on the external API; internal subjects aren't versioned in the path — farmer and the SaaS API deploy together as one control plane, so subject compatibility is managed by coordinated release rather than version negotiation.
 
 ---
@@ -441,7 +445,7 @@ No cross-schema foreign keys — `tenant_id`/`sprout_id` are enforced by convent
 tenants               (id, name, status, plan_id, created_at, updated_at)
 provisioning_jobs     (id, tenant_id, type, status, attempts, last_error, warning, created_at, updated_at)
 enrollment_keys        (id, tenant_id, key_hash, expiry, max_uses, used_count, revoked)
-asset_links           (id, tenant_id, sprout_id UNIQUE, asset_id UNIQUE, linked_at)
+asset_links           (id, tenant_id, sprout_id, asset_id UNIQUE, linked_at, UNIQUE(tenant_id, sprout_id))
 asset_action_batches  (id, tenant_id, requested_asset_ids, created_at)
 asset_action_items    (batch_id, asset_id, sprout_id, jid, status)
 ```
