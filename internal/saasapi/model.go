@@ -159,3 +159,94 @@ type TenantUpdatePolicy struct {
 }
 
 func (TenantUpdatePolicy) TableName() string { return "tenant_update_policy" }
+
+// AssetActionItemStatus is one §1.5 batch item's status, as returned by
+// GET /tenants/{tenant_id}/sprouts/actions/{batch_id}.
+//
+// The outbox distinction that matters is queued vs. dispatching (see
+// sprout_actions.go's dispatchItem): a queued item has provably never
+// reached farmer and is safe to (re-)dispatch; a dispatching item's
+// request has been sent, so if it stays dispatching (this process died
+// before the reply, or the reply was lost) its outcome is unknown and it
+// must never be blindly re-sent — cmd.run isn't idempotent.
+type AssetActionItemStatus string
+
+const (
+	// ActionItemUnresolved: the asset_id didn't resolve to a sprout in
+	// the caller's tenant (never linked, linked elsewhere, or its sprout
+	// is gone). Never dispatched.
+	ActionItemUnresolved AssetActionItemStatus = "unresolved"
+	// ActionItemQueued: resolved and recorded, not yet sent to farmer.
+	ActionItemQueued AssetActionItemStatus = "queued"
+	// ActionItemDispatching: sent to farmer; no reply recorded yet.
+	ActionItemDispatching AssetActionItemStatus = "dispatching"
+	// ActionItemRunning: farmer accepted it and returned a jid (a cook);
+	// the job itself hasn't been seen to finish.
+	ActionItemRunning AssetActionItemStatus = "running"
+	// ActionItemSucceeded: a cmd.run that exited 0, or a job that
+	// finished successfully.
+	ActionItemSucceeded AssetActionItemStatus = "succeeded"
+	// ActionItemFailed: anything that ended badly; ErrorCode says what.
+	ActionItemFailed AssetActionItemStatus = "failed"
+)
+
+// terminal reports whether s is an end state: nothing further will move
+// an item out of it.
+func (s AssetActionItemStatus) terminal() bool {
+	switch s {
+	case ActionItemUnresolved, ActionItemSucceeded, ActionItemFailed:
+		return true
+	}
+	return false
+}
+
+// AssetActionBatch is the `saas.asset_action_batches` table (design doc
+// §4.2, §1.5): one row per POST .../sprouts/actions, the outbox parent of
+// its AssetActionItem rows.
+//
+// ActionParams is the farmer-side internal.sprout.action params exactly as
+// dispatched (see sprout_actions.go's translateAction), kept so a future
+// outbox sweeper can re-send a queued item unchanged. It holds the command
+// line the caller supplied (never environment variables: the API accepts
+// none), so it is never returned by the API. RequestedAssetIDs is the JSON array of the
+// batch's deduplicated asset_ids, in request order.
+type AssetActionBatch struct {
+	ID                string    `gorm:"column:id;primaryKey;size:32"`
+	TenantID          string    `gorm:"column:tenant_id;size:32;not null;index"`
+	ActionType        string    `gorm:"column:action_type;size:32;not null"`
+	ActionParams      string    `gorm:"column:action_params;type:text;not null"`
+	RequestedAssetIDs string    `gorm:"column:requested_asset_ids;type:text;not null"`
+	CreatedAt         time.Time `gorm:"column:created_at"`
+}
+
+func (AssetActionBatch) TableName() string { return "asset_action_batches" }
+
+// AssetActionItem is the `saas.asset_action_items` table (design doc
+// §4.2, §1.5): one row per requested asset_id in a batch.
+//
+// TenantID isn't in §4.2's sketch. It's carried on every item, alongside
+// the batch's own, so that every item query and conditional status update
+// can carry tenant_id in its WHERE clause (§4 "Tenant safety"), and so an
+// item's sprout_id is never meaningful without its tenant: sprout_id is
+// only unique per tenant.
+//
+// Position is the asset_id's index in the request, so GET returns items
+// in request order. SproutID and JID are empty until known. ErrorCode is
+// a fixed code (controlplane.ErrorCode or one of sprout_actions.go's own),
+// never error text. ExitCode is set only for a completed cmd.run.
+type AssetActionItem struct {
+	BatchID   string                `gorm:"column:batch_id;primaryKey;size:32"`
+	AssetID   string                `gorm:"column:asset_id;primaryKey;size:191"`
+	TenantID  string                `gorm:"column:tenant_id;size:32;not null"`
+	Position  int                   `gorm:"column:position;not null"`
+	SproutID  string                `gorm:"column:sprout_id;size:253;not null;default:''"`
+	JID       string                `gorm:"column:jid;size:64;not null;default:''"`
+	Status    AssetActionItemStatus `gorm:"column:status;size:32;not null"`
+	ErrorCode string                `gorm:"column:error_code;size:64;not null;default:''"`
+	ExitCode  *int                  `gorm:"column:exit_code"`
+	Attempts  int                   `gorm:"column:attempts;not null;default:0"`
+	CreatedAt time.Time             `gorm:"column:created_at"`
+	UpdatedAt time.Time             `gorm:"column:updated_at"`
+}
+
+func (AssetActionItem) TableName() string { return "asset_action_items" }

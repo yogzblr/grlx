@@ -194,7 +194,7 @@ func TestLogJobs_ExistingJobAppend(t *testing.T) {
 		Started:          time.Now(),
 		Duration:         2 * time.Second,
 	}
-	logJobs(stepMsg(t, "grlx.cook.sprout-existing.existing-job", newStep))
+	logJobs("", stepMsg(t, "grlx.cook.sprout-existing.existing-job", newStep))
 
 	summary := waitForSteps(t, obj, "sprout-existing", "existing-job", 2)
 	if summary.Steps[0].ID != "existing-step" || summary.Steps[1].ID != "new-step" {
@@ -214,7 +214,7 @@ func TestLogJobs_InvalidJSON(t *testing.T) {
 	obj := useTestObjStore(t)
 
 	// Invalid JSON — should not panic, and nothing is written.
-	logJobs(&nats.Msg{Subject: "grlx.cook.sprout-bad.job-bad", Data: []byte("invalid json")})
+	logJobs("", &nats.Msg{Subject: "grlx.cook.sprout-bad.job-bad", Data: []byte("invalid json")})
 
 	if keys := listKeys(t, obj, jobKeyPrefix); len(keys) != 0 {
 		t.Errorf("expected nothing written for invalid JSON, got %v", keys)
@@ -227,7 +227,7 @@ func TestLogJobs_ShortSubject(t *testing.T) {
 
 	// The wildcard subscription guarantees 4 tokens, but logJobs guards
 	// anyway.
-	logJobs(stepMsg(t, "grlx.cook.only-three", step))
+	logJobs("", stepMsg(t, "grlx.cook.only-three", step))
 
 	if keys := listKeys(t, obj, jobKeyPrefix); len(keys) != 0 {
 		t.Errorf("expected nothing written for a short subject, got %v", keys)
@@ -240,9 +240,9 @@ func TestLogJobs_UnsafeKeySegment(t *testing.T) {
 	obj := useTestObjStore(t)
 	step := makeStep("s1", cook.StepCompleted, time.Now(), time.Second)
 
-	logJobs(stepMsg(t, "grlx.cook.sprout/other.job", step))
-	logJobs(stepMsg(t, "grlx.cook.sprout.job/events", step))
-	logJobs(stepMsg(t, "grlx.cook.sprout...", step))
+	logJobs("", stepMsg(t, "grlx.cook.sprout/other.job", step))
+	logJobs("", stepMsg(t, "grlx.cook.sprout.job/events", step))
+	logJobs("", stepMsg(t, "grlx.cook.sprout...", step))
 
 	if keys := listKeys(t, obj, ""); len(keys) != 0 {
 		t.Errorf("expected nothing written for unsafe key segments, got %v", keys)
@@ -255,7 +255,7 @@ func TestLogJobs_NotConfigured(t *testing.T) {
 	t.Cleanup(func() { SetStore(orig) })
 
 	// Should log and drop the event, not panic.
-	logJobs(stepMsg(t, "grlx.cook.sprout.job", makeStep("s1", cook.StepCompleted, time.Now(), time.Second)))
+	logJobs("", stepMsg(t, "grlx.cook.sprout.job", makeStep("s1", cook.StepCompleted, time.Now(), time.Second)))
 }
 
 func TestLogJobs_PutError(t *testing.T) {
@@ -263,7 +263,7 @@ func TestLogJobs_PutError(t *testing.T) {
 
 	srv.FailNext(1, 403, "AccessDenied")
 	// Should log the failed Put, not panic.
-	logJobs(stepMsg(t, "grlx.cook.sprout-err.job-err", makeStep("s1", cook.StepCompleted, time.Now(), time.Second)))
+	logJobs("", stepMsg(t, "grlx.cook.sprout-err.job-err", makeStep("s1", cook.StepCompleted, time.Now(), time.Second)))
 
 	if keys := listKeys(t, obj, jobKeyPrefix); len(keys) != 0 {
 		t.Errorf("expected nothing written after a failed Put, got %v", keys)
@@ -342,12 +342,12 @@ func TestLogJobCreation(t *testing.T) {
 func TestLogJobCreation_ThenSteps(t *testing.T) {
 	obj := useTestObjStore(t)
 
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout-flow.cook", cook.RecipeEnvelope{
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout-flow.cook", cook.RecipeEnvelope{
 		JobID: "flow-job",
 		Steps: []cook.Step{{ID: "a"}, {ID: "b"}},
 	}))
-	logJobs(stepMsg(t, "grlx.cook.sprout-flow.flow-job", makeStep("a", cook.StepCompleted, time.Now(), time.Second)))
-	logJobs(stepMsg(t, "grlx.cook.sprout-flow.flow-job", makeStep("b", cook.StepCompleted, time.Now(), time.Second)))
+	logJobs("", stepMsg(t, "grlx.cook.sprout-flow.flow-job", makeStep("a", cook.StepCompleted, time.Now(), time.Second)))
+	logJobs("", stepMsg(t, "grlx.cook.sprout-flow.flow-job", makeStep("b", cook.StepCompleted, time.Now(), time.Second)))
 
 	// Same lines, in the same order, the old local .jsonl file held:
 	// placeholders first, then events as they arrived.
@@ -369,7 +369,7 @@ func TestLogJobCreation_EmptyJobID(t *testing.T) {
 	obj := useTestObjStore(t)
 
 	// Envelope with empty JobID should be ignored.
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout-empty.cook", cook.RecipeEnvelope{
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout-empty.cook", cook.RecipeEnvelope{
 		JobID: "",
 		Steps: []cook.Step{{ID: "step-a"}},
 	}))
@@ -383,7 +383,7 @@ func TestLogJobCreation_NoInvokedBy(t *testing.T) {
 	obj := useTestObjStore(t)
 
 	before := time.Now().UTC().Add(-time.Second)
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout-noinv.cook", cook.RecipeEnvelope{
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout-noinv.cook", cook.RecipeEnvelope{
 		JobID: "no-invoker-job",
 		Steps: []cook.Step{{ID: "step-a"}},
 	}))
@@ -412,7 +412,7 @@ func TestLogJobCreation_DuplicateJobID(t *testing.T) {
 	})
 
 	// First creation.
-	logJobCreation(msg)
+	logJobCreation("", msg)
 	key := createdKey("sprout-dup", "dup-job")
 	originalContent, err := obj.Get(context.Background(), key)
 	if err != nil {
@@ -423,7 +423,7 @@ func TestLogJobCreation_DuplicateJobID(t *testing.T) {
 	// already exists (the placeholders carry a fresh Started time, so a
 	// rewrite would change the content).
 	time.Sleep(time.Millisecond)
-	logJobCreation(msg)
+	logJobCreation("", msg)
 
 	afterContent, err := obj.Get(context.Background(), key)
 	if err != nil {
@@ -437,7 +437,7 @@ func TestLogJobCreation_DuplicateJobID(t *testing.T) {
 func TestLogJobCreation_InvalidJSON(t *testing.T) {
 	obj := useTestObjStore(t)
 
-	logJobCreation(&nats.Msg{Subject: "grlx.sprouts.sprout-badjson.cook", Data: []byte("not json")})
+	logJobCreation("", &nats.Msg{Subject: "grlx.sprouts.sprout-badjson.cook", Data: []byte("not json")})
 
 	if keys := listKeys(t, obj, jobKeyPrefix); len(keys) != 0 {
 		t.Errorf("expected no objects for invalid JSON, got %v", keys)
@@ -447,7 +447,7 @@ func TestLogJobCreation_InvalidJSON(t *testing.T) {
 func TestLogJobCreation_ShortSubject(t *testing.T) {
 	obj := useTestObjStore(t)
 
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
 
 	if keys := listKeys(t, obj, jobKeyPrefix); len(keys) != 0 {
 		t.Errorf("expected nothing written for a short subject, got %v", keys)
@@ -457,8 +457,8 @@ func TestLogJobCreation_ShortSubject(t *testing.T) {
 func TestLogJobCreation_UnsafeKeySegment(t *testing.T) {
 	obj := useTestObjStore(t)
 
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout.cook", cook.RecipeEnvelope{JobID: "../other", Steps: []cook.Step{{ID: "s"}}}))
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.a/b.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout.cook", cook.RecipeEnvelope{JobID: "../other", Steps: []cook.Step{{ID: "s"}}}))
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.a/b.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
 
 	if keys := listKeys(t, obj, ""); len(keys) != 0 {
 		t.Errorf("expected nothing written for unsafe key segments, got %v", keys)
@@ -471,14 +471,14 @@ func TestLogJobCreation_NotConfigured(t *testing.T) {
 	t.Cleanup(func() { SetStore(orig) })
 
 	// Should log and drop the event, not panic.
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
 }
 
 func TestLogJobCreation_ExistsError(t *testing.T) {
 	srv, obj := useTestObjServer(t)
 
 	srv.FailNext(1, 403, "AccessDenied")
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout-err.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout-err.cook", cook.RecipeEnvelope{JobID: "j", Steps: []cook.Step{{ID: "s"}}}))
 
 	// A failed existence check doesn't risk overwriting a job: nothing is
 	// written.

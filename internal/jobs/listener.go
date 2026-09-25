@@ -66,17 +66,27 @@ func RegisterNatsConn(tenantID string, conn *nats.Conn) {
 	// tenants (docs/design/grlx-tenant-context-threading.md) — a shared var
 	// would race between one call's assignment and another's Subscribe, and
 	// nothing else in this package needs to read it back afterward.
-	_, err := conn.QueueSubscribe("grlx.cook.*.*", natsCoreQueueGroup, logJobs)
+	//
+	// tenantID is passed to each handler for the job-status index
+	// (status_index.go), which keys every row by the tenant whose
+	// connection the event arrived on.
+	_, err := conn.QueueSubscribe("grlx.cook.*.*", natsCoreQueueGroup, func(msg *nats.Msg) {
+		logJobs(tenantID, msg)
+	})
 	if err != nil {
 		log.Error(err)
 	}
-	_, err = conn.QueueSubscribe("grlx.sprouts.*.cook", natsCoreQueueGroup, logJobCreation)
+	_, err = conn.QueueSubscribe("grlx.sprouts.*.cook", natsCoreQueueGroup, func(msg *nats.Msg) {
+		logJobCreation(tenantID, msg)
+	})
 	if err != nil {
 		log.Error(err)
 	}
 }
 
-func logJobCreation(msg *nats.Msg) {
+// logJobCreation records a new job from its recipe envelope: in the job
+// object store, and (its step count) in the job-status index for tenantID.
+func logJobCreation(tenantID string, msg *nats.Msg) {
 	// Subject: grlx.sprouts.<sproutID>.cook
 	tComponents := strings.Split(msg.Subject, ".")
 	if len(tComponents) < 4 {
@@ -97,6 +107,10 @@ func logJobCreation(msg *nats.Msg) {
 		log.Errorf("refusing to record job %q for sprout %q: not usable as an object key segment", envelope.JobID, sprout)
 		return
 	}
+	// Independent of the object-store writes below, which it neither
+	// waits on nor replaces. Idempotent, so it runs even when created.jsonl
+	// already exists.
+	indexJobCreation(tenantID, sprout, envelope.JobID, len(envelope.Steps))
 	obj := objStore
 	if obj == nil {
 		log.Errorf("failed to record job %s for sprout %s: %v", envelope.JobID, sprout, ErrJobStoreNotConfigured)
@@ -155,7 +169,9 @@ func logJobCreation(msg *nats.Msg) {
 	log.Noticef("job %s created for sprout %s (%d steps)", envelope.JobID, sprout, len(envelope.Steps))
 }
 
-func logJobs(msg *nats.Msg) {
+// logJobs records one job event: in the job object store, and in the
+// job-status index for tenantID.
+func logJobs(tenantID string, msg *nats.Msg) {
 	// Subject: grlx.cook.<sproutID>.<jid>
 	tComponents := strings.Split(msg.Subject, ".")
 	if len(tComponents) < 4 {
@@ -176,6 +192,8 @@ func logJobs(msg *nats.Msg) {
 		log.Errorf("refusing to record step for job %q on sprout %q: not usable as an object key segment", JID, sprout)
 		return
 	}
+	// Independent of the object-store write below; see logJobCreation.
+	indexJobEvent(tenantID, sprout, JID, classifyJobEvent(JID, completedStep))
 	b, err := json.Marshal(completedStep)
 	if err != nil {
 		log.Error(err)

@@ -647,7 +647,7 @@ func TestLogJobCreation_PutError(t *testing.T) {
 	// created.jsonl Put fail.
 	srv.FailNext(1, 404, "NoSuchKey")
 	srv.FailNext(2, 403, "AccessDenied")
-	logJobCreation(envelopeMsg(t, "grlx.sprouts.sprout-fail.cook", cook.RecipeEnvelope{JobID: "fail-create", Steps: []cook.Step{{ID: "s1"}}}))
+	logJobCreation("", envelopeMsg(t, "grlx.sprouts.sprout-fail.cook", cook.RecipeEnvelope{JobID: "fail-create", Steps: []cook.Step{{ID: "s1"}}}))
 
 	// Should not panic, and no half-created job is visible.
 	store := NewStoreWithObjectStore(obj)

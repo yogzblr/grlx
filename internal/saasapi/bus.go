@@ -1,7 +1,8 @@
 package saasapi
 
 // The SaaS API's NATS connection to farmer — the transport for the
-// internal.tenant.* control-plane subjects (design doc §2.2). This service
+// internal.tenant.* and internal.sprout.action control-plane subjects
+// (design doc §2.2). This service
 // connects as its own narrowly-scoped User under the bus's SYS Account;
 // see docs/design/grlx-internal-api-account.md for why, and for exactly
 // which subjects that User may use (FLAG FOR SECURITY REVIEW).
@@ -19,6 +20,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
+	"github.com/gogrlx/grlx/v2/internal/controlplane"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 )
 
@@ -29,9 +31,10 @@ import (
 const busQueueGroup = "grlx-saasapi"
 
 // bus is the connection dispatchProvisioning/dispatchDeprovisioning
-// publish through, set once at startup via SetBus — the same injection
-// pattern SetDB uses. Nil means "not connected": dispatch logs and leaves
-// the outbox row pending.
+// publish through and dispatchBatch sends internal.sprout.action requests
+// on, set once at startup via SetBus — the same injection pattern SetDB
+// uses. Nil means "not connected": dispatch logs and leaves the outbox row
+// pending (or the action item queued).
 var bus *nats.Conn
 
 // SetBus installs the NATS connection dispatch publishes through. Call
@@ -98,6 +101,11 @@ func ConnectBus(cfg Config) (*nats.Conn, error) {
 	}
 	nc, err := nats.Connect(cfg.NATSURL,
 		nats.Name("grlx-saasapi"),
+		// Request-reply (internal.sprout.action) replies arrive on this
+		// prefix: it's the only inbox this service's NATS User may
+		// subscribe to, and the only one farmer will reply on
+		// (controlplane.SaaSAPIInboxPrefix).
+		nats.CustomInboxPrefix(controlplane.SaaSAPIInboxPrefix),
 		nats.Secure(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}),
 		nats.UserJWTAndSeed(strings.TrimSpace(cfg.NATSUserJWT), seed),
 		nats.Timeout(10*time.Second),

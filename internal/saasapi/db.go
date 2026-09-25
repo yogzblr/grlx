@@ -19,10 +19,11 @@ func SetDB(d *gorm.DB) { db = d }
 
 // OpenDB opens a GORM connection to the `saas` schema and migrates the
 // tables this package owns (tenants, provisioning_jobs, enrollment_keys,
-// asset_links — design doc §4.2; fleet_versions, tenant_update_policy —
-// §4.3). It never writes to the `farmer` schema;
-// asset_links.go only reads farmer.pki_nkeys, through the saas service
-// account's SELECT grant (§4.1).
+// asset_links, asset_action_batches, asset_action_items — design doc
+// §4.2; fleet_versions, tenant_update_policy — §4.3). It never writes to
+// the `farmer` schema; asset_links.go and sprout_actions.go only read
+// farmer.pki_nkeys, through the saas service account's SELECT grant
+// (§4.1).
 func OpenDB(dsn string) (*gorm.DB, error) {
 	if dsn == "" {
 		return nil, fmt.Errorf("saasapi: empty DSN")
@@ -58,6 +59,7 @@ var legacyAssetLinkIndexes = []string{"idx_asset_links_sprout_id", "idx_asset_li
 // already-migrated database the drop step finds nothing to do.
 func migrateSchema(d *gorm.DB) error {
 	if err := d.AutoMigrate(&Tenant{}, &ProvisioningJob{}, &EnrollmentKey{}, &AssetLink{},
+		&AssetActionBatch{}, &AssetActionItem{},
 		&FleetVersion{}, &TenantUpdatePolicy{}); err != nil {
 		return err
 	}

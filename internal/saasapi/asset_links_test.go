@@ -23,6 +23,7 @@ import (
 
 // newTestDBWithFarmer is newTestDB plus a stand-in for the farmer schema:
 // an attached in-memory sqlite database named "farmer" holding a
+// job_status table (internal/jobs' index) and a
 // pki_nkeys table with internal/pki's nkeyRow columns and primary key
 // (TestFarmerNKeysColumnContract checks the columns asset_links.go reads
 // against pki.Models()), so §1.4's cross-schema join runs unmodified.
@@ -47,6 +48,17 @@ func newTestDBWithFarmer(t *testing.T) *gorm.DB {
 			nkey      TEXT NOT NULL,
 			state     TEXT NOT NULL,
 			PRIMARY KEY (tenant_id, sprout_id)
+		)`,
+		// internal/jobs' job-status index (sprout_actions.go's
+		// farmerJobStatusReader); TestFarmerJobStatusColumnContract pins
+		// the columns read.
+		`CREATE TABLE farmer.job_status (
+			tenant_id  TEXT NOT NULL,
+			sprout_id  TEXT NOT NULL,
+			jid        TEXT NOT NULL,
+			status     TEXT NOT NULL,
+			updated_at DATETIME,
+			PRIMARY KEY (tenant_id, sprout_id, jid)
 		)`,
 		`DELETE FROM asset_links`,
 	} {
