@@ -1,22 +1,31 @@
 package saasapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/valkey-io/valkey-go"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
+
+	"github.com/gogrlx/grlx/v2/internal/heartbeat"
+	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
 // newTestDBWithFarmer is newTestDB plus a stand-in for the farmer schema:
-// an attached in-memory sqlite database named "farmer" holding a sprouts
-// table with the columns asset_links.go relies on (see
-// farmerSproutsTable), so §1.4's cross-schema join runs unmodified.
+// an attached in-memory sqlite database named "farmer" holding a
+// pki_nkeys table with internal/pki's nkeyRow columns and primary key
+// (TestFarmerNKeysColumnContract checks the columns asset_links.go reads
+// against pki.Models()), so §1.4's cross-schema join runs unmodified.
 //
 // ATTACH is per-connection in sqlite, so the pool is pinned to a single
 // connection. asset_links is also cleared: newTestDB's shared-cache
@@ -32,12 +41,12 @@ func newTestDBWithFarmer(t *testing.T) *gorm.DB {
 	sqlDB.SetMaxOpenConns(1)
 	for _, stmt := range []string{
 		`ATTACH DATABASE ':memory:' AS farmer`,
-		`CREATE TABLE farmer.sprouts (
-			id        TEXT NOT NULL,
+		`CREATE TABLE farmer.pki_nkeys (
 			tenant_id TEXT NOT NULL,
-			key_state TEXT NOT NULL,
-			connected BOOLEAN NOT NULL,
-			PRIMARY KEY (tenant_id, id)
+			sprout_id TEXT NOT NULL,
+			nkey      TEXT NOT NULL,
+			state     TEXT NOT NULL,
+			PRIMARY KEY (tenant_id, sprout_id)
 		)`,
 		`DELETE FROM asset_links`,
 	} {
@@ -48,11 +57,76 @@ func newTestDBWithFarmer(t *testing.T) *gorm.DB {
 	return gdb
 }
 
-func mustInsertFarmerSprout(t *testing.T, gdb *gorm.DB, tenantID, sproutID, keyState string, connected bool) {
+func mustInsertFarmerSprout(t *testing.T, gdb *gorm.DB, tenantID, sproutID, state string) {
 	t.Helper()
-	if err := gdb.Exec(`INSERT INTO farmer.sprouts (id, tenant_id, key_state, connected) VALUES (?, ?, ?, ?)`,
-		sproutID, tenantID, keyState, connected).Error; err != nil {
+	if err := gdb.Exec(`INSERT INTO farmer.pki_nkeys (tenant_id, sprout_id, nkey, state) VALUES (?, ?, ?, ?)`,
+		tenantID, sproutID, "U"+strings.ToUpper(sproutID), state).Error; err != nil {
 		t.Fatalf("inserting farmer sprout: %v", err)
+	}
+}
+
+// newTestHeartbeat points internal/heartbeat at an in-process miniredis
+// for the duration of the test and returns it, so tests can mark sprouts
+// online with markOnline.
+func newTestHeartbeat(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	c, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{mr.Addr()}, DisableCache: true})
+	if err != nil {
+		t.Fatalf("creating valkey client: %v", err)
+	}
+	heartbeat.SetClient(c)
+	t.Cleanup(func() {
+		heartbeat.SetClient(nil)
+		c.Close()
+	})
+	return mr
+}
+
+// markOnline writes the heartbeat key internal/heartbeat's CONNECT
+// listener would. heartbeat's keyFor is unexported, so the format is
+// repeated here, and immediately checked through the real
+// heartbeat.IsOnline so a format drift fails loudly instead of silently
+// making every sprout look offline.
+func markOnline(t *testing.T, mr *miniredis.Miniredis, tenantID, sproutID string) {
+	t.Helper()
+	if err := mr.Set("grlx:heartbeat:"+tenantID+":"+sproutID, "1"); err != nil {
+		t.Fatalf("setting heartbeat key: %v", err)
+	}
+	if !heartbeat.IsOnline(context.Background(), tenantID, sproutID) {
+		t.Fatalf("heartbeat.IsOnline doesn't see the key markOnline wrote; has heartbeat's key format changed?")
+	}
+}
+
+// TestFarmerNKeysColumnContract pins the pki_nkeys columns asset_links.go
+// reads by name in raw SQL (tenant_id, sprout_id, state) to internal/pki's
+// own model, so a rename there breaks this test rather than §1.3/§1.4 in
+// production.
+func TestFarmerNKeysColumnContract(t *testing.T) {
+	var found *schema.Schema
+	for _, m := range pki.Models() {
+		sch, err := schema.Parse(m, &sync.Map{}, schema.NamingStrategy{})
+		if err != nil {
+			t.Fatalf("parsing pki model %T: %v", m, err)
+		}
+		if "farmer."+sch.Table == farmerNKeysTable {
+			found = sch
+		}
+	}
+	if found == nil {
+		t.Fatalf("no pki model has table %q", strings.TrimPrefix(farmerNKeysTable, "farmer."))
+	}
+	for _, col := range []string{"tenant_id", "sprout_id", "state"} {
+		if found.LookUpField(col) == nil {
+			t.Fatalf("pki_nkeys has no %q column", col)
+		}
+	}
+	var pk []string
+	for _, f := range found.PrimaryFields {
+		pk = append(pk, f.DBName)
+	}
+	if fmt.Sprint(pk) != "[tenant_id sprout_id]" {
+		t.Fatalf("pki_nkeys primary key = %v, want [tenant_id sprout_id] (the join key)", pk)
 	}
 }
 
@@ -113,7 +187,7 @@ func assertErrorCode(t *testing.T, w *httptest.ResponseRecorder, status int, cod
 func TestLinkAssetCreatesTenantScopedRow(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
 
 	w := linkAssetReq(t, tenantID, "s_1", linkAssetRequest{AssetID: "  a1 "})
 	if w.Code != http.StatusCreated {
@@ -139,7 +213,7 @@ func TestLinkAssetCreatesTenantScopedRow(t *testing.T) {
 func TestLinkAssetIsIdempotentForSamePair(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
 	mustLinkAsset(t, tenantID, "s_1", "a1")
 
 	w := linkAssetReq(t, tenantID, "s_1", linkAssetRequest{AssetID: "a1"})
@@ -156,7 +230,7 @@ func TestLinkAssetIsIdempotentForSamePair(t *testing.T) {
 func TestLinkAssetValidation(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
 
 	for name, body := range map[string]any{
 		"missing asset_id": map[string]string{},
@@ -190,7 +264,7 @@ func TestLinkAssetOtherTenantsSproutIsIndistinguishableFromMissing(t *testing.T)
 	gdb := newTestDBWithFarmer(t)
 	tenantA := mustCreateTenant(t, "Tenant A")
 	tenantB := mustCreateTenant(t, "Tenant B")
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted")
 
 	otherTenants := linkAssetReq(t, tenantB, "s_a", linkAssetRequest{AssetID: "a1"})
 	missing := linkAssetReq(t, tenantB, "s_nonexistent", linkAssetRequest{AssetID: "a1"})
@@ -214,9 +288,9 @@ func TestLinkAssetConflictsShareOneBody(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantA := mustCreateTenant(t, "Tenant A")
 	tenantB := mustCreateTenant(t, "Tenant B")
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a1", "accepted", true)
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a2", "accepted", true)
-	mustInsertFarmerSprout(t, gdb, tenantB, "s_b1", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a1", "accepted")
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a2", "accepted")
+	mustInsertFarmerSprout(t, gdb, tenantB, "s_b1", "accepted")
 	mustLinkAsset(t, tenantA, "s_a1", "asset_a")
 	mustLinkAsset(t, tenantB, "s_b1", "asset_b")
 
@@ -246,7 +320,7 @@ func TestLinkAssetConflictsShareOneBody(t *testing.T) {
 func TestUnlinkAsset(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
 	mustLinkAsset(t, tenantID, "s_1", "a1")
 
 	if w := unlinkAssetReq(t, tenantID, "s_1"); w.Code != http.StatusOK {
@@ -267,7 +341,7 @@ func TestUnlinkAssetOtherTenantsLinkIsIndistinguishableFromNone(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantA := mustCreateTenant(t, "Tenant A")
 	tenantB := mustCreateTenant(t, "Tenant B")
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted")
 	mustLinkAsset(t, tenantA, "s_a", "a1")
 
 	otherTenants := unlinkAssetReq(t, tenantB, "s_a")
@@ -289,11 +363,13 @@ func TestUnlinkAssetOtherTenantsLinkIsIndistinguishableFromNone(t *testing.T) {
 
 func TestListSproutsByAssetIDs(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
+	mr := newTestHeartbeat(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted", true)
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_2", "accepted", false)
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_2", "accepted")
 	mustLinkAsset(t, tenantID, "s_1", "a1")
 	mustLinkAsset(t, tenantID, "s_2", "a2")
+	markOnline(t, mr, tenantID, "s_1")
 
 	// Repeated and comma-separated forms combine; duplicates and blanks
 	// are dropped; order follows the request.
@@ -311,10 +387,89 @@ func TestListSproutsByAssetIDs(t *testing.T) {
 	}
 }
 
+// TestListSproutsByAssetIDsKeyStateAndConnected covers the two-step
+// composition: key_state is pki_nkeys.state as-is, and connected is a
+// heartbeat read that — like internal/natsapi's sprouts.list — only
+// happens for accepted sprouts.
+func TestListSproutsByAssetIDsKeyStateAndConnected(t *testing.T) {
+	gdb := newTestDBWithFarmer(t)
+	mr := newTestHeartbeat(t)
+	tenantID := mustCreateTenant(t, "Acme Bank")
+
+	cases := []struct {
+		sprout, state string
+		online        bool
+		wantConnected bool
+	}{
+		{"s-accepted-on", "accepted", true, true},
+		{"s-accepted-off", "accepted", false, false},
+		{"s-unaccepted", "unaccepted", true, false},
+		{"s-denied", "denied", true, false},
+		{"s-rejected", "rejected", true, false},
+	}
+	var ids []string
+	for i, c := range cases {
+		mustInsertFarmerSprout(t, gdb, tenantID, c.sprout, c.state)
+		asset := fmt.Sprintf("asset-%d", i)
+		mustLinkAsset(t, tenantID, c.sprout, asset)
+		if c.online {
+			markOnline(t, mr, tenantID, c.sprout)
+		}
+		ids = append(ids, asset)
+	}
+
+	resp := decodeSproutsByAsset(t, listByAssetReq(t, tenantID, "asset_ids="+strings.Join(ids, ",")))
+	if len(resp.Results) != len(cases) {
+		t.Fatalf("results = %+v, want %d rows", resp.Results, len(cases))
+	}
+	for i, c := range cases {
+		got := resp.Results[i]
+		if got.SproutID != c.sprout || got.KeyState != c.state || got.Connected != c.wantConnected {
+			t.Errorf("%s: got %+v, want key_state=%s connected=%v", c.sprout, got, c.state, c.wantConnected)
+		}
+	}
+}
+
+// TestListSproutsByAssetIDsHeartbeatIsTenantScoped: pki_nkeys only keys a
+// sprout_id per tenant, so two tenants can each have a sprout named
+// "web-01". Another tenant's same-named sprout being online must not make
+// the caller's show as connected.
+func TestListSproutsByAssetIDsHeartbeatIsTenantScoped(t *testing.T) {
+	gdb := newTestDBWithFarmer(t)
+	mr := newTestHeartbeat(t)
+	tenantA := mustCreateTenant(t, "Tenant A")
+	tenantB := mustCreateTenant(t, "Tenant B")
+	mustInsertFarmerSprout(t, gdb, tenantA, "web-01", "accepted")
+	mustInsertFarmerSprout(t, gdb, tenantB, "web-01", "accepted")
+	mustLinkAsset(t, tenantA, "web-01", "asset_a")
+	markOnline(t, mr, tenantB, "web-01")
+
+	resp := decodeSproutsByAsset(t, listByAssetReq(t, tenantA, "asset_ids=asset_a"))
+	if len(resp.Results) != 1 || resp.Results[0].Connected {
+		t.Fatalf("results = %+v, want web-01 resolved but not connected", resp.Results)
+	}
+}
+
+// TestListSproutsByAssetIDsHeartbeatUnavailable: with no heartbeat client
+// (or Valkey down — heartbeat.IsOnline treats both the same), lookups
+// still succeed, reporting connected=false.
+func TestListSproutsByAssetIDsHeartbeatUnavailable(t *testing.T) {
+	gdb := newTestDBWithFarmer(t)
+	heartbeat.SetClient(nil)
+	tenantID := mustCreateTenant(t, "Acme Bank")
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
+	mustLinkAsset(t, tenantID, "s_1", "a1")
+
+	resp := decodeSproutsByAsset(t, listByAssetReq(t, tenantID, "asset_ids=a1"))
+	if len(resp.Results) != 1 || resp.Results[0].KeyState != "accepted" || resp.Results[0].Connected {
+		t.Fatalf("results = %+v, want s_1 accepted and not connected", resp.Results)
+	}
+}
+
 func TestListSproutsByAssetIDsAlwaysEmitsBothArrays(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantID := mustCreateTenant(t, "Acme Bank")
-	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantID, "s_1", "accepted")
 	mustLinkAsset(t, tenantID, "s_1", "a1")
 
 	if body := listByAssetReq(t, tenantID, "asset_ids=a1").Body.String(); !strings.Contains(body, `"unresolved":[]`) {
@@ -337,16 +492,20 @@ func TestListSproutsByAssetIDsAlwaysEmitsBothArrays(t *testing.T) {
 //     request yields the mirror-image response.
 func TestListSproutsByAssetIDsNoCrossTenantExistenceLeak(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
+	mr := newTestHeartbeat(t)
 	tenantA := mustCreateTenant(t, "Tenant A")
 	tenantB := mustCreateTenant(t, "Tenant B")
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted", true)
-	mustInsertFarmerSprout(t, gdb, tenantB, "s_b", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted")
+	mustInsertFarmerSprout(t, gdb, tenantB, "s_b", "accepted")
 	mustLinkAsset(t, tenantB, "s_b", "asset_b")
 
 	const query = "asset_ids=asset_a,asset_b"
 	before := listByAssetReq(t, tenantB, query)
 
+	// Tenant A's sprout is linked *and* live, so neither the join nor
+	// the heartbeat step has any excuse to be quiet about it.
 	mustLinkAsset(t, tenantA, "s_a", "asset_a")
+	markOnline(t, mr, tenantA, "s_a")
 	after := listByAssetReq(t, tenantB, query)
 
 	if before.Code != after.Code || before.Body.String() != after.Body.String() {
@@ -378,17 +537,17 @@ func TestListSproutsByAssetIDsNoCrossTenantExistenceLeak(t *testing.T) {
 	}
 }
 
-// TestListSproutsByAssetIDsJoinRequiresSproutTenantMatch covers the
-// join's extra s.tenant_id = a.tenant_id predicate: even a link row that
-// LinkAsset would have refused (tenant B's link pointing at tenant A's
-// sprout, inserted directly here) must not surface tenant A's sprout
+// TestListSproutsByAssetIDsJoinRequiresSproutTenantMatch covers the join
+// being on (tenant_id, sprout_id), not sprout_id alone: even a link row
+// that LinkAsset would have refused (tenant B's link pointing at tenant
+// A's sprout, inserted directly here) must not surface tenant A's sprout
 // state to tenant B. Also covers a link whose sprout has vanished from
-// farmer.sprouts.
+// pki_nkeys.
 func TestListSproutsByAssetIDsJoinRequiresSproutTenantMatch(t *testing.T) {
 	gdb := newTestDBWithFarmer(t)
 	tenantA := mustCreateTenant(t, "Tenant A")
 	tenantB := mustCreateTenant(t, "Tenant B")
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted")
 
 	for _, l := range []AssetLink{
 		{ID: "al_bad", TenantID: tenantB, SproutID: "s_a", AssetID: "asset_x", LinkedAt: time.Now()},
@@ -460,7 +619,7 @@ func TestRouterAssetLinkRoutes(t *testing.T) {
 	mux := NewRouter()
 	tenantA := mustCreateTenant(t, "Tenant A")
 	tenantB := mustCreateTenant(t, "Tenant B")
-	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted", true)
+	mustInsertFarmerSprout(t, gdb, tenantA, "s_a", "accepted")
 
 	serve := func(method, path, body, tokenTenant string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, strings.NewReader(body))

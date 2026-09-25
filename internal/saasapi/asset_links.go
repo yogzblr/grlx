@@ -9,6 +9,7 @@
 package saasapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,6 +17,9 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"github.com/gogrlx/grlx/v2/internal/heartbeat"
+	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
 const (
@@ -25,21 +29,30 @@ const (
 	// caller-supplied asset_ids per GET .../sprouts call.
 	maxAssetIDsPerLookup = 100
 
-	// maxAssetIDLen / maxSproutIDLen match AssetLink's column sizes. An
-	// ID longer than its column can never have been linked, so it's
+	// maxAssetIDLen matches AssetLink's asset_id column size. An ID
+	// longer than its column can never have been linked, so it's
 	// rejected up front rather than sent to the database.
-	maxAssetIDLen  = 191
-	maxSproutIDLen = 253
+	maxAssetIDLen = 191
 
-	// farmerSproutsTable is farmer's sprout registry, read (never
-	// written) through the saas service account's SELECT grant on
-	// farmer.* (§4.1). This package relies on exactly these columns:
-	//
-	//	id         the sprout_id (the value asset_links.sprout_id holds)
-	//	tenant_id  the owning tenant
-	//	key_state  e.g. "accepted" (§1.4's response field)
-	//	connected  boolean (§1.4's response field)
-	farmerSproutsTable = "farmer.sprouts"
+	// farmerNKeysTable is internal/pki's nkeyRow table — farmer's
+	// sprout identity/lifecycle record — read (never written) through
+	// the saas service account's SELECT grant on farmer.* (§4.1). The
+	// design doc's §1.4 SQL names a farmer.sprouts table that doesn't
+	// exist; this is the real record. Only its tenant_id, sprout_id and
+	// state columns are used (TestFarmerNKeysColumnContract pins them
+	// against pki.Models()).
+	farmerNKeysTable = "farmer.pki_nkeys"
+
+	// heartbeatLookupTimeout bounds the Valkey reads for one §1.4
+	// request's `connected` fields — the same 2s budget
+	// internal/natsapi's probeSprout gives a single lookup.
+	heartbeatLookupTimeout = 2 * time.Second
+
+	// keyStateAccepted is pki's accepted nkey state. Only accepted
+	// sprouts get a heartbeat lookup; any other state reports
+	// connected=false — the same rule internal/natsapi's sprouts.list
+	// and sprouts.get apply.
+	keyStateAccepted = "accepted"
 )
 
 type linkAssetRequest struct {
@@ -68,9 +81,9 @@ type sproutsByAssetResponse struct {
 // LinkAsset handles POST /tenants/{tenant_id}/sprouts/{sprout_id}/asset-link
 // (design doc §1.3).
 //
-// The sprout must belong to the caller's tenant in farmer.sprouts; a
-// sprout that doesn't exist and one that belongs to another tenant are
-// both 404 sprout_not_found (§4 "Tenant safety"). Without this check a
+// The sprout must belong to the caller's tenant in farmer.pki_nkeys (in
+// any key state); a sprout that doesn't exist and one that belongs to
+// another tenant are both 404 sprout_not_found (§4 "Tenant safety"). Without this check a
 // tenant could create a link row pointing at another tenant's sprout_id,
 // squatting on it (sprout_id is globally UNIQUE, §4.2) so its real owner
 // could never link it.
@@ -80,9 +93,9 @@ type sproutsByAssetResponse struct {
 // asset_id uniqueness is 409 asset_link_conflict, with one fixed body
 // regardless of which row it collided with or which tenant owns that
 // row. See the PR description for the residual oracle this leaves: a
-// 409 on an asset_id the caller can't see via §1.4 implies another
-// tenant has linked it — inherent to §4.2 declaring asset_id globally
-// UNIQUE.
+// 409 on an asset_id (or sprout_id) the caller can't see via §1.4
+// implies another tenant has linked it — inherent to §4.2 declaring both
+// columns globally UNIQUE.
 //
 // Not rate-limited: a tenant can create at most one link per sprout it
 // owns, so the table can't grow faster than the tenant's own fleet.
@@ -187,12 +200,19 @@ func UnlinkAsset(w http.ResponseWriter, r *http.Request) {
 // ListSproutsByAssetIDs handles GET
 // /tenants/{tenant_id}/sprouts?asset_ids=a1,a2,... (design doc §1.4).
 //
-// Resolution is the single local SQL join §1.4 specifies — no NATS call.
-// An asset_id the join doesn't return lands in `unresolved`, whatever the
-// reason: never linked, linked by another tenant, or linked here but its
-// sprout is missing from (or owned by another tenant in) farmer.sprouts.
-// The handler never looks at *why* an id didn't resolve, so it has no way
-// to leak the difference.
+// Resolution is two steps, no NATS call: one local SQL join of
+// asset_links against farmer.pki_nkeys for sprout_id/key_state, then a
+// heartbeat.IsOnline (Valkey) read per resolved, accepted sprout for
+// `connected` — the same composition internal/natsapi's sprouts.list
+// uses. `connected` isn't stored in PXC, so it can't be part of the join.
+//
+// Only the join decides what resolves. An asset_id it doesn't return
+// lands in `unresolved`, whatever the reason: never linked, linked by
+// another tenant, or linked here but its sprout is missing from (or
+// owned by another tenant in) pki_nkeys. The handler never looks at
+// *why* an id didn't resolve, so it has no way to leak the difference.
+// The heartbeat step only ever runs for rows the join already scoped to
+// the caller's tenant, keyed by that same tenant_id.
 func ListSproutsByAssetIDs(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenant_id")
 	if !tenantExists(w, tenantID) {
@@ -209,6 +229,7 @@ func ListSproutsByAssetIDs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to resolve asset ids")
 		return
 	}
+	fillConnected(r.Context(), tenantID, rows)
 
 	byAsset := make(map[string]sproutByAssetItem, len(rows))
 	for _, row := range rows {
@@ -268,28 +289,47 @@ func parseAssetIDs(w http.ResponseWriter, values []string) ([]string, bool) {
 	return ids, true
 }
 
-// resolveAssetIDs is §1.4's single local join of farmer.sprouts against
-// saas.asset_links. Beyond the design doc's SQL, the join also requires
-// s.tenant_id = a.tenant_id: LinkAsset already refuses to link another
-// tenant's sprout, but this keeps the read side from ever returning
-// another tenant's key_state/connected even if a bad link row exists.
+// resolveAssetIDs is §1.4's local join of saas.asset_links against
+// farmer.pki_nkeys. It joins on the (tenant_id, sprout_id) pair — pki_nkeys'
+// primary key, since a sprout_id is only unique within a tenant there —
+// so a link row can only ever resolve to a sprout in its own tenant, and
+// the WHERE clause scopes the links themselves to the caller's tenant.
+// key_state is pki_nkeys.state passed through as-is: pki's four states
+// (unaccepted/accepted/denied/rejected) are already the strings
+// internal/natsapi reports as key_state. Connected is left false;
+// fillConnected sets it.
 func resolveAssetIDs(tenantID string, assetIDs []string) ([]sproutByAssetItem, error) {
 	var rows []sproutByAssetItem
-	err := db.Raw(`SELECT a.asset_id AS asset_id, s.id AS sprout_id, s.key_state AS key_state, s.connected AS connected
-FROM `+farmerSproutsTable+` s
-JOIN `+AssetLink{}.TableName()+` a ON a.sprout_id = s.id AND a.tenant_id = s.tenant_id
+	err := db.Raw(`SELECT a.asset_id AS asset_id, n.sprout_id AS sprout_id, n.state AS key_state
+FROM `+AssetLink{}.TableName()+` a
+JOIN `+farmerNKeysTable+` n ON n.tenant_id = a.tenant_id AND n.sprout_id = a.sprout_id
 WHERE a.tenant_id = ? AND a.asset_id IN ?`, tenantID, assetIDs).Scan(&rows).Error
 	return rows, err
 }
 
-// sproutOwnedByTenant reports whether farmer.sprouts has sprout_id under
+// fillConnected sets Connected on each accepted row from its live
+// heartbeat key, under one shared timeout. heartbeat.IsOnline reports
+// false on any Valkey error or an unset client, so a heartbeat outage
+// degrades to connected=false rather than failing the request — the
+// same behavior as internal/natsapi's sprouts.list.
+func fillConnected(ctx context.Context, tenantID string, rows []sproutByAssetItem) {
+	ctx, cancel := context.WithTimeout(ctx, heartbeatLookupTimeout)
+	defer cancel()
+	for i := range rows {
+		if rows[i].KeyState == keyStateAccepted {
+			rows[i].Connected = heartbeat.IsOnline(ctx, tenantID, rows[i].SproutID)
+		}
+	}
+}
+
+// sproutOwnedByTenant reports whether farmer.pki_nkeys has sprout_id under
 // tenant_id — false for both a missing sprout and another tenant's.
 func sproutOwnedByTenant(tenantID, sproutID string) (bool, error) {
-	if sproutID == "" || len(sproutID) > maxSproutIDLen {
+	if !pki.IsValidSproutID(sproutID) {
 		return false, nil
 	}
 	var count int64
-	err := db.Table(farmerSproutsTable).Where("tenant_id = ? AND id = ?", tenantID, sproutID).Count(&count).Error
+	err := db.Table(farmerNKeysTable).Where("tenant_id = ? AND sprout_id = ?", tenantID, sproutID).Count(&count).Error
 	return count > 0, err
 }
 

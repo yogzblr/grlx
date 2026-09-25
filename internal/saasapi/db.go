@@ -20,7 +20,7 @@ func SetDB(d *gorm.DB) { db = d }
 // OpenDB opens a GORM connection to the `saas` schema and migrates the
 // tables this package owns (tenants, provisioning_jobs, enrollment_keys,
 // asset_links — design doc §4.2). It never writes to the `farmer` schema;
-// asset_links.go only reads farmer.sprouts, through the saas service
+// asset_links.go only reads farmer.pki_nkeys, through the saas service
 // account's SELECT grant (§4.1).
 func OpenDB(dsn string) (*gorm.DB, error) {
 	if dsn == "" {

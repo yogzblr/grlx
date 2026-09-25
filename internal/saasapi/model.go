@@ -97,7 +97,9 @@ func (EnrollmentKey) TableName() string { return "enrollment_keys" }
 // only place CloudXP's asset_id enters the system. Both sprout_id and
 // asset_id are globally UNIQUE per §4.2 — one sprout carries at most one
 // asset_id, and one asset_id resolves to at most one sprout, across every
-// tenant. Every query that resolves a caller-supplied sprout_id or
+// tenant. Note farmer's pki_nkeys only keys sprout_id per tenant, so two
+// tenants with a same-named sprout (e.g. "web-01") can't both link it
+// under this constraint — an open question on the PR. Every query that resolves a caller-supplied sprout_id or
 // asset_id against this table still includes tenant_id in its WHERE
 // clause (§4 "Tenant safety"); see asset_links.go.
 type AssetLink struct {
