@@ -160,7 +160,11 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	}
 	t.Setenv("SAASAPI_NATS_NKEY_SEED_FILE", seedFile)
 	t.Setenv("SAASAPI_NATS_USER_JWT", userJWT)
-	nc, err := ConnectBus(LoadConfig())
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	nc, err := ConnectBus(cfg)
 	if err != nil {
 		t.Fatalf("ConnectBus: %v", err)
 	}

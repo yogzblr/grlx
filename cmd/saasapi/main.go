@@ -19,13 +19,24 @@ import (
 )
 
 func main() {
-	cfg := saasapi.LoadConfig()
+	cfg, err := saasapi.LoadConfig()
+	if err != nil {
+		log.Fatalf("saasapi: invalid configuration: %v", err)
+	}
 
 	db, err := saasapi.OpenDB(cfg.DSN)
 	if err != nil {
 		log.Fatalf("saasapi: failed to open saas schema: %v", err)
 	}
 	saasapi.SetDB(db)
+
+	// Before NewRouter, which wires the limiter in effect at that moment
+	// into POST .../enrollment-keys.
+	if err := saasapi.SetEnrollmentKeyRateLimit(cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst); err != nil {
+		log.Fatalf("saasapi: %v", err)
+	}
+	log.Infof("saasapi: enrollment-key issuance limited to %g req/s per tenant per pod, burst %d",
+		cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst)
 
 	// A background context: the JWKS cache's auto-refresh goroutine
 	// (see NewAuthConfig) should live for the whole process, not just

@@ -5,7 +5,10 @@
 package saasapi
 
 import (
+	"fmt"
+	"math"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -47,6 +50,21 @@ import (
 //   - SAASAPI_NATS_CA_FILE: path to the root CA PEM that signed the bus's
 //     server certificate — the same config.RootCA farmer's own
 //     connections trust.
+//
+// The per-tenant rate limit on POST .../enrollment-keys (see router.go's
+// enrollmentKeyIssuanceRate for why the defaults are what they are) is
+// tunable per deployment, e.g. from Helm values:
+//
+//   - SAASAPI_ENROLLMENT_KEY_RATE_LIMIT: sustained requests per second
+//     per tenant, a decimal number > 0 (e.g. "0.5" is one every two
+//     seconds). Default 1.
+//   - SAASAPI_ENROLLMENT_KEY_RATE_BURST: requests a tenant may make back
+//     to back before the sustained rate applies, an integer >= 1.
+//     Default 5.
+//
+// An unparseable or out-of-range value is a startup error, not a silent
+// fallback to the default: a typo in a Helm value shouldn't quietly
+// leave the limit somewhere the operator didn't intend.
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to, e.g. ":8081".
 	ListenAddr string
@@ -85,11 +103,20 @@ type Config struct {
 	NATSNKeySeedFile string
 	// NATSUserJWT is this service's signed NATS User JWT.
 	NATSUserJWT string
+
+	// EnrollmentKeyRateLimit is the sustained per-tenant rate, in
+	// requests per second, for POST .../enrollment-keys.
+	EnrollmentKeyRateLimit float64
+	// EnrollmentKeyRateBurst is the per-tenant burst size for POST
+	// .../enrollment-keys.
+	EnrollmentKeyRateBurst int
 }
 
 // LoadConfig reads the saasapi service's configuration from environment
-// variables, applying sane defaults where possible.
-func LoadConfig() Config {
+// variables, applying sane defaults where possible. It returns an error
+// only for a value that is set but invalid (currently just the
+// enrollment-key rate-limit settings).
+func LoadConfig() (Config, error) {
 	cfg := Config{
 		ListenAddr:   envOrDefault("SAASAPI_LISTEN_ADDR", ":8081"),
 		DSN:          os.Getenv("SAASAPI_DSN"),
@@ -108,8 +135,43 @@ func LoadConfig() Config {
 		NATSCAFile:       os.Getenv("SAASAPI_NATS_CA_FILE"),
 		NATSNKeySeedFile: os.Getenv("SAASAPI_NATS_NKEY_SEED_FILE"),
 		NATSUserJWT:      os.Getenv("SAASAPI_NATS_USER_JWT"),
+
+		EnrollmentKeyRateLimit: float64(enrollmentKeyIssuanceRate),
+		EnrollmentKeyRateBurst: enrollmentKeyIssuanceBurst,
 	}
-	return cfg
+
+	if v := os.Getenv("SAASAPI_ENROLLMENT_KEY_RATE_LIMIT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("saasapi: SAASAPI_ENROLLMENT_KEY_RATE_LIMIT=%q: not a number", v)
+		}
+		cfg.EnrollmentKeyRateLimit = f
+	}
+	if v := os.Getenv("SAASAPI_ENROLLMENT_KEY_RATE_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("saasapi: SAASAPI_ENROLLMENT_KEY_RATE_BURST=%q: not an integer", v)
+		}
+		cfg.EnrollmentKeyRateBurst = n
+	}
+	if err := validateRateLimit(cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst); err != nil {
+		return Config{}, fmt.Errorf("saasapi: enrollment-key rate limit (SAASAPI_ENROLLMENT_KEY_RATE_LIMIT/_BURST): %w", err)
+	}
+	return cfg, nil
+}
+
+// validateRateLimit rejects settings that would silently disable or
+// break a token-bucket limiter: a non-positive, NaN, or infinite rate
+// (rate.Limit(0) denies everything once the burst is spent, rate.Inf
+// allows everything) and a burst below 1 (every request denied).
+func validateRateLimit(perSecond float64, burst int) error {
+	if math.IsNaN(perSecond) || math.IsInf(perSecond, 0) || perSecond <= 0 {
+		return fmt.Errorf("rate must be a finite number of requests per second > 0, got %v", perSecond)
+	}
+	if burst < 1 {
+		return fmt.Errorf("burst must be >= 1, got %d", burst)
+	}
+	return nil
 }
 
 func envOrDefault(key, def string) string {

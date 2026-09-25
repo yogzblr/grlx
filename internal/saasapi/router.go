@@ -1,6 +1,7 @@
 package saasapi
 
 import (
+	"fmt"
 	"net/http"
 
 	"golang.org/x/time/rate"
@@ -25,7 +26,26 @@ const (
 	enrollmentKeyIssuanceBurst int        = 5
 )
 
+// These are the defaults; a deployment overrides them with
+// SAASAPI_ENROLLMENT_KEY_RATE_LIMIT/_BURST (see config.go, and
+// deploy/saasapi/ for the Helm wiring), which main applies via
+// SetEnrollmentKeyRateLimit. The buckets are in-memory, so every figure
+// here is per pod: N replicas allow a tenant up to N times as much.
 var enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(enrollmentKeyIssuanceRate, enrollmentKeyIssuanceBurst)
+
+// SetEnrollmentKeyRateLimit replaces the per-tenant limiter on POST
+// .../enrollment-keys with one allowing perSecond requests/second
+// sustained and bursts up to burst. Like SetDB and SetAuthConfig, call it
+// once at startup: it must run before NewRouter, which wires the limiter
+// in effect at that moment into the route. It replaces any existing
+// per-tenant bucket state.
+func SetEnrollmentKeyRateLimit(perSecond float64, burst int) error {
+	if err := validateRateLimit(perSecond, burst); err != nil {
+		return fmt.Errorf("saasapi: enrollment-key rate limit: %w", err)
+	}
+	enrollmentKeyIssuanceLimiter = NewPerCallerLimiter(rate.Limit(perSecond), burst)
+	return nil
+}
 
 // NewRouter builds the SaaS API's HTTP router (design doc §1.1, §1.2).
 // Every route is wrapped in Auth — see middleware.go for the two-layer

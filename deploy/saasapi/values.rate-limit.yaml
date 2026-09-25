@@ -1,0 +1,18 @@
+# Reference Helm values for saasapi's per-tenant enrollment-key rate
+# limit. NOT used by anything in this repo: saasapi's real Deployment and
+# Helm chart live in the separate ops repo (same situation as
+# deploy/farmer/). Merge this block into that chart's values.yaml, and
+# deployment.env.rate-limit.yaml into its Deployment template.
+#
+# These are the compiled-in defaults (internal/saasapi/router.go). Setting
+# a value to null (or leaving the block out) emits no env var, which also
+# gives the default. See README.md before changing them: the limit is per
+# pod, not cluster-wide.
+enrollmentKeys:
+  rateLimit:
+    # Sustained POST .../enrollment-keys requests per second, per tenant,
+    # per pod. A decimal > 0: 0.5 means one every two seconds.
+    perSecond: 1
+    # Requests a tenant may make back to back before perSecond applies.
+    # An integer >= 1.
+    burst: 5
