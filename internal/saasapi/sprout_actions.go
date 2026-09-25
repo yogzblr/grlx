@@ -58,11 +58,10 @@ const (
 	// Limits on a cmd.run's params. Generous for any real command line;
 	// they exist so one request can't park megabytes in
 	// asset_action_batches.action_params.
-	maxCmdLen     = 4096
-	maxCmdArgs    = 256
-	maxCmdEnvVars = 64
+	maxCmdLen  = 4096
+	maxCmdArgs = 256
 
-	// maxRecipeLen bounds a cook's recipe name (and its env name).
+	// maxRecipeLen bounds a cook's recipe name.
 	maxRecipeLen = 255
 
 	// defaultCmdTimeout applies when a cmd.run request doesn't set
@@ -178,19 +177,23 @@ type sproutActionInput struct {
 // sprout execs the command directly), which is why the split form rejects
 // quoting and shell syntax rather than silently passing them through as
 // literal arguments.
+//
+// There is deliberately no env: environment variables are the usual way
+// to hand a command a secret, and the batch row persists its params
+// (AssetActionBatch.ActionParams). A caller that needs different inputs
+// resubmits a new batch. Sent anyway, env is rejected as an unknown field.
 type cmdRunInput struct {
-	Cmd            string            `json:"cmd"`
-	Args           []string          `json:"args"`
-	CWD            string            `json:"cwd"`
-	Env            map[string]string `json:"env"`
-	RunAs          string            `json:"run_as"`
-	TimeoutSeconds int               `json:"timeout_seconds"`
+	Cmd            string   `json:"cmd"`
+	Args           []string `json:"args"`
+	CWD            string   `json:"cwd"`
+	RunAs          string   `json:"run_as"`
+	TimeoutSeconds int      `json:"timeout_seconds"`
 }
 
-// cookInput is a cook's external params.
+// cookInput is a cook's external params. Like cmd.run, no env: the cook
+// runs in farmer's default environment.
 type cookInput struct {
 	Recipe string `json:"recipe"`
-	Env    string `json:"env"`
 	Test   bool   `json:"test"`
 }
 
@@ -201,17 +204,15 @@ type cookInput struct {
 // TestFarmerActionParamsContract pins the JSON field names against the
 // real types.
 type farmerCmdRun struct {
-	Command string            `json:"command"`
-	Args    []string          `json:"args,omitempty"`
-	CWD     string            `json:"cwd,omitempty"`
-	RunAs   string            `json:"runas,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Timeout time.Duration     `json:"timeout"`
+	Command string        `json:"command"`
+	Args    []string      `json:"args,omitempty"`
+	CWD     string        `json:"cwd,omitempty"`
+	RunAs   string        `json:"runas,omitempty"`
+	Timeout time.Duration `json:"timeout"`
 }
 
 type farmerCook struct {
 	Recipe string `json:"recipe"`
-	Env    string `json:"env,omitempty"`
 	Test   bool   `json:"test,omitempty"`
 }
 
@@ -424,7 +425,7 @@ func translateAction(w http.ResponseWriter, in sproutActionInput) (controlplane.
 	case controlplane.ActionCmdRun:
 		var p cmdRunInput
 		if err := decodeParams(in.Params, &p); err != nil {
-			return invalid("cmd.run params must be an object with cmd and optionally args, cwd, env, run_as, timeout_seconds")
+			return invalid("cmd.run params must be an object with cmd and optionally args, cwd, run_as, timeout_seconds")
 		}
 		out, msg := translateCmdRun(p)
 		if msg != "" {
@@ -434,7 +435,7 @@ func translateAction(w http.ResponseWriter, in sproutActionInput) (controlplane.
 	case controlplane.ActionCook:
 		var p cookInput
 		if err := decodeParams(in.Params, &p); err != nil {
-			return invalid("cook params must be an object with recipe and optionally env, test")
+			return invalid("cook params must be an object with recipe and optionally test")
 		}
 		out, msg := translateCook(p)
 		if msg != "" {
@@ -486,8 +487,6 @@ func translateCmdRun(p cmdRunInput) (farmerCmdRun, string) {
 		return out, "cmd must not contain NUL bytes"
 	case len(p.Args) > maxCmdArgs:
 		return out, "too many args"
-	case len(p.Env) > maxCmdEnvVars:
-		return out, "too many env variables"
 	case p.TimeoutSeconds < 0 || time.Duration(p.TimeoutSeconds)*time.Second > maxCmdTimeout:
 		return out, fmt.Sprintf("timeout_seconds must be between 1 and %d", int(maxCmdTimeout/time.Second))
 	}
@@ -506,12 +505,6 @@ func translateCmdRun(p cmdRunInput) (farmerCmdRun, string) {
 		}
 		out.Args = p.Args
 	}
-	for k, v := range p.Env {
-		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(v, 0) || len(k)+len(v) > maxCmdLen {
-			return out, "env names must be non-empty and contain no '=' or NUL bytes; values must contain no NUL bytes"
-		}
-	}
-	out.Env = p.Env
 	out.CWD = p.CWD
 	out.RunAs = p.RunAs
 	if len(out.CWD) > maxCmdLen || len(out.RunAs) > maxRecipeLen {
@@ -531,12 +524,12 @@ func translateCook(p cookInput) (farmerCook, string) {
 	switch {
 	case recipe == "":
 		return farmerCook{}, "cook requires recipe"
-	case len(recipe) > maxRecipeLen || len(p.Env) > maxRecipeLen:
-		return farmerCook{}, "recipe or env is too long"
-	case strings.ContainsAny(recipe, " \t\r\n\x00") || strings.ContainsAny(p.Env, " \t\r\n\x00"):
-		return farmerCook{}, "recipe and env must not contain whitespace or NUL bytes"
+	case len(recipe) > maxRecipeLen:
+		return farmerCook{}, "recipe is too long"
+	case strings.ContainsAny(recipe, " \t\r\n\x00"):
+		return farmerCook{}, "recipe must not contain whitespace or NUL bytes"
 	}
-	return farmerCook{Recipe: recipe, Env: p.Env, Test: p.Test}, ""
+	return farmerCook{Recipe: recipe, Test: p.Test}, ""
 }
 
 // createActionBatch writes the batch and its items in one transaction and
@@ -797,22 +790,20 @@ const (
 // through. Implementations must scope every lookup by tenantID as well as
 // sprout and jid, and simply omit jobs they can't find.
 //
-// The design doc names this read "farmer.jobs", but farmer keeps no jobs
-// table in PXC: job logs live in object storage
-// (internal/jobs/store.go), keyed by sprout and jid without a tenant. No
-// production implementation is installed until that's settled, so running
-// items stay `running` on GET — see the PR description's open question.
+// The production implementation is farmerJobStatusReader (job_status.go),
+// over farmer's tenant-keyed farmer.job_status index. The design doc calls
+// this read "farmer.jobs"; farmer.job_status is that table.
 type JobStatusReader interface {
 	JobOutcomes(ctx context.Context, tenantID string, jobs []JobRef) (map[JobRef]JobOutcome, error)
 }
 
-// jobStatusReader is set once at startup via SetJobStatusReader; nil means
-// running items aren't refreshed.
-var jobStatusReader JobStatusReader
+// jobStatusReader defaults to the farmer.job_status reader. SetJobStatusReader
+// replaces it; nil means running items aren't refreshed.
+var jobStatusReader JobStatusReader = farmerJobStatusReader{}
 
-// SetJobStatusReader installs the reader GET .../sprouts/actions/{batch_id}
-// refreshes running items through. Call once at startup, before
-// NewRouter's handlers serve requests.
+// SetJobStatusReader replaces the reader GET .../sprouts/actions/{batch_id}
+// refreshes running items through (farmerJobStatusReader by default). Call
+// once at startup, before NewRouter's handlers serve requests.
 func SetJobStatusReader(r JobStatusReader) { jobStatusReader = r }
 
 // refreshRunningItems asks the JobStatusReader about every running item

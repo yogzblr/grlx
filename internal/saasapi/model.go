@@ -206,9 +206,9 @@ func (s AssetActionItemStatus) terminal() bool {
 //
 // ActionParams is the farmer-side internal.sprout.action params exactly as
 // dispatched (see sprout_actions.go's translateAction), kept so a future
-// outbox sweeper can re-send a queued item unchanged. It can hold the
-// command line and environment variables the caller supplied, so it is
-// never returned by the API. RequestedAssetIDs is the JSON array of the
+// outbox sweeper can re-send a queued item unchanged. It holds the command
+// line the caller supplied (never environment variables: the API accepts
+// none), so it is never returned by the API. RequestedAssetIDs is the JSON array of the
 // batch's deduplicated asset_ids, in request order.
 type AssetActionBatch struct {
 	ID                string    `gorm:"column:id;primaryKey;size:32"`

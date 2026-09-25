@@ -53,6 +53,10 @@ func (s *Store) StartReaperCtx(ctx context.Context, ttl time.Duration) {
 // no events have arrived. logJobCreation always writes meta.json, so every
 // job can be dated. A job with neither is left alone.
 func (s *Store) reap(ttl time.Duration) {
+	// The job-status index expires by its own clock (status_index.go),
+	// whether or not the object store is reachable.
+	reapJobStatusIndex(time.Now().Add(-ttl))
+
 	obj, err := s.backend()
 	if err != nil {
 		log.Errorf("reaper: %v", err)

