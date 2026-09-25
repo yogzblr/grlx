@@ -61,7 +61,23 @@ func SetEnrollmentKeyRateLimit(perSecond float64, burst int, vc valkey.Client) e
 	return nil
 }
 
-// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.4, and
+// sproutActionRate/Burst bound how often a single tenant may call POST
+// .../sprouts/actions (§1.5). Each call can trigger up to
+// maxAssetIDsPerLookup remote executions and writes as many
+// asset_action_items rows, so it's limited like enrollment-key issuance:
+// one batch per second sustained per tenant, bursts of 5. That's up to
+// 100 machines a second per tenant — ample for operator-driven batches,
+// while bounding a runaway script. Per pod only for now: there's no
+// SAASAPI_* setting or Valkey wiring for it yet (that lives in
+// cmd/saasapi and deploy/saasapi, outside this change).
+const (
+	sproutActionRate  rate.Limit = 1
+	sproutActionBurst int        = 5
+)
+
+var sproutActionLimiter callerLimiter = NewPerCallerLimiter(sproutActionRate, sproutActionBurst)
+
+// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.5, and
 // §1.8's catalog and update-policy routes).
 // Every route is wrapped in Auth — see middleware.go for the two-layer
 // shared-secret + Keycloak-JWT check it performs, and SetAuthConfig,
@@ -95,10 +111,17 @@ func NewRouter() *http.ServeMux {
 	route(mux, "DELETE /v1/tenants/{tenant_id}/sprouts/{sprout_id}/asset-link", UnlinkAsset, "UnlinkAsset")
 	route(mux, "GET /v1/tenants/{tenant_id}/sprouts", ListSproutsByAssetIDs, "ListSproutsByAssetIDs")
 
+	// Batch sprout actions (§1.5) — see sprout_actions.go. POST is the
+	// SaaS API's remote-execution trigger, so it's rate-limited
+	// (sproutActionRate above); GET is a local read and isn't.
+	routeRateLimited(mux, "POST /v1/tenants/{tenant_id}/sprouts/actions", CreateSproutActionBatch,
+		"CreateSproutActionBatch", sproutActionLimiter)
+	route(mux, "GET /v1/tenants/{tenant_id}/sprouts/actions/{batch_id}", GetSproutActionBatch, "GetSproutActionBatch")
+
 	// Fleet updates (§1.8), catalog and policy only — see
 	// fleet_updates.go. POST .../sprouts/updates and its status endpoint
-	// aren't registered: they depend on §1.5's batch dispatch and on a
-	// working signed sprout self-update path. PATCH .../update-policy
+	// aren't registered: they depend on a working signed sprout
+	// self-update path. PATCH .../update-policy
 	// only rewrites the tenant's single policy row, so it can't grow
 	// state and needs no rate limit.
 	route(mux, "GET /v1/versions", ListFleetVersions, "ListFleetVersions")
