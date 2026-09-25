@@ -69,3 +69,53 @@ func TestPublicWarningMessage(t *testing.T) {
 		t.Fatalf("PublicWarningMessage(unknown) = %q, want a generic message", got)
 	}
 }
+
+func TestValidSaaSAPIReplySubject(t *testing.T) {
+	valid := []string{
+		"_INBOX.saasapi.abc",
+		"_INBOX.saasapi.Ab12CdEf.9", // nats.go's respmux form: prefix.<nuid>.<token>
+		"_INBOX.saasapi.x-y_z.deeper.ok",
+	}
+	for _, s := range valid {
+		if !ValidSaaSAPIReplySubject(s) {
+			t.Errorf("ValidSaaSAPIReplySubject(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{
+		"",
+		"_INBOX.saasapi",                        // the prefix alone
+		"_INBOX.saasapi.",                       // empty token
+		"_INBOX.saasapi..x",                     // empty token
+		"_INBOX.saasapix.abc",                   // not a token boundary
+		"_INBOX.abc",                            // another user's inbox
+		"_INBOX.abc.saasapi.x",                  // prefix not at the start
+		"_INBOX.saasapi.*",                      // wildcard
+		"_INBOX.saasapi.>",                      // wildcard
+		"_INBOX.saasapi.a>",                     // wildcard char inside a token
+		"_INBOX.saasapi.a b",                    // whitespace
+		"_INBOX.saasapi.a\tb",                   // whitespace
+		"$SYS.REQ.CLAIMS.UPDATE",                // server administration
+		"internal.tenant.provisioned.pj_forged", // a forged result
+		"grlx.api.cmd.run",
+		"_INBOX.saasapi." + strings.Repeat("x", 250), // over-long
+	}
+	for _, s := range invalid {
+		if ValidSaaSAPIReplySubject(s) {
+			t.Errorf("ValidSaaSAPIReplySubject(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestSaaSAPIInboxWildcardCoversOnlyThePrefix(t *testing.T) {
+	if SaaSAPIInboxWildcard != "_INBOX.saasapi.>" {
+		t.Fatalf("SaaSAPIInboxWildcard = %q; widening this is a security-review change", SaaSAPIInboxWildcard)
+	}
+}
+
+func TestPublicErrorMessage_SproutActionCodesHaveFixedMessages(t *testing.T) {
+	for _, code := range []ErrorCode{ErrorInvalidRequest, ErrorUnsupportedAction, ErrorSproutNotFound, ErrorSproutUnreachable} {
+		if PublicErrorMessage(code) == PublicErrorMessage(ErrorInternal) {
+			t.Errorf("code %q has no message of its own", code)
+		}
+	}
+}

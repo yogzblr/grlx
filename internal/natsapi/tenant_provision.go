@@ -52,6 +52,11 @@ const (
 // It uses the same natsCoreQueueGroup as grlx.api.> (workstream D's
 // discipline) so that with several farmer replicas, exactly one processes
 // each request. Call once per process, not once per tenant.
+//
+// It also registers internal.sprout.action (RegisterSproutAction), the
+// other SaaS API -> farmer subject on this connection, so that
+// cmd/farmer/main.go's initSystemAccountListeners picks it up through its
+// existing call here.
 func RegisterTenantProvisioning(nc *nats.Conn) error {
 	if _, err := nc.QueueSubscribe(controlplane.SubjectTenantProvision, natsCoreQueueGroup, func(msg *nats.Msg) {
 		handleTenantProvision(nc, msg.Data)
@@ -64,7 +69,7 @@ func RegisterTenantProvisioning(nc *nats.Conn) error {
 		return fmt.Errorf("natsapi: failed to subscribe to %s: %w", controlplane.SubjectTenantDeprovision, err)
 	}
 	log.Info("natsapi: registered tenant provisioning handlers (SYS account)")
-	return nil
+	return RegisterSproutAction(nc)
 }
 
 func handleTenantProvision(nc *nats.Conn, data []byte) {

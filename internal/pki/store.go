@@ -192,6 +192,59 @@ func NKeyExistsInTenant(tenantID, id, nkey string) (registered bool, matches boo
 	return true, row.NKey == nkey
 }
 
+// VerifySproutInTenant is farmer's point-of-effect tenant check for
+// control-plane actions dispatched on a caller's say-so
+// (internal.sprout.action, cloudxp-machine-manager-api-design.md §2.2):
+// it returns nil only if sproutID is an *accepted* sprout whose own stored
+// tenant_id is tenantID, and tenantID is a live tenant (the legacy
+// current-tenant seam, or a non-deleted pki_tenants row). FLAG FOR
+// SECURITY REVIEW.
+//
+// Every "no" — absent row, a row in another state, a stored tenant_id
+// that doesn't match, a deprovisioned tenant — is ErrSproutIDNotFound (or
+// ErrTenantNotFound), never a distinguishable authorization error (§4).
+// A database error is returned wrapped, never disguised as not-found, so
+// a caller can tell "refused" from "couldn't check".
+//
+// The WHERE clause is already keyed on (tenant_id, sprout_id); the
+// explicit comparison of the row's own tenant_id and sprout_id afterwards
+// is deliberate, not redundant. PXC's default collations compare strings
+// case-insensitively, so the query alone would match tenant "T_1"'s row
+// for an asserted "t_1" — and the check must also survive a future edit
+// that drops tenant_id from the query.
+func VerifySproutInTenant(tenantID, sproutID string) error {
+	if !IsValidTenantID(tenantID) {
+		return ErrTenantIDInvalid
+	}
+	if !IsValidSproutID(sproutID) {
+		return ErrSproutIDInvalid
+	}
+	// The legacy tenant has no pki_tenants row (see
+	// ListProvisionedTenantIDs); every other tenant must have a live one.
+	// Deprovisioning leaves a tenant's pki_nkeys rows in place, so the
+	// sprout lookup below alone would still pass for a deleted tenant.
+	if tenantID != currentTenantID() {
+		trow, err := getTenantRow(tenantID)
+		if err != nil {
+			return err
+		}
+		if trow.Deleted || trow.ID != tenantID {
+			return ErrTenantNotFound
+		}
+	}
+	var row nkeyRow
+	if err := db.Where("tenant_id = ? AND sprout_id = ?", tenantID, sproutID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrSproutIDNotFound
+		}
+		return fmt.Errorf("pki: looking up sprout %q in tenant %q: %w", sproutID, tenantID, err)
+	}
+	if row.TenantID != tenantID || row.SproutID != sproutID || row.State != stateAccepted {
+		return ErrSproutIDNotFound
+	}
+	return nil
+}
+
 // upsertTenantRow inserts or (if already present, undeleting it) updates
 // the pki_tenants row for id/name. Idempotent — see ProvisionTenant.
 func upsertTenantRow(row tenantRow) error {
