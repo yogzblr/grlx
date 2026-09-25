@@ -118,3 +118,44 @@ type AssetLink struct {
 }
 
 func (AssetLink) TableName() string { return "asset_links" }
+
+// FleetVersion is the `saas.fleet_versions` table (design doc §4.3,
+// §1.8): CloudXP's own published catalog of sprout versions. It is
+// deliberately not upstream grlx's GitHub release feed — a version only
+// becomes approvable by a tenant once CloudXP has published it here.
+//
+// The catalog is global, not per tenant: every tenant chooses from the
+// same list, and tenant_update_policy records which entry each tenant
+// has approved. Nothing in this package writes it; see fleet_updates.go.
+type FleetVersion struct {
+	ID      string `gorm:"column:id;primaryKey;size:32" json:"-"`
+	Version string `gorm:"column:version;size:64;not null;uniqueIndex" json:"version"`
+	// ArtifactURL is where the release pipeline published the sprout
+	// binary, for the (not yet built) dispatch path to hand to a sprout.
+	// Not part of GET /versions' response; see fleetVersionItem.
+	ArtifactURL    string    `gorm:"column:artifact_url;size:2048;not null" json:"-"`
+	ChecksumSHA256 string    `gorm:"column:checksum_sha256;size:64;not null" json:"checksum_sha256"`
+	ReleasedAt     time.Time `gorm:"column:released_at;not null;index" json:"released_at"`
+	Notes          string    `gorm:"column:notes;type:text" json:"notes,omitempty"`
+}
+
+func (FleetVersion) TableName() string { return "fleet_versions" }
+
+// TenantUpdatePolicy is the `saas.tenant_update_policy` table (design doc
+// §4.3, §1.8): one row per tenant, keyed by tenant_id alone since it holds
+// no sprout-level state. A tenant without a row has the default policy —
+// no approved version, auto_update off — so no sprout of theirs is ever
+// updated until they explicitly approve a version.
+//
+// ApprovedVersion, when set, names a FleetVersion.Version. The rollout
+// window is a pair of absolute UTC instants, both set or both NULL.
+type TenantUpdatePolicy struct {
+	TenantID           string     `gorm:"column:tenant_id;primaryKey;size:32" json:"tenant_id"`
+	ApprovedVersion    *string    `gorm:"column:approved_version;size:64" json:"approved_version"`
+	AutoUpdate         bool       `gorm:"column:auto_update;not null;default:false" json:"auto_update"`
+	RolloutWindowStart *time.Time `gorm:"column:rollout_window_start" json:"rollout_window_start"`
+	RolloutWindowEnd   *time.Time `gorm:"column:rollout_window_end" json:"rollout_window_end"`
+	UpdatedAt          time.Time  `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (TenantUpdatePolicy) TableName() string { return "tenant_update_policy" }

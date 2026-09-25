@@ -61,7 +61,8 @@ func SetEnrollmentKeyRateLimit(perSecond float64, burst int, vc valkey.Client) e
 	return nil
 }
 
-// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.4).
+// NewRouter builds the SaaS API's HTTP router (design doc §1.1–§1.4, and
+// §1.8's catalog and update-policy routes).
 // Every route is wrapped in Auth — see middleware.go for the two-layer
 // shared-secret + Keycloak-JWT check it performs, and SetAuthConfig,
 // which must be called (from main, after NewAuthConfig) before this
@@ -93,6 +94,16 @@ func NewRouter() *http.ServeMux {
 	route(mux, "POST /v1/tenants/{tenant_id}/sprouts/{sprout_id}/asset-link", LinkAsset, "LinkAsset")
 	route(mux, "DELETE /v1/tenants/{tenant_id}/sprouts/{sprout_id}/asset-link", UnlinkAsset, "UnlinkAsset")
 	route(mux, "GET /v1/tenants/{tenant_id}/sprouts", ListSproutsByAssetIDs, "ListSproutsByAssetIDs")
+
+	// Fleet updates (§1.8), catalog and policy only — see
+	// fleet_updates.go. POST .../sprouts/updates and its status endpoint
+	// aren't registered: they depend on §1.5's batch dispatch and on a
+	// working signed sprout self-update path. PATCH .../update-policy
+	// only rewrites the tenant's single policy row, so it can't grow
+	// state and needs no rate limit.
+	route(mux, "GET /v1/versions", ListFleetVersions, "ListFleetVersions")
+	route(mux, "GET /v1/tenants/{tenant_id}/update-policy", GetUpdatePolicy, "GetUpdatePolicy")
+	route(mux, "PATCH /v1/tenants/{tenant_id}/update-policy", PatchUpdatePolicy, "PatchUpdatePolicy")
 
 	return mux
 }
