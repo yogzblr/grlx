@@ -38,7 +38,14 @@ func setupNatsAPIPKI(t *testing.T) string {
 		t.Fatalf("migrating pki test db: %v", err)
 	}
 	pki.SetDB(gdb)
-	t.Cleanup(func() { pki.SetDB(sharedPKIDB) })
+	t.Cleanup(func() {
+		pki.SetDB(sharedPKIDB)
+		// A shared-cache in-memory DB lives as long as any connection to
+		// it is open; close it so a rerun (-count=N) starts empty.
+		if sqlDB, err := gdb.DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
 
 	tmpDir := t.TempDir()
 	pkiDir := filepath.Join(tmpDir, "pki") + "/"

@@ -32,6 +32,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,13 +58,43 @@ var (
 
 const auditActionSproutAction = controlplane.SubjectSproutAction
 
-// sproutActionConcurrency bounds how many internal.sprout.action requests
-// one farmer process runs at once. A cmd.run holds its slot until the
-// sprout answers (up to its timeout), so handling requests serially —
+// EnvSproutActionConcurrency sets how many internal.sprout.action
+// requests one farmer process runs at once (see sproutActionConcurrency).
+// Read once, when RegisterSproutAction is called.
+const EnvSproutActionConcurrency = "GRLX_SPROUT_ACTION_CONCURRENCY"
+
+// Bounds for EnvSproutActionConcurrency. A cmd.run holds its slot until
+// the sprout answers (up to its timeout), so handling requests serially —
 // NATS's default for one subscription — would let one slow sprout stall a
 // whole §1.5 batch. When every slot is busy the subscription callback
 // blocks, and further requests queue in the subscription's pending buffer.
-const sproutActionConcurrency = 64
+// The ceiling keeps a typo from turning into an unbounded goroutine count
+// on a privileged surface.
+const (
+	defaultSproutActionConcurrency = 64
+	maxSproutActionConcurrency     = 1024
+)
+
+// sproutActionConcurrency returns EnvSproutActionConcurrency's value, or
+// the default if it's unset or not a positive integer, clamped to
+// maxSproutActionConcurrency. A bad value is logged, never fatal: it only
+// tunes throughput.
+func sproutActionConcurrency() int {
+	raw := strings.TrimSpace(os.Getenv(EnvSproutActionConcurrency))
+	if raw == "" {
+		return defaultSproutActionConcurrency
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		log.Warnf("natsapi: ignoring %s=%q (want a positive integer); using %d", EnvSproutActionConcurrency, raw, defaultSproutActionConcurrency)
+		return defaultSproutActionConcurrency
+	}
+	if n > maxSproutActionConcurrency {
+		log.Warnf("natsapi: %s=%d exceeds the maximum; using %d", EnvSproutActionConcurrency, n, maxSproutActionConcurrency)
+		return maxSproutActionConcurrency
+	}
+	return n
+}
 
 // maxSproutActionCmdTimeout caps a cmd.run's own timeout. The handler
 // waits for the sprout for 15s plus this long, holding a concurrency slot
@@ -83,7 +115,8 @@ var errSproutActionInvalid = errors.New("invalid internal.sprout.action request"
 // Call once per process, not once per tenant. RegisterTenantProvisioning
 // calls it, so it is registered wherever the tenant subjects are.
 func RegisterSproutAction(nc *nats.Conn) error {
-	slots := make(chan struct{}, sproutActionConcurrency)
+	concurrency := sproutActionConcurrency()
+	slots := make(chan struct{}, concurrency)
 	if _, err := nc.QueueSubscribe(controlplane.SubjectSproutAction, natsCoreQueueGroup, func(msg *nats.Msg) {
 		// Checked before decoding or doing anything else: a request with
 		// no valid SaaS API inbox is dropped, not executed and not
@@ -109,7 +142,7 @@ func RegisterSproutAction(nc *nats.Conn) error {
 	}); err != nil {
 		return fmt.Errorf("natsapi: failed to subscribe to %s: %w", controlplane.SubjectSproutAction, err)
 	}
-	log.Info("natsapi: registered sprout action handler (SYS account)")
+	log.Infof("natsapi: registered sprout action handler (SYS account, concurrency %d)", concurrency)
 	return nil
 }
 
