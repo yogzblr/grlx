@@ -1,8 +1,9 @@
 package pki
 
 // The SaaS API's own NATS identity — a narrowly-scoped User under the SYS
-// Account, carrying exactly the platform-level internal.tenant.* subjects
-// internal/saasapi needs to drive tenant provisioning through farmer. See
+// Account, carrying exactly the platform-level internal.* subjects
+// internal/saasapi needs to drive tenant provisioning and sprout actions
+// through farmer. See
 // docs/design/grlx-internal-api-account.md for why SYS (rather than the
 // legacy tenant Account, or a new dedicated one), and why these
 // permissions and nothing more.
@@ -50,20 +51,33 @@ func SaaSAPIUserJWTPath() string { return filepath.Join(natsAuthDir(), "users", 
 func sysAccountJWTPath() string { return filepath.Join(natsAuthDir(), "sys-account.jwt") }
 
 // saasAPIUserPermissions is the SaaS API's entire NATS reach: publish the
-// two request subjects, subscribe to their per-job result subjects.
-// Deliberately absent: _INBOX.> (neither flow is request-reply), grlx.>
-// (any tenant's business traffic), $SYS.> (server administration), and
-// internal.sprout.* (no farmer handler exists for those yet — add them
-// here when one does, with a scoped inbox; see the design doc).
+// two tenant request subjects and internal.sprout.action; subscribe to the
+// tenant flows' per-job result subjects and to its own reply inboxes.
+//
+// The inbox grant is scoped to controlplane.SaaSAPIInboxWildcard
+// (_INBOX.saasapi.>), never a bare _INBOX.>: every SYS user's default
+// inbox lives under _INBOX, so the bare form would let this credential
+// subscribe to farmer's own SYS user's replies. The SaaS API has to dial
+// with nats.CustomInboxPrefix(controlplane.SaaSAPIInboxPrefix) for its
+// requests to get replies at all. Pub on the inbox is deliberately not
+// granted: replies come from farmer.
+//
+// Deliberately absent: grlx.> (any tenant's business traffic), $SYS.>
+// (server administration), subscribe on any internal.* request subject
+// (only farmer receives requests), and the internal.sprout.* subjects
+// that have no farmer handler yet (mint, revoke, enrolled,
+// internal.sprouts.list) — add each here when its handler lands.
 func saasAPIUserPermissions() jwt.Permissions {
 	return jwt.Permissions{
 		Pub: jwt.Permission{Allow: jwt.StringList{
 			controlplane.SubjectTenantProvision,
 			controlplane.SubjectTenantDeprovision,
+			controlplane.SubjectSproutAction,
 		}},
 		Sub: jwt.Permission{Allow: jwt.StringList{
 			controlplane.SubjectTenantProvisionedWildcard,
 			controlplane.SubjectTenantDeprovisionedWildcard,
+			controlplane.SaaSAPIInboxWildcard,
 		}},
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/nats-io/nkeys"
 
 	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/controlplane"
 )
 
 // permissionErrors collects the asynchronous -ERR 'Permissions Violation'
@@ -42,6 +43,27 @@ func (p *permissionErrors) waitFor(subject string) bool {
 		p.mu.Lock()
 		for _, e := range p.errs {
 			if strings.Contains(e, "Permissions Violation") && strings.Contains(e, `"`+subject+`"`) {
+				p.mu.Unlock()
+				return true
+			}
+		}
+		p.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+// waitForOp is waitFor narrowed to one direction — op is "Publish" or
+// "Subscription", as the server words it — for tests that check the same
+// subject both ways, where a publish denial would otherwise satisfy the
+// subscribe check.
+func (p *permissionErrors) waitForOp(op, subject string) bool {
+	want := "Permissions Violation for " + op + ` to "` + subject + `"`
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		for _, e := range p.errs {
+			if strings.Contains(e, want) {
 				p.mu.Unlock()
 				return true
 			}
@@ -171,6 +193,154 @@ func TestSaaSAPICredential_ScopedOnLiveBus(t *testing.T) {
 		if !perrs.waitFor(subj) {
 			t.Errorf("expected subscribe to %q to be denied", subj)
 		}
+	}
+}
+
+// TestSaaSAPICredential_SproutActionScopedOnLiveBus proves the
+// internal.sprout.action grant (FLAG FOR SECURITY REVIEW): the credential
+// can make the request-reply round trip through farmer's SYS connection,
+// but only with replies on its own _INBOX.saasapi.> inboxes — it still
+// can't reach grlx.api.* or grlx.sprouts.*, can't receive farmer's
+// requests, and can't subscribe to (or publish into) any other SYS user's
+// reply inbox.
+func TestSaaSAPICredential_SproutActionScopedOnLiveBus(t *testing.T) {
+	setupTestPKI(t)
+	defer startTestBus(t)()
+
+	userJWT, seed, err := EnsureSaaSAPICredential()
+	if err != nil {
+		t.Fatalf("EnsureSaaSAPICredential: %v", err)
+	}
+
+	// Farmer's side: its SYS connection answers internal.sprout.action the
+	// way natsapi.RegisterSproutAction does, from its own unrestricted SYS
+	// user, in the same queue group.
+	farmer, err := ConnectSystemAccount()
+	if err != nil {
+		t.Fatalf("ConnectSystemAccount: %v", err)
+	}
+	defer farmer.Close()
+	var replyTo []string
+	var replyMu sync.Mutex
+	if _, err := farmer.QueueSubscribe(controlplane.SubjectSproutAction, "grlx-core", func(msg *nats.Msg) {
+		replyMu.Lock()
+		replyTo = append(replyTo, msg.Reply)
+		replyMu.Unlock()
+		_ = msg.Respond([]byte(`{"status":"completed"}`))
+	}); err != nil {
+		t.Fatalf("farmer subscribe: %v", err)
+	}
+	// Another SYS user's live reply inbox, and the tenant/sprout subjects
+	// the credential must never reach.
+	farmerInbox := farmer.NewInbox()
+	farmerReplies, _ := farmer.SubscribeSync(farmerInbox)
+	grlxAPI, _ := farmer.SubscribeSync("grlx.api.>")
+	grlxSprouts, _ := farmer.SubscribeSync("grlx.sprouts.>")
+	if err := farmer.Flush(); err != nil {
+		t.Fatalf("farmer flush: %v", err)
+	}
+	if strings.HasPrefix(farmerInbox, controlplane.SaaSAPIInboxPrefix+".") {
+		t.Fatalf("farmer's own inbox %q falls under the SaaS API's inbox prefix", farmerInbox)
+	}
+
+	var perrs permissionErrors
+	saas, err := dialWithCreds(t, userJWT, seed,
+		nats.ErrorHandler(perrs.handler),
+		nats.CustomInboxPrefix(controlplane.SaaSAPIInboxPrefix))
+	if err != nil {
+		t.Fatalf("expected the SaaS API credential to connect: %v", err)
+	}
+	defer saas.Close()
+
+	// Allowed: the full request-reply round trip, reply on a scoped inbox.
+	msg, err := saas.Request(controlplane.SubjectSproutAction, []byte(`{}`), 2*time.Second)
+	if err != nil {
+		t.Fatalf("expected internal.sprout.action to round-trip through farmer: %v", err)
+	}
+	if string(msg.Data) != `{"status":"completed"}` {
+		t.Fatalf("unexpected reply %q", msg.Data)
+	}
+	replyMu.Lock()
+	gotReply := append([]string(nil), replyTo...)
+	replyMu.Unlock()
+	if len(gotReply) != 1 || !controlplane.ValidSaaSAPIReplySubject(gotReply[0]) {
+		t.Fatalf("farmer saw reply subjects %v, want one scoped SaaS API inbox", gotReply)
+	}
+	if got := perrs.any(); len(got) != 0 {
+		t.Fatalf("unexpected permission errors on allowed operations: %v", got)
+	}
+
+	// Denied publishes: tenant API and sprout subjects, the not-yet-built
+	// internal.sprout* subjects, and any reply inbox — its own included
+	// (replies come from farmer) and, above all, farmer's, where a publish
+	// would forge a reply to one of farmer's own requests.
+	for _, subj := range []string{
+		"grlx.api.cmd.run",
+		"grlx.api.cook",
+		"grlx.sprouts.web-01.cmd.run",
+		"grlx.sprouts.web-01.cook",
+		"internal.sprout.mint",
+		"internal.sprout.revoke",
+		"internal.sprouts.list",
+		farmerInbox,
+		controlplane.SaaSAPIInboxPrefix + ".forged",
+	} {
+		_ = saas.Publish(subj, []byte(`{}`))
+		_ = saas.Flush()
+		if !perrs.waitForOp("Publish", subj) {
+			t.Errorf("expected publish to %q to be denied", subj)
+		}
+	}
+	for name, sub := range map[string]*nats.Subscription{"grlx.api": grlxAPI, "grlx.sprouts": grlxSprouts, "farmer inbox": farmerReplies} {
+		if _, err := sub.NextMsg(200 * time.Millisecond); err == nil {
+			t.Errorf("a %s publish from the SaaS API credential was delivered", name)
+		}
+	}
+
+	// Denied subscribes: farmer's request subject (only farmer receives
+	// requests), every other SYS user's inboxes, and tenant traffic.
+	for _, subj := range []string{
+		controlplane.SubjectSproutAction,
+		"internal.sprout.>",
+		"internal.>",
+		farmerInbox,
+		farmerInbox + ".*",
+		"_INBOX.*",
+		"_INBOX.*.>",
+		"_INBOX.>",
+		"_INBOX.saasapix.>",
+		"grlx.api.>",
+		"grlx.sprouts.>",
+		"grlx.sprouts.*.cmd.run",
+	} {
+		if _, err := saas.SubscribeSync(subj); err != nil {
+			t.Fatalf("SubscribeSync(%q) returned a local error: %v", subj, err)
+		}
+		_ = saas.Flush()
+		if !perrs.waitForOp("Subscription", subj) {
+			t.Errorf("expected subscribe to %q to be denied", subj)
+		}
+	}
+
+	// Without the scoped prefix the same credential gets no replies at
+	// all: nats.go's default response inbox (_INBOX.<nuid>.*) is refused.
+	var bareErrs permissionErrors
+	bare, err := dialWithCreds(t, userJWT, seed, nats.ErrorHandler(bareErrs.handler))
+	if err != nil {
+		t.Fatalf("connect without the inbox prefix: %v", err)
+	}
+	defer bare.Close()
+	if _, err := bare.Request(controlplane.SubjectSproutAction, []byte(`{}`), 500*time.Millisecond); err == nil {
+		t.Fatal("expected a request with a bare _INBOX reply to get no reply")
+	}
+	denied := false
+	for _, e := range bareErrs.any() {
+		if strings.Contains(e, `Permissions Violation for Subscription to "_INBOX.`) {
+			denied = true
+		}
+	}
+	if !denied {
+		t.Fatalf("expected the default _INBOX response subscription to be denied, got %v", bareErrs.any())
 	}
 }
 

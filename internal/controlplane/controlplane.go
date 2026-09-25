@@ -11,7 +11,11 @@
 // docs/design/grlx-internal-api-account.md for that decision and why.
 package controlplane
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+	"time"
+)
 
 // Request subjects, published by the SaaS API and queue-subscribed by
 // farmer. Fire-and-forget (design doc §2.2): no NATS reply is expected;
@@ -19,6 +23,26 @@ import "strings"
 const (
 	SubjectTenantProvision   = "internal.tenant.provision"
 	SubjectTenantDeprovision = "internal.tenant.deprovision"
+)
+
+// SubjectSproutAction is the one request-reply subject in this package
+// (design doc §2.2): published by the SaaS API with a reply inbox under
+// SaaSAPIInboxPrefix, queue-subscribed by farmer, which replies directly
+// on that inbox. It dispatches a single action to a single, already
+// resolved sprout — the SaaS API fans a §1.5 batch out into one request
+// per item.
+const SubjectSproutAction = "internal.sprout.action"
+
+// SaaSAPIInboxPrefix is the only reply-inbox prefix the SaaS API's NATS
+// User may subscribe to (pki's saasAPIUserPermissions grants
+// SaaSAPIInboxWildcard, never a bare _INBOX.>), so it can't subscribe to
+// other SYS users' reply inboxes. The SaaS API must dial with
+// nats.CustomInboxPrefix(SaaSAPIInboxPrefix), or its own replies are
+// refused by the bus. Farmer, in turn, refuses to reply anywhere else
+// (ValidSaaSAPIReplySubject).
+const (
+	SaaSAPIInboxPrefix   = "_INBOX.saasapi"
+	SaaSAPIInboxWildcard = SaaSAPIInboxPrefix + ".>"
 )
 
 // Result subject prefixes, published by farmer with the job's ID as the
@@ -35,10 +59,18 @@ const (
 // Result statuses farmer reports. A provision succeeds as StatusActive; a
 // deprovision succeeds as StatusOffboarded; either can fail as
 // StatusFailed with Error set.
+//
+// internal.sprout.action replies use StatusCompleted (a cmd.run the sprout
+// ran and answered — which says nothing about the command's own exit code,
+// see CmdRunResult.ExitCode), StatusDispatched (a cook, which runs
+// asynchronously under the returned JID), or StatusFailed.
 const (
 	StatusActive     = "active"
 	StatusOffboarded = "offboarded"
 	StatusFailed     = "failed"
+
+	StatusCompleted  = "completed"
+	StatusDispatched = "dispatched"
 )
 
 // ErrorCode classifies a failed provisioning result. Farmer never puts raw
@@ -58,12 +90,35 @@ const (
 	ErrorTenantNotFound ErrorCode = "tenant_not_found"
 	// ErrorInternal: anything else. The detail stays in farmer's logs.
 	ErrorInternal ErrorCode = "internal_error"
+
+	// internal.sprout.action only:
+
+	// ErrorInvalidRequest: the request was malformed (bad JSON, a bad
+	// tenant or sprout ID, or params that don't decode for the action).
+	ErrorInvalidRequest ErrorCode = "invalid_request"
+	// ErrorUnsupportedAction: action.type isn't one farmer handles.
+	ErrorUnsupportedAction ErrorCode = "unsupported_action"
+	// ErrorSproutNotFound: farmer's point-of-effect check failed — no
+	// accepted sprout with that ID is registered under the asserted
+	// tenant, or the tenant itself isn't live. Deliberately the same code
+	// for "doesn't exist" and "belongs to another tenant" (design doc §4:
+	// a mismatch resolves to not-found, never a distinguishable
+	// authorization error).
+	ErrorSproutNotFound ErrorCode = "sprout_not_found"
+	// ErrorSproutUnreachable: the sprout is registered but didn't answer
+	// (offline, or the command outlived its timeout).
+	ErrorSproutUnreachable ErrorCode = "sprout_unreachable"
 )
 
 var publicErrorMessages = map[ErrorCode]string{
 	ErrorInvalidTenantID: "the tenant ID was rejected by the provisioning service",
 	ErrorTenantNotFound:  "the tenant is not known to the provisioning service",
 	ErrorInternal:        "an internal error occurred during provisioning; retry or contact support",
+
+	ErrorInvalidRequest:    "the action request was rejected as malformed",
+	ErrorUnsupportedAction: "the action type is not supported",
+	ErrorSproutNotFound:    "the sprout is not known to this tenant",
+	ErrorSproutUnreachable: "the sprout did not respond; it may be offline",
 }
 
 // PublicErrorMessage returns the fixed, caller-safe message for code. An
@@ -130,6 +185,80 @@ type TenantResult struct {
 	Status      string      `json:"status"`
 	ErrorCode   ErrorCode   `json:"error_code,omitempty"`
 	WarningCode WarningCode `json:"warning_code,omitempty"`
+}
+
+// Action types for SproutActionRequest.Action.Type. ActionSelfUpdate is
+// part of the design (§1.8) but has no farmer handler yet: farmer answers
+// it with ErrorUnsupportedAction.
+const (
+	ActionCmdRun     = "cmd.run"
+	ActionCook       = "cook"
+	ActionSelfUpdate = "self_update"
+)
+
+// SproutActionRequest is the internal.sprout.action payload. TenantID is
+// the SaaS API's assertion, not a fact: farmer independently checks it
+// against the sprout's own stored tenant before doing anything (the
+// point-of-effect check, design doc §2.2).
+type SproutActionRequest struct {
+	TenantID string       `json:"tenant_id"`
+	SproutID string       `json:"sprout_id"`
+	Action   SproutAction `json:"action"`
+}
+
+// SproutAction is one action to run on one sprout. Params is the action
+// payload farmer's own grlx.api.cmd.run / grlx.api.cook handlers take
+// (internal/api/types CmdRun / CmdCook, e.g. {"command": "systemctl",
+// "args": ["restart", "nginx"]} or {"recipe": "nginx.harden"}) — mapping
+// the SaaS API's external request shape onto it is the SaaS API's job.
+type SproutAction struct {
+	Type   string          `json:"type"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+// SproutActionReply is farmer's reply to internal.sprout.action. Like
+// TenantResult it carries only a fixed ErrorCode on failure, never error
+// text. Result is set for a completed cmd.run (a CmdRunResult); JID for a
+// dispatched cook.
+type SproutActionReply struct {
+	TenantID  string        `json:"tenant_id"`
+	SproutID  string        `json:"sprout_id"`
+	Status    string        `json:"status"`
+	JID       string        `json:"jid,omitempty"`
+	Result    *CmdRunResult `json:"result,omitempty"`
+	ErrorCode ErrorCode     `json:"error_code,omitempty"`
+}
+
+// CmdRunResult is what a sprout reported for a cmd.run. A non-zero
+// ExitCode is still StatusCompleted: the action ran; whether the command
+// succeeded is the caller's call.
+type CmdRunResult struct {
+	Stdout   string        `json:"stdout"`
+	Stderr   string        `json:"stderr"`
+	ExitCode int           `json:"exit_code"`
+	Duration time.Duration `json:"duration"`
+}
+
+// ValidSaaSAPIReplySubject reports whether subject is a reply inbox farmer
+// may answer an internal.sprout.action request on: a literal subject (no
+// wildcards, no empty tokens, no whitespace) strictly under
+// SaaSAPIInboxPrefix. Farmer replies from its SYS user, which has no
+// permission restrictions, and NATS doesn't check a publisher's
+// permissions against the reply subject it sets — so without this, the
+// SaaS API credential could name any subject as its "inbox" (another
+// user's inbox, $SYS.REQ.*, a forged internal.tenant.provisioned.*
+// result) and have farmer publish there on its behalf.
+func ValidSaaSAPIReplySubject(subject string) bool {
+	rest, ok := strings.CutPrefix(subject, SaaSAPIInboxPrefix+".")
+	if !ok || rest == "" || len(subject) > 255 {
+		return false
+	}
+	for _, tok := range strings.Split(rest, ".") {
+		if tok == "" || strings.ContainsAny(tok, " \t\r\n*>") {
+			return false
+		}
+	}
+	return true
 }
 
 // maxJobIDLen matches saas.provisioning_jobs.id's column size.
