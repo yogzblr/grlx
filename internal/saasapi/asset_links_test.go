@@ -202,7 +202,7 @@ func TestLinkAssetCreatesTenantScopedRow(t *testing.T) {
 	}
 
 	var stored AssetLink
-	if err := gdb.First(&stored, "sprout_id = ?", "s_1").Error; err != nil {
+	if err := gdb.First(&stored, "tenant_id = ? AND sprout_id = ?", tenantID, "s_1").Error; err != nil {
 		t.Fatalf("loading stored link: %v", err)
 	}
 	if stored.TenantID != tenantID || stored.AssetID != "a1" || !strings.HasPrefix(stored.ID, assetLinkIDPrefix) {
