@@ -12,6 +12,10 @@ first, then the specific design doc named in your task.
 - No CGO (blocks a CGO-free build target elsewhere in the plan).
 - Follow the existing self-registering ingredient plugin pattern
   (see internal/ingredients/*) for any new ingredient.
+- `sprout_id` is unique per tenant only, never globally: always key
+  tables, indexes, caches and maps on `(tenant_id, sprout_id)` — keying on
+  `sprout_id` alone is a cross-tenant collision bug. See §4 "Tenant
+  safety" in docs/design/cloudxp-machine-manager-api-design.md.
 
 ## Workflow
 - Work only within the file scope stated in your task brief. If you need
