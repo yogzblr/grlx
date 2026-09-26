@@ -49,12 +49,8 @@ import (
 
 	nats "github.com/nats-io/nats.go"
 	valkey "github.com/valkey-io/valkey-go"
+	"gorm.io/gorm"
 )
-
-func init() {
-	config.LoadConfig("farmer")
-	log.SetLogLevel(config.LogLevel)
-}
 
 var (
 	// srvMu guards the apiServer package global, read by the shutdown path
@@ -117,7 +113,10 @@ func readinessTenantStats() handlers.TenantConnStats {
 }
 
 func main() {
+	// Loaded here rather than in init(), so this package's tests don't
+	// read or create the system farmer config (/etc/grlx/farmer).
 	config.LoadConfig("farmer")
+	log.SetLogLevel(config.LogLevel)
 	// One-shot subcommands run before any server initialization (storage,
 	// Valkey, OpenBao PKI/Transit clients): they need only the config and
 	// PKI directory loaded above. See internal/saasapicred.
@@ -244,15 +243,32 @@ func main() {
 // clause as the row's own key — see their store.go doc comments for the
 // current seam (config.FarmerOrganization) and why it isn't yet a
 // per-request value.
+//
+// jobs owns farmer.job_status, the tenant-keyed cook job-status index the
+// SaaS API polls (internal/jobs/status_index.go). Indexing is off until
+// jobs.SetDB is called, so it's migrated and installed here with the rest.
 func initStorage() {
-	models := append(append(props.Models(), pki.Models()...), rbac.Models()...)
-	db, err := pxc.OpenDB(config.PXCDSN, models...)
+	db, err := pxc.OpenDB(config.PXCDSN, storageModels()...)
 	if err != nil {
 		log.Fatalf("failed to open PXC farmer schema: %v", err)
 	}
+	installStorage(db)
+}
+
+// storageModels is every GORM model in the farmer schema, migrated in one
+// AutoMigrate call by initStorage.
+func storageModels() []any {
+	models := append(append(props.Models(), pki.Models()...), rbac.Models()...)
+	return append(models, jobs.Models()...)
+}
+
+// installStorage hands the migrated farmer-schema handle to every package
+// that reads or writes through it.
+func installStorage(db *gorm.DB) {
 	props.SetDB(db)
 	pki.SetDB(db)
 	rbac.SetDB(db)
+	jobs.SetDB(db)
 	handlers.SetReadinessDB(db)
 }
 
