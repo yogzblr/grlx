@@ -60,6 +60,12 @@ type mockTransit struct {
 	// bytes than it was given.
 	tamper bool
 	signs  int
+	// older are earlier key versions Transit still holds but no longer
+	// signs with (below version). minEncryption/minDecryption are the
+	// key's floors as Transit reports them.
+	older         map[int]ed25519.PublicKey
+	minEncryption int
+	minDecryption int
 }
 
 func newMockTransit(t *testing.T) *mockTransit {
@@ -103,13 +109,22 @@ func (m *mockTransit) serve(t *testing.T) string {
 				deny()
 				return
 			}
-			der, _ := x509.MarshalPKIXPublicKey(m.pub)
-			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"type": "ed25519",
-				"keys": map[string]any{strconv.Itoa(m.version): map[string]any{
+			keys := map[string]any{}
+			add := func(v int, pub ed25519.PublicKey) {
+				der, _ := x509.MarshalPKIXPublicKey(pub)
+				keys[strconv.Itoa(v)] = map[string]any{
 					"public_key": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})),
-				}},
-				"min_encryption_version": 1,
+				}
+			}
+			add(m.version, m.pub)
+			for v, pub := range m.older {
+				add(v, pub)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"type":                   "ed25519",
+				"keys":                   keys,
+				"min_encryption_version": m.minEncryption,
+				"min_decryption_version": m.minDecryption,
 			}})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -286,5 +301,68 @@ func TestRun_UsageErrors(t *testing.T) {
 	t.Setenv(EnvDSN, "")
 	if code := run([]string{"-version", "v1", "-artifact-url", "https://a.example.com/x", "-checksum-sha256", strings.ToUpper(testChecksum)}, &stdout, &stderr); code != 2 {
 		t.Errorf("missing DSN: exit %d, want 2", code)
+	}
+}
+
+// Rotation grace period: v2 is the only version new signatures use
+// (min_encryption_version=2), but Transit still verifies v1
+// (min_decryption_version=1). A release already published under v1 is
+// valid for every verifier, so re-running fleetreleaser for it must say
+// "unchanged" — not refuse it as an invalid signature — and must not
+// re-sign it. Once v1 is retired (min_decryption_version=2), the same row
+// is refused, matching the verifiers again.
+func TestPublish_GracePeriodExistingRowSignedByOlderVersion(t *testing.T) {
+	m := newMockTransit(t) // signs with m.version
+	m.version = 2
+	oldPub, oldPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.older = map[int]ed25519.PublicKey{1: oldPub}
+	m.minEncryption, m.minDecryption = 2, 1
+	signer := newSigner(t, m, "signer")
+	db := newTestDB(t)
+
+	rel := testRelease()
+	msg, _ := rel.Message()
+	v1Sig := fleetsign.EncodeSignature(1, ed25519.Sign(oldPriv, msg))
+	if err := db.Create(&saasapi.FleetVersion{ID: "fv_v1", Version: rel.Version, ArtifactURL: rel.ArtifactURL,
+		ChecksumSHA256: rel.ChecksumSHA256, Signature: v1Sig, ReleasedAt: time.Now()}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := publish(t.Context(), db, signer, rel, "", time.Now())
+	if err != nil || out != outcomeUnchanged {
+		t.Fatalf("publish during grace period = %q, %v; want unchanged", out, err)
+	}
+	if m.signs != 0 {
+		t.Fatalf("Transit was asked to sign %d time(s) for an already-valid row", m.signs)
+	}
+
+	// A new release during the grace period is signed with v2, and the
+	// post-sign self-verify still passes.
+	next := rel
+	next.Version = "v2.4.2"
+	if out, err := publish(t.Context(), db, signer, next, "", time.Now()); err != nil || out != outcomeInserted {
+		t.Fatalf("new release during grace period = %q, %v", out, err)
+	}
+	var row saasapi.FleetVersion
+	db.First(&row, "version = ?", next.Version)
+	if !strings.HasPrefix(row.Signature, "v2:") {
+		t.Fatalf("new release signed as %q, want v2", row.Signature)
+	}
+
+	// v1 retired for verification: the old row is now refused, and left
+	// as it was.
+	m.minDecryption = 2
+	if _, err := publish(t.Context(), db, signer, rel, "", time.Now()); !errors.Is(err, errExistingSignatureInvalid) {
+		t.Fatalf("publish after retiring v1 = %v, want errExistingSignatureInvalid", err)
+	}
+	var old saasapi.FleetVersion
+	if err := db.First(&old, "id = ?", "fv_v1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if old.Signature != v1Sig {
+		t.Fatal("refused row was modified")
 	}
 }

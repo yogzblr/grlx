@@ -265,7 +265,9 @@ func (c *obTransitClient) sign(ctx context.Context, input []byte) ([]byte, int, 
 }
 
 // keySet calls GET /v1/<mount>/keys/<key>, for verifying a signature
-// right after Transit produced it (and before anything is written).
+// right after Transit produced it (and before anything is written), and
+// for judging an existing row's signature (publish's unchanged/refuse
+// decision).
 func (c *obTransitClient) keySet(ctx context.Context) (fleetsign.KeySet, error) {
 	token, err := c.currentToken(ctx)
 	if err != nil {
@@ -277,7 +279,9 @@ func (c *obTransitClient) keySet(ctx context.Context) (fleetsign.KeySet, error) 
 			Keys map[string]struct {
 				PublicKey string `json:"public_key"`
 			} `json:"keys"`
-			MinEncryptionVersion int `json:"min_encryption_version"`
+			// MinDecryptionVersion is the floor Transit's own /verify
+			// honors; see the filter below.
+			MinDecryptionVersion int `json:"min_decryption_version"`
 		} `json:"data"`
 		Errors []string `json:"errors"`
 	}
@@ -291,20 +295,26 @@ func (c *obTransitClient) keySet(ctx context.Context) (fleetsign.KeySet, error) 
 	if rr.Data.Type != "ed25519" {
 		return nil, fmt.Errorf("%w: Transit key %q is type %q, want ed25519", errReadKeyFailed, c.keyName, rr.Data.Type)
 	}
+	// Same floor as every verifier (fleetsign's readKeySet):
+	// min_decryption_version, the floor Transit's own /verify honors, with
+	// 0 meaning unrestricted. So publish judges an existing row's signature
+	// exactly as farmer, saasapi and the sprouts will: during a rotation
+	// grace period, a row signed by a version below min_encryption_version
+	// but at or above min_decryption_version is still valid, not a
+	// conflict. A signature Transit has just produced is always by a
+	// version >= min_encryption_version >= min_decryption_version, so the
+	// post-sign self-verify is unaffected.
+	minVersion := rr.Data.MinDecryptionVersion
+	if minVersion < 1 {
+		minVersion = 1
+	}
 	keys := make([]fleetsign.PublicKey, 0, len(rr.Data.Keys))
 	for k, v := range rr.Data.Keys {
 		version, err := strconv.Atoi(k)
 		if err != nil {
 			return nil, fmt.Errorf("%w: unexpected key version %q", errReadKeyFailed, k)
 		}
-		// Signer-side floor: min_encryption_version, which is always >=
-		// the verifiers' min_decryption_version floor (fleetsign's
-		// readKeySet). Stricter than they are, so a signature that
-		// verifies here verifies on every sprout, farmer and saasapi.
-		// The flip side: during a rotation grace period, an existing
-		// row signed by a version below min_encryption_version fails
-		// this check even though every verifier still accepts it.
-		if version < rr.Data.MinEncryptionVersion {
+		if version < minVersion {
 			continue
 		}
 		pub, err := fleetsign.ParseEd25519PublicKeyPEM(v.PublicKey)
