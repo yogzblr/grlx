@@ -52,11 +52,6 @@ import (
 	"gorm.io/gorm"
 )
 
-func init() {
-	config.LoadConfig("farmer")
-	log.SetLogLevel(config.LogLevel)
-}
-
 var (
 	// srvMu guards the apiServer package global, read by the shutdown path
 	// in main and written/read by handleSIGHUP concurrently.
@@ -118,7 +113,10 @@ func readinessTenantStats() handlers.TenantConnStats {
 }
 
 func main() {
+	// Loaded here rather than in init(), so this package's tests don't
+	// read or create the system farmer config (/etc/grlx/farmer).
 	config.LoadConfig("farmer")
+	log.SetLogLevel(config.LogLevel)
 	// One-shot subcommands run before any server initialization (storage,
 	// Valkey, OpenBao PKI/Transit clients): they need only the config and
 	// PKI directory loaded above. See internal/saasapicred.
