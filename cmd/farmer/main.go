@@ -33,6 +33,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/cook"
 	"github.com/gogrlx/grlx/v2/internal/facts"
+	"github.com/gogrlx/grlx/v2/internal/fleetsign"
 	"github.com/gogrlx/grlx/v2/internal/gatewayjwt"
 	"github.com/gogrlx/grlx/v2/internal/heartbeat"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/cmd"
@@ -131,6 +132,7 @@ func main() {
 	recipeStore := initRecipeStore()
 	jobStore := initJobStore()
 	initGatewaySigner()
+	initFleetKeySource()
 	initHeartbeatClient()
 	props.LoadStaticProps(config.StaticProps())
 	loadCohortRegistry()
@@ -374,6 +376,25 @@ func initGatewaySigner() {
 	pki.SetGatewaySigner(signer)
 	handlers.SetGatewaySigner(signer)
 	log.Info("Gateway JWT signer configured")
+}
+
+// initFleetKeySource wires up farmer's READ-ONLY view of the
+// grlx-fleet-signing Transit key (internal/fleetsign, design doc §2.5):
+// served ungated as a JWKS, returned in POST /v1/enroll for the sprout to
+// pin, and used to re-verify a release before a self_update is
+// dispatched. The token behind GRLX_FLEETSIGN_OPENBAO_* must carry only
+// deploy/fleetreleaser/policies/grlx-fleet-verify.hcl; farmer never signs
+// releases (cmd/fleetreleaser does). Not fatal if unconfigured, like
+// initGatewaySigner: POST /v1/enroll and self_update fail closed instead.
+func initFleetKeySource() {
+	src, err := fleetsign.NewTransitKeySourceFromEnv()
+	if err != nil {
+		log.Errorf("fleet signing key not configured (POST /v1/enroll and self_update will fail until it is): %v", err)
+		return
+	}
+	handlers.SetFleetKeySource(src)
+	natsapi.SetFleetKeySource(src)
+	log.Infof("Fleet signing key source configured (read-only, Transit key %s)", src.KeyName())
 }
 
 // initHeartbeatClient connects the Valkey client connection-state reads

@@ -127,6 +127,8 @@ func (AssetLink) TableName() string { return "asset_links" }
 // The catalog is global, not per tenant: every tenant chooses from the
 // same list, and tenant_update_policy records which entry each tenant
 // has approved. Nothing in this package writes it; see fleet_updates.go.
+// Rows are written by cmd/fleetreleaser, the only holder of sign
+// capability on the grlx-fleet-signing Transit key (§2.5).
 type FleetVersion struct {
 	ID      string `gorm:"column:id;primaryKey;size:32" json:"-"`
 	Version string `gorm:"column:version;size:64;not null;uniqueIndex" json:"version"`
@@ -138,6 +140,14 @@ type FleetVersion struct {
 	ChecksumSHA256 string    `gorm:"column:checksum_sha256;size:64;not null" json:"checksum_sha256"`
 	ReleasedAt     time.Time `gorm:"column:released_at;not null;index" json:"released_at"`
 	Notes          string    `gorm:"column:notes;type:text" json:"notes,omitempty"`
+	// Signature is cmd/fleetreleaser's Ed25519 signature over
+	// version|artifact_url|checksum_sha256, in fleetsign.EncodeSignature's
+	// "v<key version>:<base64>" format (§2.5). A row written before this
+	// column existed gets "" from AutoMigrate's default, and "" is always
+	// refused for dispatch — by saasapi here, by farmer, and by the
+	// sprout — never treated as checksum-only trust. Not part of GET
+	// /versions' response.
+	Signature string `gorm:"column:signature;size:128;not null;default:''" json:"-"`
 }
 
 func (FleetVersion) TableName() string { return "fleet_versions" }

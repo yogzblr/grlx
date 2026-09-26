@@ -3,9 +3,11 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 
 	"github.com/gogrlx/grlx/v2/internal/config"
+	"github.com/gogrlx/grlx/v2/internal/fleetsign"
 	"github.com/gogrlx/grlx/v2/internal/gatewayjwt"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
@@ -91,6 +94,29 @@ func withFakeGatewaySigner(t *testing.T) {
 	t.Cleanup(func() { pki.SetGatewaySigner(nil) })
 }
 
+// staticFleetKeys is a fleetsign.KeySetSource over a fixed key set.
+type staticFleetKeys struct {
+	ks  fleetsign.KeySet
+	err error
+}
+
+func (s staticFleetKeys) KeySet(context.Context) (fleetsign.KeySet, error) { return s.ks, s.err }
+
+// withFakeFleetKeySource installs a fixed fleet signing key set for the
+// duration of the test, standing in for farmer's read-only Transit
+// client (internal/fleetsign's own tests cover that client).
+func withFakeFleetKeySource(t *testing.T) fleetsign.KeySet {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks, _ := fleetsign.NewKeySet([]fleetsign.PublicKey{{Version: 1, Key: pub}})
+	SetFleetKeySource(staticFleetKeys{ks: ks})
+	t.Cleanup(func() { SetFleetKeySource(nil) })
+	return ks
+}
+
 func TestEnroll_InvalidJSON(t *testing.T) {
 	setupPKIDirs(t)
 
@@ -148,6 +174,7 @@ func TestEnroll_IdempotentReplaySucceeds(t *testing.T) {
 	config.FarmerWSPort = "5407"
 	withFakeGatewaySigner(t)
 	withFakeTenantBoxOpenBao(t)
+	fleetKeys := withFakeFleetKeySource(t)
 
 	nkey := generateTestUserNKey(t)
 	if err := pki.UnacceptNKey(pki.CurrentTenantID(), "web-01", nkey); err != nil {
@@ -184,6 +211,14 @@ func TestEnroll_IdempotentReplaySucceeds(t *testing.T) {
 	if resp.TenantX25519Pub == "" {
 		t.Error("expected non-empty tenant_x25519_pub")
 	}
+	// The sprout pins exactly the key set farmer's Transit source reports.
+	pinned, err := fleetsign.ParseJWKS(resp.FleetSigningJWKS)
+	if err != nil {
+		t.Fatalf("fleet_signing_jwks does not parse: %v (%s)", err, resp.FleetSigningJWKS)
+	}
+	if len(pinned) != 1 || pinned[0].Version != 1 || !pinned[0].Key.Equal(fleetKeys[0].Key) {
+		t.Errorf("fleet_signing_jwks = %+v, want %+v", pinned, fleetKeys)
+	}
 	wantURL := "wss://127.0.0.1:5407"
 	if len(resp.NatsURLs) != 1 || resp.NatsURLs[0] != wantURL {
 		t.Errorf("expected nats_urls [%q], got %v", wantURL, resp.NatsURLs)
@@ -201,5 +236,55 @@ func assertEnrollFailed(t *testing.T, w *httptest.ResponseRecorder) {
 	}
 	if resp.Error != "enrollment_failed" {
 		t.Errorf("expected generic enrollment_failed error, got %q", resp.Error)
+	}
+}
+
+// Without the fleet signing key the sprout couldn't pin it, so enrollment
+// fails closed — generically, like every other enrollment failure (§3.4)
+// — rather than handing out an identity that can never verify an update.
+func TestEnroll_FailsClosedWithoutFleetSigningKey(t *testing.T) {
+	for name, src := range map[string]fleetsign.KeySetSource{
+		"not configured":     nil,
+		"Transit unreadable": staticFleetKeys{err: errors.New("permission denied")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setupPKIDirs(t)
+			withFakeGatewaySigner(t)
+			withFakeTenantBoxOpenBao(t)
+			SetFleetKeySource(src)
+			t.Cleanup(func() { SetFleetKeySource(nil) })
+
+			nkey := generateTestUserNKey(t)
+			if err := pki.UnacceptNKey(pki.CurrentTenantID(), "web-01", nkey); err != nil {
+				t.Fatalf("UnacceptNKey: %v", err)
+			}
+			if err := pki.AcceptNKey(pki.CurrentTenantID(), "web-01"); err != nil {
+				t.Fatalf("AcceptNKey: %v", err)
+			}
+			body, _ := json.Marshal(enrollRequest{JoinToken: "irrelevant.token", NKeyPub: nkey, Hostname: "web-01", SproutPub: generateTestBoxPub(t)})
+			w := httptest.NewRecorder()
+			Enroll(w, httptest.NewRequest(http.MethodPost, "/v1/enroll", bytes.NewReader(body)))
+			assertEnrollFailed(t, w)
+		})
+	}
+}
+
+func TestFleetSigningJWKS(t *testing.T) {
+	SetFleetKeySource(nil)
+	w := httptest.NewRecorder()
+	FleetSigningJWKS(w, httptest.NewRequest(http.MethodGet, "/v1/.well-known/fleet-signing-jwks.json", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured: status %d, want 503", w.Code)
+	}
+
+	ks := withFakeFleetKeySource(t)
+	w = httptest.NewRecorder()
+	FleetSigningJWKS(w, httptest.NewRequest(http.MethodGet, "/v1/.well-known/fleet-signing-jwks.json", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	got, err := fleetsign.ParseJWKS(w.Body.Bytes())
+	if err != nil || len(got) != 1 || !got[0].Key.Equal(ks[0].Key) {
+		t.Fatalf("served %s (%v)", w.Body, err)
 	}
 }

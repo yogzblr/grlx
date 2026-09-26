@@ -16,6 +16,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
+	"github.com/gogrlx/grlx/v2/internal/fleetsign"
 	"github.com/gogrlx/grlx/v2/internal/heartbeat"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 	"github.com/gogrlx/grlx/v2/internal/saasapi"
@@ -92,6 +93,7 @@ func main() {
 	// (Envoy, workstream H) in front of this service, consistent with the
 	// design doc's architecture diagram (§0) showing CloudXP/tenants
 	// reaching the SaaS API over REST without this binary owning certs.
+	initFleetKeySource(cfg)
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      newRouter(cfg),
@@ -140,6 +142,26 @@ func main() {
 func newRouter(cfg saasapi.Config) *http.ServeMux {
 	saasapi.SetFleetUpdateDispatchEnabled(cfg.FleetUpdateDispatchEnabled)
 	return saasapi.NewRouter()
+}
+
+// initFleetKeySource gives saasapi its READ-ONLY view of the
+// grlx-fleet-signing Transit key (GRLX_FLEETSIGN_OPENBAO_*, design doc
+// §2.5), which POST .../sprouts/updates verifies each catalog row
+// against. Only needed with fleet update dispatch on, and fatal then: a
+// replica that accepted rollouts it couldn't verify would refuse every
+// one of them anyway. The token must carry only the grlx-fleet-verify
+// policy — saasapi already writes saas.fleet_versions and must never
+// also be able to sign it (deploy/fleetreleaser/README.md).
+func initFleetKeySource(cfg saasapi.Config) {
+	if !cfg.FleetUpdateDispatchEnabled {
+		return
+	}
+	src, err := fleetsign.NewTransitKeySourceFromEnv()
+	if err != nil {
+		log.Fatalf("saasapi: fleet update dispatch is enabled but the fleet signing key isn't configured: %v", err)
+	}
+	saasapi.SetFleetKeySource(src)
+	log.Infof("saasapi: fleet signing key source configured (read-only, Transit key %s)", src.KeyName())
 }
 
 // initHeartbeatClient points internal/heartbeat at the same Valkey client

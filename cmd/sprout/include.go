@@ -12,6 +12,7 @@ import (
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/sdb/azurekv"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/sdb/gcpsm"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/sdb/openbao"
+	_ "github.com/gogrlx/grlx/v2/internal/ingredients/selfupdate"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/user"
 	_ "github.com/gogrlx/grlx/v2/internal/ingredients/wait"
 )

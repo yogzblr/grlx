@@ -80,7 +80,10 @@ import (
 //     .../sprouts/updates and its status endpoint (design doc §1.8).
 //     Default false. Leave it off until sprout has a working signed
 //     self-update path (gogrlx/grlx#286). Any value strconv.ParseBool
-//     doesn't accept is a startup error.
+//     doesn't accept is a startup error. With it on, the read-only fleet
+//     signing key client must also be configured
+//     (GRLX_FLEETSIGN_OPENBAO_*, internal/fleetsign; design doc §2.5), or
+//     saasapi refuses to start.
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to, e.g. ":8081".
 	ListenAddr string

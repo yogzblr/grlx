@@ -81,6 +81,13 @@ var (
 	SproutPKI             string
 	SproutRootCA          string
 
+	// SproutFleetSigningJWKS is where a sprout pins the grlx-fleet-signing
+	// public key set it received at enrollment (POST /v1/enroll's
+	// fleet_signing_jwks, design doc §2.5) — next to SproutRootCA, with
+	// the same write-once lifecycle (pki.PinFleetSigningKeys). The
+	// selfupdate ingredient verifies every release against it.
+	SproutFleetSigningJWKS string
+
 	// GatewayJWTTTL bounds how long a minted gateway JWT
 	// (internal/gatewayjwt) stays valid. Short by design: Envoy's
 	// jwt_authn has no live revocation check of its own, so this expiry
@@ -362,6 +369,7 @@ func LoadConfig(binary string) {
 			jety.SetDefault("sproutid", "")
 			jety.SetDefault("sproutpki", filepath.Join(systemConfigRoot, "pki/sprout")+"/")
 			jety.SetDefault("sproutrootca", filepath.Join(systemConfigRoot, "pki/sprout/tls-rootca.pem"))
+			jety.SetDefault("sproutfleetsigningjwks", filepath.Join(systemConfigRoot, "pki/sprout/fleet-signing-jwks.json"))
 			jety.SetDefault("nkeysproutpubfile", filepath.Join(systemConfigRoot, "pki/sprout/sprout.nkey.pub"))
 			jety.SetDefault("joblogdir", "/var/cache/grlx/sprout/jobs")
 			jety.SetDefault("joblogttl", 30*24*time.Hour) // 30 days default
@@ -427,6 +435,7 @@ func LoadConfig(binary string) {
 	SproutID = jety.GetString("sproutid")
 	SproutPKI = jety.GetString("sproutpki")
 	SproutRootCA = jety.GetString("sproutrootca")
+	SproutFleetSigningJWKS = jety.GetString("sproutfleetsigningjwks")
 	RecipeDir = jety.GetString("recipedir")
 	if RecipeDir == "" {
 		RecipeDir = filepath.Join("/", "srv", "grlx", "recipes", "prod")

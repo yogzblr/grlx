@@ -187,14 +187,25 @@ type TenantResult struct {
 	WarningCode WarningCode `json:"warning_code,omitempty"`
 }
 
-// Action types for SproutActionRequest.Action.Type. ActionSelfUpdate is
-// part of the design (§1.8) but has no farmer handler yet: farmer answers
-// it with ErrorUnsupportedAction.
+// Action types for SproutActionRequest.Action.Type. ActionSelfUpdate's
+// params are SelfUpdateParams.
 const (
 	ActionCmdRun     = "cmd.run"
 	ActionCook       = "cook"
 	ActionSelfUpdate = "self_update"
 )
+
+// SelfUpdateParams is a self_update action's params (design doc §2.2):
+// one saas.fleet_versions row, signature included. Farmer re-verifies
+// Signature against the grlx-fleet-signing public key before dispatching
+// (§2.5), and the sprout verifies it again against its pinned copy before
+// fetching anything; a missing or invalid signature is refused at each.
+type SelfUpdateParams struct {
+	Version        string `json:"version"`
+	ArtifactURL    string `json:"artifact_url"`
+	ChecksumSHA256 string `json:"checksum_sha256"`
+	Signature      string `json:"signature"`
+}
 
 // SproutActionRequest is the internal.sprout.action payload. TenantID is
 // the SaaS API's assertion, not a fact: farmer independently checks it
