@@ -1,17 +1,18 @@
 package pki
 
-// Sprout-side pinning of the grlx-fleet-signing public key set (design
-// doc §2.5). The sprout receives it once, in POST /v1/enroll's
+// Sprout-side storage of the enrollment-time grlx-fleet-signing public key
+// set (design doc §2.5). The sprout receives it once, in POST /v1/enroll's
 // fleet_signing_jwks, and keeps it next to its root CA
 // (config.SproutRootCA) with the same lifecycle: written the first time,
-// never silently replaced afterwards. Every self-update is verified
-// against this file, so a later response — or anything else able to
-// write through this path — can't swap in a different key.
+// never silently replaced afterwards.
 //
-// FLAG FOR SECURITY REVIEW. Key rotation: a sprout pinned before a new
-// Transit key version existed can't verify releases signed by it. Rotating
-// grlx-fleet-signing therefore needs a re-pin procedure (an operator
-// removes the file and the sprout re-enrolls) — see §2.5's open items.
+// FLAG FOR SECURITY REVIEW. This pin is a BOOTSTRAP FALLBACK ONLY, not the
+// sprout's root of trust for releases. Releases are verified against the
+// key set fetched live from farmer over the SproutRootCA-pinned NATS
+// connection (internal/fleetkeys), which follows Transit key rotations;
+// this file is consulted only until the first live fetch succeeds, after
+// which internal/ingredients/selfupdate (keys.go) marks it superseded and
+// never uses it again.
 
 import (
 	"bytes"

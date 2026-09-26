@@ -73,6 +73,14 @@ func newFixture(t *testing.T) *fixture {
 		return nil
 	}
 	t.Cleanup(func() { install = origInstall })
+
+	// By default farmer is unreachable for keys and none has ever been
+	// fetched, so these tests run on the enrollment-time bootstrap key;
+	// keys_test.go covers the live path.
+	resetLiveKeys()
+	origFetch := fetchLiveKeys
+	fetchLiveKeys = func(context.Context) (fleetsign.KeySet, error) { return nil, errors.New("no connection to farmer") }
+	t.Cleanup(func() { fetchLiveKeys = origFetch; resetLiveKeys() })
 	return f
 }
 

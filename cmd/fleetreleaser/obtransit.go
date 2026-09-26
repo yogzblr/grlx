@@ -277,7 +277,7 @@ func (c *obTransitClient) keySet(ctx context.Context) (fleetsign.KeySet, error) 
 			Keys map[string]struct {
 				PublicKey string `json:"public_key"`
 			} `json:"keys"`
-			MinDecryptionVersion int `json:"min_decryption_version"`
+			MinEncryptionVersion int `json:"min_encryption_version"`
 		} `json:"data"`
 		Errors []string `json:"errors"`
 	}
@@ -297,7 +297,10 @@ func (c *obTransitClient) keySet(ctx context.Context) (fleetsign.KeySet, error) 
 		if err != nil {
 			return nil, fmt.Errorf("%w: unexpected key version %q", errReadKeyFailed, k)
 		}
-		if version < rr.Data.MinDecryptionVersion {
+		// Same floor as fleetsign's readKeySet (and gatewayjwt's
+		// PublicKeys), so a signature that verifies here verifies on
+		// every sprout.
+		if version < rr.Data.MinEncryptionVersion {
 			continue
 		}
 		pub, err := fleetsign.ParseEd25519PublicKeyPEM(v.PublicKey)

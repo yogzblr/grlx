@@ -375,8 +375,8 @@ from the gateway JWT key. The row stores it as
 |---|---|---|
 | `cmd/fleetreleaser` | **sign** + read public key (`grlx-fleet-signer` policy) | Run by CloudXP's release pipeline. Signs the row and writes it straight to `saas.fleet_versions` with its own DB user. It never calls the SaaS API. |
 | saasapi | read + verify only (`grlx-fleet-verify`) | Refuses to create a rollout (§1.8) from a row whose signature is missing or invalid. |
-| farmer | read + verify only (`grlx-fleet-verify`, its own role) | Serves the public key ungated at `GET /v1/.well-known/fleet-signing-jwks.json`, the same trust model as §2.4. Returns it as `fleet_signing_jwks` in `POST /v1/enroll`. Re-verifies before it dispatches a `self_update`. |
-| sprout | none | Pins `fleet_signing_jwks` at enrollment, next to `SproutRootCA`, write-once. Verifies against that pinned copy **before** it fetches anything. Then fetches with `SproutRootCA` as the only TLS root and checks the SHA-256 afterwards. |
+| farmer | read + verify only (`grlx-fleet-verify`, its own role) | Serves the key's current versions live to each sprout on `grlx.sprouts.<id>.fleetsigningkeys`, queue-subscribed on each tenant connection. The set is every version at or above `min_encryption_version`, as in gatewayjwt's `PublicKeys`. Also serves them ungated at `GET /v1/.well-known/fleet-signing-jwks.json`, the same trust model as §2.4. Returns a bootstrap copy as `fleet_signing_jwks` in `POST /v1/enroll`. Re-verifies before it dispatches a `self_update`. |
+| sprout | none | Verifies against the **live** key set, fetched over its SproutRootCA-pinned NATS connection, **before** it fetches the artifact. It accepts any version in the set; the set is cached for 5 min, and a miss refetches immediately. The enrollment-time pin, stored next to `SproutRootCA`, is a bootstrap fallback only until the first live fetch succeeds. It then fetches the artifact with `SproutRootCA` as the only TLS root and checks the SHA-256 afterwards. |
 
 **Why the split.** saasapi already has PXC write access to
 `saas.fleet_versions` (§4.1). If the same identity could also sign with
@@ -404,9 +404,17 @@ fallback. Policies, roles, the DB grant and the manual checks are in
 - **Install.** The sprout's `selfupdate` step verifies and stages the
   artifact, then fails with "install not implemented". Installing is
   §2.3's backup/restore work.
-- **Key rotation.** A sprout that pinned before a new Transit key version
-  existed can't verify releases signed by that version, so rotation
-  needs a re-pin procedure.
+- **Key retirement stays manual.** Rotation is handled by the live fetch.
+  Retiring a version means raising `min_encryption_version`, and that is
+  an operator decision under one constraint: never retire a version that
+  signed a release still approved in any tenant's
+  `tenant_update_policy` (`deploy/fleetreleaser/README.md`, "Rotating the
+  key").
+- **Trust in the live key set.** A sprout trusts whoever answers on
+  `grlx.sprouts.<id>.fleetsigningkeys`. Only farmer and grlx.>-template
+  Users in the tenant's Account can answer, and they can already run
+  commands on the sprout (`internal/fleetkeys`). A reviewer should confirm
+  that equivalence holds for every User template that exists.
 - **Downgrade and replay.** Any validly signed row, old versions
   included, is accepted. Nothing binds a signature to the tenant's
   approved version or orders versions yet.

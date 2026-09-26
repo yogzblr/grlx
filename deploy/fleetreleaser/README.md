@@ -24,7 +24,7 @@ the ops repo.
 | `cmd/fleetreleaser` (release pipeline Job) | `grlx-fleet-signer`: **sign**, read | its own user: `SELECT`, `INSERT`, `UPDATE (signature)` |
 | saasapi | `grlx-fleet-verify`: read, verify | `saas_svc`: `ALL ON saas.*` (unchanged) |
 | farmer | `grlx-fleet-verify`: read, verify | `farmer_svc`: `SELECT ON saas.*` (unchanged) |
-| sprout | none. It uses the key pinned at enrollment | none |
+| sprout | none. It gets the live key set from farmer over its own NATS connection; the enrollment-time key is a bootstrap fallback only | none |
 
 The rule this table enforces is that **no identity holds both Transit
 sign on `grlx-fleet-signing` and a way to change what
@@ -41,10 +41,42 @@ bao write -f transit/keys/grlx-fleet-signing type=ed25519 exportable=false allow
 
 - Use a new key. Do not reuse `grlx-gateway-jwt`.
 - Never set `exportable=true` or `allow_plaintext_backup=true`.
-- **Don't rotate it casually.** Each sprout pins the key versions that
-  exist when it enrolls. A release signed with a later version fails
-  verification on every sprout that enrolled earlier. Rotation needs a
-  re-pin procedure, which isn't designed yet (§2.5, open items).
+### Rotating the key
+
+**The rotation step itself is safe.** Run
+`bao write -f transit/keys/grlx-fleet-signing/rotate`.
+
+- fleetreleaser signs new releases with the new version.
+- Sprouts pick it up without re-enrolling. They verify against the key
+  set farmer serves live on `grlx.sprouts.<id>.fleetsigningkeys`. That
+  set holds every version at or above `min_encryption_version`, the same
+  selection as `internal/gatewayjwt`'s `PublicKeys`.
+- Sprouts cache that set for 5 minutes. A signature by a version missing
+  from the cache triggers an immediate refetch.
+
+**Retiring a version is not automated, on purpose, and has a hard
+constraint.** You retire version N by raising `min_encryption_version`
+past it (`bao write transit/keys/grlx-fleet-signing/config
+min_encryption_version=N+1`).
+
+- That removes N from the live set, so every sprout stops accepting
+  signatures made with N within about 5 minutes. Farmer's pre-dispatch
+  check and saasapi's rollout check stop accepting them too.
+- **Never raise `min_encryption_version` past a version that signed a
+  release still named as `approved_version` in any tenant's
+  `saas.tenant_update_policy`.** That tenant's approved release would
+  stop verifying fleet-wide, and its rollouts would fail.
+- Before raising it, check that every approved version was signed at or
+  above the new floor. The key version is the `v<N>:` prefix of
+  `saas.fleet_versions.signature`. If one wasn't, re-sign it with
+  fleetreleaser under the new version first. Only then retire the old
+  version.
+- This is an operator decision. Nothing in grlx raises
+  `min_encryption_version`, trims key versions or retires them
+  automatically.
+
+Don't use `min_decryption_version` for this. The verifiers deliberately
+follow `min_encryption_version`, as `PublicKeys` does.
 
 ## Roles
 

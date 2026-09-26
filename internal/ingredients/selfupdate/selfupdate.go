@@ -3,10 +3,13 @@
 // internal.sprout.action self_update. Its single method, apply:
 //
 //  1. verifies the release's Ed25519 signature over
-//     version|artifact_url|checksum_sha256 against the grlx-fleet-signing
-//     key set this sprout pinned at enrollment (pki.PinFleetSigningKeys) —
-//     BEFORE any network request. A missing signature, an invalid one, or
-//     no pinned key is a refusal; there is no checksum-only fallback;
+//     version|artifact_url|checksum_sha256 against grlx-fleet-signing's
+//     current key versions, fetched live from farmer over the sprout's
+//     SproutRootCA-pinned NATS connection (keys.go; the enrollment-time
+//     pin is only a bootstrap fallback until the first live fetch
+//     succeeds) — BEFORE any request to the artifact host. A missing
+//     signature, an invalid one, or no usable key set is a refusal; there
+//     is no checksum-only fallback;
 //  2. downloads the artifact with internal/ingredients/file/http's
 //     provider, trusting only config.SproutRootCA for the artifact host's
 //     TLS certificate (the same root the sprout's farmer/NATS connection
@@ -37,7 +40,6 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/fleetsign"
 	"github.com/gogrlx/grlx/v2/internal/ingredients"
 	fhttp "github.com/gogrlx/grlx/v2/internal/ingredients/file/http"
-	"github.com/gogrlx/grlx/v2/internal/pki"
 )
 
 var (
@@ -51,12 +53,9 @@ var (
 	ErrInstallNotImplemented = errors.New("selfupdate: installing a verified artifact is not implemented yet (design doc §2.3, gogrlx/grlx#286)")
 )
 
-// Seams for tests. Production code always uses these values.
+// install receives a staged artifact whose signature and checksum have
+// both been verified. A seam for tests; see the package doc.
 var (
-	// loadPinnedKeys reads the key set pinned at enrollment.
-	loadPinnedKeys = pki.LoadPinnedFleetSigningKeys
-	// install receives a staged artifact whose signature and checksum
-	// have both been verified.
 	install = func(_ context.Context, _ fleetsign.Release, stagedPath string) error {
 		return fmt.Errorf("%w; verified artifact left at %s", ErrInstallNotImplemented, stagedPath)
 	}
@@ -126,27 +125,25 @@ func failed(err error, notes ...fmt.Stringer) (cook.Result, error) {
 	return cook.Result{Succeeded: false, Failed: true, Notes: notes}, err
 }
 
-// verify checks the release's signature against the pinned key set. It
-// makes no network request.
-func (s SelfUpdate) verify() (fleetsign.Release, error) {
+// verify checks the release's signature against the trusted key set
+// (keys.go). Its only network traffic is the key fetch from farmer; the
+// artifact host is never contacted.
+func (s SelfUpdate) verify(ctx context.Context) (fleetsign.Release, keySource, error) {
 	rel, sig, err := s.release()
 	if err != nil {
-		return rel, err
+		return rel, "", err
 	}
-	keys, err := loadPinnedKeys()
+	src, err := verifyRelease(ctx, rel, sig)
 	if err != nil {
-		return rel, fmt.Errorf("selfupdate: refusing %s: %w", rel.Version, err)
+		return rel, "", fmt.Errorf("selfupdate: refusing %s: %w", rel.Version, err)
 	}
-	if err := keys.Verify(rel, sig); err != nil {
-		return rel, fmt.Errorf("selfupdate: refusing %s: %w", rel.Version, err)
-	}
-	return rel, nil
+	return rel, src, nil
 }
 
 func (s SelfUpdate) apply(ctx context.Context) (cook.Result, error) {
 	// 1. Signature first: nothing is fetched for a release that isn't
-	// signed by the pinned key.
-	rel, err := s.verify()
+	// signed by a trusted key version.
+	rel, src, err := s.verify(ctx)
 	if err != nil {
 		return failed(err)
 	}
@@ -183,7 +180,7 @@ func (s SelfUpdate) apply(ctx context.Context) (cook.Result, error) {
 	}
 
 	// 4. Install.
-	verified := cook.Snprintf("%s: signature and sha256 verified, staged at %s", rel.Version, staged)
+	verified := cook.Snprintf("%s: signature (against the %s) and sha256 verified, staged at %s", rel.Version, src, staged)
 	if err := install(ctx, rel, staged); err != nil {
 		return failed(err, verified)
 	}
@@ -196,13 +193,13 @@ func (s SelfUpdate) Test(ctx context.Context) (cook.Result, error) {
 	if s.method != fleetsign.SelfUpdateMethod {
 		return failed(errors.Join(ErrMethodUndefined, fmt.Errorf("method %s undefined", s.method)))
 	}
-	rel, err := s.verify()
+	rel, src, err := s.verify(ctx)
 	if err != nil {
 		return failed(err)
 	}
 	return cook.Result{Succeeded: true, Notes: []fmt.Stringer{
-		cook.Snprintf("signature verified; would download %s from %s (trusting only %s) and check sha256 %s",
-			rel.Version, rel.ArtifactURL, config.SproutRootCA, rel.ChecksumSHA256),
+		cook.Snprintf("signature verified against the %s; would download %s from %s (trusting only %s) and check sha256 %s",
+			src, rel.Version, rel.ArtifactURL, config.SproutRootCA, rel.ChecksumSHA256),
 	}}, nil
 }
 

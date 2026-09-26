@@ -43,6 +43,12 @@ func sproutPermissions(id string) jwt.Permissions {
 			"_INBOX.>",
 			"grlx.cook." + id + ".>",
 			"grlx.sprouts." + id + ".facts",
+			// Request grlx-fleet-signing's current key versions from farmer
+			// (internal/fleetkeys). The reply comes back on
+			// grlx.sprouts.<id>.fleetsigningkeys.reply.<random>, covered by
+			// the existing Sub grant below; no Sub grant on _INBOX.> (which
+			// would expose every reply in the Account to every sprout).
+			"grlx.sprouts." + id + ".fleetsigningkeys",
 		}},
 		Sub: jwt.Permission{Allow: jwt.StringList{
 			"grlx.sprouts." + id + ".>",

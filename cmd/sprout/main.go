@@ -17,6 +17,7 @@ import (
 	"github.com/gogrlx/grlx/v2/internal/cook"
 	"github.com/gogrlx/grlx/v2/internal/ingredients"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/cmd"
+	"github.com/gogrlx/grlx/v2/internal/ingredients/selfupdate"
 	"github.com/gogrlx/grlx/v2/internal/ingredients/test"
 	"github.com/gogrlx/grlx/v2/internal/jobs"
 	"github.com/gogrlx/grlx/v2/internal/pki"
@@ -150,6 +151,9 @@ func ConnectSprout(ctx context.Context, done chan<- struct{}) {
 	test.RegisterNatsConn(nc)
 	cmd.RegisterNatsConn(nc)
 	cook.RegisterNatsConn(nc)
+	// The selfupdate ingredient fetches grlx-fleet-signing's live key set
+	// over this same SproutRootCA-pinned connection.
+	selfupdate.RegisterNatsConn(nc)
 	err = natsInit(nc)
 	if err != nil {
 		log.Panicf("Error with natsInit: %v", err)

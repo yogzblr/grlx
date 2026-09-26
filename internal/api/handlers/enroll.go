@@ -50,9 +50,15 @@ type enrollRequest struct {
 // Envoy — unlike nats-server — can't be taught NATS's own JWT dialect.
 //
 // fleet_signing_jwks is the grlx-fleet-signing public key set (design doc
-// §2.5) as a JWKS document, for the sprout to pin next to its root CA
-// (pki.PinFleetSigningKeys) and check every self-update against, so it
-// never needs a live fetch of the key it trusts binaries by.
+// §2.5) as a JWKS document, which the sprout pins next to its root CA
+// (pki.PinFleetSigningKeys). It is ADVISORY, a bootstrap fallback only:
+// the sprout verifies releases against the key set it fetches live from
+// farmer over its SproutRootCA-pinned NATS connection
+// (grlx.sprouts.<id>.fleetsigningkeys, internal/fleetkeys), so Transit key
+// rotations reach it. This enrollment-time copy is used only for a
+// sprout's very first update if it has never yet completed a live fetch,
+// and is superseded permanently by the first live fetch that succeeds
+// (internal/ingredients/selfupdate, keys.go).
 type enrollSuccessResponse struct {
 	SproutID         string          `json:"sprout_id"`
 	JWT              string          `json:"jwt"`
@@ -88,9 +94,9 @@ func Enroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read the fleet signing key before redeeming anything: if it can't be
-	// had, the sprout couldn't pin it, and failing here leaves the join
-	// token unspent for the retry. Enrollment fails closed without it,
-	// the same way it does without a gateway JWT signer.
+	// had, the sprout couldn't pin its bootstrap copy, and failing here
+	// leaves the join token unspent for the retry. Enrollment fails closed
+	// without it, the same way it does without a gateway JWT signer.
 	fleetJWKS, err := enrollFleetSigningJWKS(r)
 	if err != nil {
 		log.Errorf("enroll: fleet signing key unavailable: %v", err)

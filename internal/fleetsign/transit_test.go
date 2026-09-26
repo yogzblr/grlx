@@ -24,7 +24,7 @@ import (
 type mockTransit struct {
 	token         string
 	keys          []PublicKey
-	minDecryption int
+	minEncryption int
 	keyType       string
 	reads         atomic.Int32
 	otherRequests atomic.Int32
@@ -56,7 +56,7 @@ func (m *mockTransit) start(t *testing.T) *httptest.Server {
 			keyType = "ed25519"
 		}
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-			"type": keyType, "keys": keys, "min_decryption_version": m.minDecryption, "latest_version": len(m.keys),
+			"type": keyType, "keys": keys, "min_encryption_version": m.minEncryption, "latest_version": len(m.keys),
 		}})
 	}))
 	t.Cleanup(ts.Close)
@@ -96,12 +96,12 @@ func TestTransitKeySource_ReadsAndCaches(t *testing.T) {
 	}
 }
 
-// min_decryption_version is the floor Transit's own /verify applies: a
-// retired key version must stop verifying here too.
-func TestTransitKeySource_HonorsMinDecryptionVersion(t *testing.T) {
+// min_encryption_version is the floor, copied from gatewayjwt's
+// PublicKeys: raising it retires the versions below it for verification.
+func TestTransitKeySource_HonorsMinEncryptionVersion(t *testing.T) {
 	k1, priv1 := newTestKey(t, 1)
 	k2, _ := newTestKey(t, 2)
-	m := &mockTransit{token: "ro-token", keys: []PublicKey{k1, k2}, minDecryption: 2}
+	m := &mockTransit{token: "ro-token", keys: []PublicKey{k1, k2}, minEncryption: 2}
 	m.start(t)
 	src, _ := NewTransitKeySourceFromEnv()
 	err := src.Verify(t.Context(), testRelease(), signForTest(t, priv1, 1, testRelease()))

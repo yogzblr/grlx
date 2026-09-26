@@ -109,7 +109,7 @@ func (m *mockTransit) serve(t *testing.T) string {
 				"keys": map[string]any{strconv.Itoa(m.version): map[string]any{
 					"public_key": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})),
 				}},
-				"min_decryption_version": 1,
+				"min_encryption_version": 1,
 			}})
 		default:
 			w.WriteHeader(http.StatusNotFound)

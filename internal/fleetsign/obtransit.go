@@ -245,18 +245,28 @@ type transitReadKeyResponse struct {
 		Keys map[string]struct {
 			PublicKey string `json:"public_key"`
 		} `json:"keys"`
-		MinDecryptionVersion int `json:"min_decryption_version"`
+		MinEncryptionVersion int `json:"min_encryption_version"`
 		LatestVersion        int `json:"latest_version"`
 	} `json:"data"`
 	Errors []string `json:"errors"`
 }
 
 // readKeySet calls Transit's GET /v1/<mount>/keys/<keyName> and returns
-// every key version Transit itself would still verify with: those at or
-// above min_decryption_version, which is the floor Transit's own
-// /verify endpoint applies to signing keys. (gatewayjwt's JWKS uses
-// min_encryption_version instead; that's the floor for *signing* new
-// tokens, and would drop a version whose signatures should still verify.)
+// every key version at or above min_encryption_version, sorted ascending —
+// the same selection internal/gatewayjwt's (*GatewaySigner).PublicKeys
+// makes for the gateway JWKS, deliberately copied rather than reinvented.
+// Every verifier of a fleet release (farmer's self_update re-check,
+// saasapi's dispatch check, the enrollment pin, and the live key set
+// sprouts fetch on grlx.sprouts.<id>.fleetsigningkeys) uses this one
+// selection, so they all agree on which versions are valid.
+//
+// Consequence, and an OPERATIONAL CONSTRAINT: raising
+// grlx-fleet-signing's min_encryption_version retires every version below
+// it for verification on every sprout, not just for new signatures. Never
+// raise it past a version that signed a release still named as
+// approved_version in any tenant's saas.tenant_update_policy. Nothing in
+// this repo bumps it or retires versions automatically; that stays an
+// operator decision (deploy/fleetreleaser/README.md, "Rotating the key").
 func (c *obTransitClient) readKeySet(ctx context.Context, keyName string) (KeySet, error) {
 	token, err := c.currentToken(ctx)
 	if err != nil {
@@ -288,7 +298,9 @@ func (c *obTransitClient) readKeySet(ctx context.Context, keyName string) (KeySe
 	if rr.Data.Type != "ed25519" {
 		return nil, fmt.Errorf("%w: Transit key %q is type %q, want ed25519", ErrReadKeyFailed, keyName, rr.Data.Type)
 	}
-	minVersion := rr.Data.MinDecryptionVersion
+	// min_encryption_version of 0 is Transit's "no restriction" sentinel:
+	// treat it as 1, exactly as PublicKeys does.
+	minVersion := rr.Data.MinEncryptionVersion
 	if minVersion < 1 {
 		minVersion = 1
 	}
