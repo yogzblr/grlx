@@ -94,7 +94,7 @@ func main() {
 	// reaching the SaaS API over REST without this binary owning certs.
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
-		Handler:      saasapi.NewRouter(),
+		Handler:      newRouter(cfg),
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		IdleTimeout:  cfg.IdleTimeout,
@@ -129,6 +129,17 @@ func main() {
 		time.Sleep(50 * time.Millisecond)
 	}
 	log.Info("saasapi: stopped")
+}
+
+// newRouter builds the HTTP router with cfg's feature flags applied. The
+// fleet update dispatch flag must be set before saasapi.NewRouter, which
+// registers POST .../sprouts/updates and GET .../sprouts/updates/{batch_id}
+// only if the flag is on at that moment (SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED,
+// default off: sprout self-update is still disabled upstream,
+// gogrlx/grlx#286).
+func newRouter(cfg saasapi.Config) *http.ServeMux {
+	saasapi.SetFleetUpdateDispatchEnabled(cfg.FleetUpdateDispatchEnabled)
+	return saasapi.NewRouter()
 }
 
 // initHeartbeatClient points internal/heartbeat at the same Valkey client

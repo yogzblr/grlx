@@ -73,6 +73,14 @@ import (
 //     and saasapi refuses to start if it can't reach Valkey. When unset,
 //     each pod enforces it on its own, so N pods allow up to N times as
 //     much.
+//
+// The fleet update dispatch feature flag (see fleet_update_dispatch.go):
+//
+//   - SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED: "true" registers POST
+//     .../sprouts/updates and its status endpoint (design doc §1.8).
+//     Default false. Leave it off until sprout has a working signed
+//     self-update path (gogrlx/grlx#286). Any value strconv.ParseBool
+//     doesn't accept is a startup error.
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to, e.g. ":8081".
 	ListenAddr string
@@ -122,12 +130,16 @@ type Config struct {
 	// ValkeyAddrs are the Valkey nodes holding the shared rate-limit
 	// state. Empty means per-pod limiting only.
 	ValkeyAddrs []string
+
+	// FleetUpdateDispatchEnabled is the fleet update dispatch feature
+	// flag, passed to SetFleetUpdateDispatchEnabled before NewRouter.
+	FleetUpdateDispatchEnabled bool
 }
 
 // LoadConfig reads the saasapi service's configuration from environment
 // variables, applying sane defaults where possible. It returns an error
-// only for a value that is set but invalid (currently just the
-// enrollment-key rate-limit settings).
+// only for a value that is set but invalid (the enrollment-key rate-limit
+// settings and the fleet update dispatch flag).
 func LoadConfig() (Config, error) {
 	cfg := Config{
 		ListenAddr:   envOrDefault("SAASAPI_LISTEN_ADDR", ":8081"),
@@ -170,6 +182,13 @@ func LoadConfig() (Config, error) {
 	}
 	if err := validateRateLimit(cfg.EnrollmentKeyRateLimit, cfg.EnrollmentKeyRateBurst); err != nil {
 		return Config{}, fmt.Errorf("saasapi: enrollment-key rate limit (SAASAPI_ENROLLMENT_KEY_RATE_LIMIT/_BURST): %w", err)
+	}
+	if v := os.Getenv("SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("saasapi: SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED=%q: not a boolean", v)
+		}
+		cfg.FleetUpdateDispatchEnabled = b
 	}
 	return cfg, nil
 }

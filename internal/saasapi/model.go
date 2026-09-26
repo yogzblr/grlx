@@ -131,7 +131,8 @@ type FleetVersion struct {
 	ID      string `gorm:"column:id;primaryKey;size:32" json:"-"`
 	Version string `gorm:"column:version;size:64;not null;uniqueIndex" json:"version"`
 	// ArtifactURL is where the release pipeline published the sprout
-	// binary, for the (not yet built) dispatch path to hand to a sprout.
+	// binary, for the dispatch path (fleet_update_dispatch.go) to hand to
+	// a sprout.
 	// Not part of GET /versions' response; see fleetVersionItem.
 	ArtifactURL    string    `gorm:"column:artifact_url;size:2048;not null" json:"-"`
 	ChecksumSHA256 string    `gorm:"column:checksum_sha256;size:64;not null" json:"checksum_sha256"`
@@ -188,13 +189,20 @@ const (
 	ActionItemSucceeded AssetActionItemStatus = "succeeded"
 	// ActionItemFailed: anything that ended badly; ErrorCode says what.
 	ActionItemFailed AssetActionItemStatus = "failed"
+	// ActionItemUnresponsiveAfterUpdate: a self_update (§1.8) was
+	// accepted, but the sprout never reported the update's outcome
+	// before its rollout wave's deadline. It's kept apart from failed
+	// (design doc §2.3) because the operator's response is different: the
+	// sprout may be unable to reconnect, or its backup/restore path may
+	// already have recovered it.
+	ActionItemUnresponsiveAfterUpdate AssetActionItemStatus = "unresponsive_after_update"
 )
 
 // terminal reports whether s is an end state: nothing further will move
 // an item out of it.
 func (s AssetActionItemStatus) terminal() bool {
 	switch s {
-	case ActionItemUnresolved, ActionItemSucceeded, ActionItemFailed:
+	case ActionItemUnresolved, ActionItemSucceeded, ActionItemFailed, ActionItemUnresponsiveAfterUpdate:
 		return true
 	}
 	return false
@@ -210,12 +218,21 @@ func (s AssetActionItemStatus) terminal() bool {
 // line the caller supplied (never environment variables: the API accepts
 // none), so it is never returned by the API. RequestedAssetIDs is the JSON array of the
 // batch's deduplicated asset_ids, in request order.
+//
+// A §1.8 fleet update rollout is a batch with ActionType self_update
+// (fleet_update_dispatch.go). Its ActionParams are built from the version
+// catalog, and RolloutBatchSize and RolloutGate record the wave size and
+// gate it was created with. Both are zero for a §1.5 batch. They're
+// columns on this table, not a new one: design doc §4.3 has update
+// dispatch reuse the §1.5 tables.
 type AssetActionBatch struct {
 	ID                string    `gorm:"column:id;primaryKey;size:32"`
 	TenantID          string    `gorm:"column:tenant_id;size:32;not null;index"`
 	ActionType        string    `gorm:"column:action_type;size:32;not null"`
 	ActionParams      string    `gorm:"column:action_params;type:text;not null"`
 	RequestedAssetIDs string    `gorm:"column:requested_asset_ids;type:text;not null"`
+	RolloutBatchSize  int       `gorm:"column:rollout_batch_size;not null;default:0"`
+	RolloutGate       string    `gorm:"column:rollout_gate;size:32;not null;default:''"`
 	CreatedAt         time.Time `gorm:"column:created_at"`
 }
 

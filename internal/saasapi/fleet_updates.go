@@ -15,10 +15,11 @@ import (
 
 // Fleet updates, the non-dispatch half of design doc §1.8: the version
 // catalog (GET /versions) and each tenant's update policy (GET/PATCH
-// .../update-policy). Nothing here sends anything to a sprout. POST
-// .../sprouts/updates and its status endpoint depend on §1.5's batch
-// dispatch and on sprout having a real signed self-update path (§1.8's
-// blocking dependency, §6), and are not built.
+// .../update-policy). Nothing here sends anything to a sprout. The
+// dispatch half, POST .../sprouts/updates and its status endpoint, is in
+// fleet_update_dispatch.go, behind a feature flag that's off by default
+// until sprout has a real signed self-update path (§1.8's blocking
+// dependency, §6).
 //
 // The catalog is CloudXP's own, not upstream grlx's release feed. Upstream
 // has each sprout poll <UpdateURL>/latest with no tenant concept, so every
@@ -157,8 +158,8 @@ func GetUpdatePolicy(w http.ResponseWriter, r *http.Request) {
 //
 // The read-merge-write runs in one transaction, with the row locked, so
 // two concurrent PATCHes can't each validate against the other's stale
-// state. Storing the policy is all this does: no dispatch path reads it
-// yet (see the top of this file).
+// state. Storing the policy is all this does here. The dispatch path
+// (fleet_update_dispatch.go) reads it before and during every rollout.
 func PatchUpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenant_id")
 	if !tenantExists(w, tenantID) {

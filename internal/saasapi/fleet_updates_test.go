@@ -363,7 +363,8 @@ func TestPatchFieldUnmarshal(t *testing.T) {
 
 // TestRouterFleetUpdateRoutes runs the §1.8 routes through NewRouter:
 // the catalog needs no organization match, the policy routes do, and the
-// dispatch routes this task leaves out aren't registered.
+// dispatch routes aren't registered while their feature flag is off (the
+// default).
 func TestRouterFleetUpdateRoutes(t *testing.T) {
 	gdb := newFleetTestDB(t)
 	auth := newTestAuthEnv(t)
