@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/server"
 	"gorm.io/gorm"
 
 	"github.com/gogrlx/grlx/v2/internal/controlplane"
@@ -721,5 +722,90 @@ func TestLoadConfigFleetUpdateDispatchFlag(t *testing.T) {
 	t.Setenv("SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED", "yes please")
 	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED") {
 		t.Fatalf("invalid value: %v", err)
+	}
+}
+
+// indexingFarmer answers every self_update with dispatched and jidFor's
+// jid, and writes the job's farmer.job_status row the way farmer's jobs
+// index (wired into farmer's startup by cmd/farmer's installStorage) would:
+// status(sprout) for the sprout, under indexTenant(request tenant).
+func indexingFarmer(t *testing.T, ns *server.Server, gdb *gorm.DB,
+	indexTenant func(string) string, status func(sprout string) string) *fakeFarmer {
+	t.Helper()
+	return startFakeFarmer(t, ns, func(req controlplane.SproutActionRequest) any {
+		if err := gdb.Exec(`INSERT INTO farmer.job_status (tenant_id, sprout_id, jid, status, updated_at)
+VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`, indexTenant(req.TenantID), req.SproutID, jidFor(req.SproutID), status(req.SproutID)).Error; err != nil {
+			t.Errorf("indexing job for %s: %v", req.SproutID, err)
+		}
+		return controlplane.SproutActionReply{TenantID: req.TenantID, SproutID: req.SproutID,
+			Status: controlplane.StatusDispatched, JID: jidFor(req.SproutID)}
+	})
+}
+
+// The default job_status gate, end to end through the production reader
+// (farmerJobStatusReader over farmer.job_status) rather than a fake: waves
+// pass on succeeded rows and a failed row halts the rollout.
+func TestFleetUpdate_JobStatusGateWithFarmerIndex(t *testing.T) {
+	gdb := newUpdateTestDB(t)
+	fastRollouts(t, 5*time.Second)
+	ns := startTestBus(t)
+	connectSaaSBus(t, ns)
+	installReader(t, farmerJobStatusReader{})
+	tid := mustCreateActiveTenant(t, gdb)
+	mustPublishVersion(t, gdb, "v2.4.1", time.Now())
+	mustApprove(t, gdb, tid, "v2.4.1")
+	assets := mustUpdateFleet(t, gdb, tid, 5)
+	farmer := indexingFarmer(t, ns, gdb, func(tenant string) string { return tenant }, func(sprout string) string {
+		if sprout == "upd-03" {
+			return "failed"
+		}
+		return "succeeded"
+	})
+
+	_, resp := postUpdates(t, tid, map[string]any{"asset_ids": assets, "target_version": "v2.4.1", "batch_size": 2})
+	actionDispatches.Wait()
+	if reqs, _ := farmer.seen(); len(reqs) != 4 {
+		t.Fatalf("farmer got %d requests, want 4 (waves 1 and 2)", len(reqs))
+	}
+	_, got := getUpdateBatch(t, tid, resp["batch_id"].(string))
+	want := []struct {
+		status AssetActionItemStatus
+		code   string
+	}{
+		{ActionItemSucceeded, ""}, {ActionItemSucceeded, ""},
+		{ActionItemFailed, errCodeJobFailed}, {ActionItemSucceeded, ""},
+		{ActionItemFailed, errCodeRolloutHalted},
+	}
+	for i, it := range got.Items {
+		if it.Status != want[i].status || it.Error != want[i].code {
+			t.Errorf("item %d = %+v, want %s %s", i, it, want[i].status, want[i].code)
+		}
+	}
+}
+
+// Another tenant's farmer.job_status row for the same sprout_id and jid
+// never passes this tenant's wave: sprout_id is only unique per tenant.
+func TestFleetUpdate_JobStatusGateIgnoresOtherTenantsIndexRows(t *testing.T) {
+	gdb := newUpdateTestDB(t)
+	fastRollouts(t, 50*time.Millisecond)
+	ns := startTestBus(t)
+	connectSaaSBus(t, ns)
+	installReader(t, farmerJobStatusReader{})
+	tid := mustCreateActiveTenant(t, gdb)
+	other := mustCreateActiveTenant(t, gdb)
+	mustPublishVersion(t, gdb, "v2.4.1", time.Now())
+	mustApprove(t, gdb, tid, "v2.4.1")
+	assets := mustUpdateFleet(t, gdb, tid, 2)
+	// The only index row for upd-01's job is filed under the other tenant.
+	indexingFarmer(t, ns, gdb, func(string) string { return other }, func(string) string { return "succeeded" })
+
+	_, resp := postUpdates(t, tid, map[string]any{"asset_ids": assets, "target_version": "v2.4.1", "batch_size": 1})
+	actionDispatches.Wait()
+	_, got := getUpdateBatch(t, tid, resp["batch_id"].(string))
+	if it := got.Items[0]; it.Status != ActionItemUnresponsiveAfterUpdate {
+		t.Errorf("upd-01 = %+v, want unresponsive_after_update", it)
+	}
+	if it := got.Items[1]; it.Status != ActionItemFailed || it.Error != errCodeRolloutHalted {
+		t.Errorf("upd-02 = %+v, want failed rollout_halted", it)
 	}
 }
