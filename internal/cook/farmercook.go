@@ -123,12 +123,27 @@ func SendCookEventContext(ctx context.Context, tenantID, sproutID string, recipe
 		}
 		validSteps = pruned
 	}
-	rEnvelope := RecipeEnvelope{
+	return sendEnvelope(tenantID, sproutID, RecipeEnvelope{
 		JobID:     JID,
 		Steps:     validSteps,
 		Test:      test,
 		InvokedBy: co.invokedBy,
-	}
+	})
+}
+
+// SendStepsEvent sends steps to sproutID as one cook job under JID, the
+// same way SendCookEvent sends a rendered recipe, for a job farmer builds
+// itself rather than reading from the recipe store: today only
+// internal.sprout.action's self_update (internal/natsapi/sprout_action.go),
+// whose single step is the sprout's selfupdate ingredient.
+func SendStepsEvent(tenantID, sproutID, JID string, steps []Step) error {
+	return sendEnvelope(tenantID, sproutID, RecipeEnvelope{JobID: JID, Steps: steps})
+}
+
+// sendEnvelope delivers rEnvelope to sproutID over tenantID's own
+// connection and waits for the sprout's acknowledgement.
+func sendEnvelope(tenantID, sproutID string, rEnvelope RecipeEnvelope) error {
+	JID := rEnvelope.JobID
 	b, _ := json.Marshal(rEnvelope)
 	log.Noticef("cooking sprout %s: %s", sproutID, JID)
 	farmerConn := farmerConnFor(tenantID)

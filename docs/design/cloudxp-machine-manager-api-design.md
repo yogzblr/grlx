@@ -303,7 +303,8 @@ alongside `cmd.run`/`cook` (§1.8):
     "params": {
       "version": "v2.4.1",
       "artifact_url": "https://<farmer-recipe-endpoint>/artifacts/sprout-v2.4.1-linux-amd64",
-      "checksum_sha256": "…"
+      "checksum_sha256": "…",
+      "signature": "v1:<base64 Ed25519 signature, §2.5>"
     }
   }
 }
@@ -361,6 +362,63 @@ Unlike everything else in §2, this route is deliberately **not** on the privile
 
 Contains the **gateway signing key's** public key only (see `grlx-nats-jwt-auth-design.md`'s key-custody section) — one entry, or two during the gateway key's own rotation overlap window (old + new `kid`). Never grows with tenant count: this is not a per-tenant Account-key JWKS, since Envoy's `jwt_authn` check never needs tenant granularity. Farmer already holds this public key (fetched from OpenBao alongside the signing operation itself), so this route is a pure data-transformation read, no new secret access.
 
+### 2.5 Fleet release signing — one signer, read-only verifiers
+
+A `saas.fleet_versions` row is trusted because it is signed, not because
+of who wrote it. The signature is Ed25519, over the canonical string
+`version|artifact_url|checksum_sha256`. It is made with the OpenBao
+Transit key `grlx-fleet-signing`, which is non-exportable and separate
+from the gateway JWT key. The row stores it as
+`signature = "v<key version>:<base64>"`.
+
+| Who | Transit access on `grlx-fleet-signing` | Does |
+|---|---|---|
+| `cmd/fleetreleaser` | **sign** + read public key (`grlx-fleet-signer` policy) | Run by CloudXP's release pipeline. Signs the row and writes it straight to `saas.fleet_versions` with its own DB user. It never calls the SaaS API. |
+| saasapi | read + verify only (`grlx-fleet-verify`) | Refuses to create a rollout (§1.8) from a row whose signature is missing or invalid. |
+| farmer | read + verify only (`grlx-fleet-verify`, its own role) | Serves the key's current versions live to each sprout on `grlx.sprouts.<id>.fleetsigningkeys`, queue-subscribed on each tenant connection. The set is every version at or above `min_decryption_version`: every version Transit's own `/verify` still accepts, including those below `min_encryption_version` during a rotation grace period. Also serves them ungated at `GET /v1/.well-known/fleet-signing-jwks.json`, the same trust model as §2.4. Returns a bootstrap copy as `fleet_signing_jwks` in `POST /v1/enroll`. Re-verifies before it dispatches a `self_update`. |
+| sprout | none | Verifies against the **live** key set, fetched over its SproutRootCA-pinned NATS connection, **before** it fetches the artifact. It accepts any version in the set; the set is cached for 5 min, and a miss refetches immediately. The enrollment-time pin, stored next to `SproutRootCA`, is a bootstrap fallback only until the first live fetch succeeds. It then fetches the artifact with `SproutRootCA` as the only TLS root and checks the SHA-256 afterwards. |
+
+**Why the split.** saasapi already has PXC write access to
+`saas.fleet_versions` (§4.1). If the same identity could also sign with
+Transit, one compromised saasapi process or credential could publish a
+"release" that every sprout in every tenant would install. So writing a
+row and signing it are two trust boundaries, with two OpenBao policies
+and two tokens:
+
+- **fleetreleaser is the only signer.** It is a separate binary, not a
+  library farmer or saasapi imports.
+- **farmer and saasapi are read-only.** Their policy grants
+  `transit/keys/grlx-fleet-signing` (read) and
+  `transit/verify/grlx-fleet-signing` and nothing else. It is OpenBao
+  that enforces this, not the Go code: the check is
+  `TestOpenBaoEnforcesReadOnlyFleetKey`, run against a real OpenBao with
+  the shipped policy files.
+
+A missing signature is always a refusal, at every hop. That includes a
+row written before the column existed. There is no checksum-only
+fallback. Policies, roles, the DB grant and the manual checks are in
+`deploy/fleetreleaser/README.md`.
+
+**Still open.**
+
+- **Install.** The sprout's `selfupdate` step verifies and stages the
+  artifact, then fails with "install not implemented". Installing is
+  §2.3's backup/restore work.
+- **Key retirement stays manual.** Rotation is handled by the live fetch.
+  Retiring a version means raising `min_decryption_version`, and that is
+  an operator decision under one constraint: never retire a version that
+  signed a release still approved in any tenant's
+  `tenant_update_policy` (`deploy/fleetreleaser/README.md`, "Rotating the
+  key").
+- **Trust in the live key set.** A sprout trusts whoever answers on
+  `grlx.sprouts.<id>.fleetsigningkeys`. Only farmer and grlx.>-template
+  Users in the tenant's Account can answer, and they can already run
+  commands on the sprout (`internal/fleetkeys`). A reviewer should confirm
+  that equivalence holds for every User template that exists.
+- **Downgrade and replay.** Any validly signed row, old versions
+  included, is accepted. Nothing binds a signature to the tenant's
+  approved version or orders versions yet.
+
 ## 3. Sprout enrollment flow
 
 The one moment in the whole system where a caller has no credential yet. Borrowed deliberately from `kubeadm`'s join-token model, and it's the one place worth a genuine security review before trusting it in production — everything downstream assumes whatever identity this issues is real.
@@ -384,6 +442,7 @@ The one moment in the whole system where a caller has no credential yet. Borrowe
   "sprout_id": "s_1",
   "nats_jwt": "<signed NATS User JWT>",
   "gateway_jwt": "<signed gateway JWT, presented to Envoy on the ws upgrade and the recipe endpoint>",
+  "fleet_signing_jwks": { "keys": [ /* grlx-fleet-signing public key(s), pinned by the sprout — §2.5 */ ] },
   "nats_urls": ["wss://bus1.dmz...", "wss://bus2.dmz..."]
 }
 
@@ -452,7 +511,8 @@ asset_action_items    (batch_id, asset_id, sprout_id, jid, status)
 
 ### 4.3 Fleet update tables (new)
 ```sql
-fleet_versions        (id, version, artifact_url, checksum_sha256, released_at, notes)
+fleet_versions        (id, version, artifact_url, checksum_sha256, signature, released_at, notes)
+                        -- signature: written only by cmd/fleetreleaser (§2.5)
 tenant_update_policy  (tenant_id PK, approved_version, auto_update BOOLEAN,
                         rollout_window_start, rollout_window_end, updated_at)
 ```
@@ -471,7 +531,8 @@ already cover dispatch tracking for any `action.type`, including
 - Can a sprout's `tenant_id` ever change post-enrollment, or does a tenant move always mean re-enrollment? Not decided.
 - **Fleet update rollout is blocked on upstream.** `internal/update` is an
   explicitly disabled skeleton (`gogrlx/grlx#286`); `PerformUpdate()` fails
-  closed today. §1.8/§2.2/§2.3's endpoints and subjects are ready to build
+  closed today. Release signing and CA pinning now exist (§2.5); the
+  sprout's install step (§2.3) still doesn't. §1.8/§2.2/§2.3's endpoints and subjects are ready to build
   against the SaaS API and schema side whenever sprout has a real signed
   update path — but don't expose `POST
   /tenants/{tenant_id}/sprouts/updates` publicly, even behind a feature

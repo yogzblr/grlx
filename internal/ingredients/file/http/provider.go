@@ -2,9 +2,13 @@ package http
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	httpc "net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -21,6 +25,26 @@ type HTTPFile struct {
 }
 
 const downloadTempPattern = ".grlx-http-download-*"
+
+// PropRootCAFile names a PEM file whose certificates become the ONLY
+// trust roots for this download, in place of the system CA pool — the
+// same pinning the sprout's own farmer/NATS connection does to
+// config.SproutRootCA (cmd/sprout's ConnectSprout). When it's set the
+// source must be https://, and a redirect may only go to another https://
+// URL (it is verified against the same pinned roots). The selfupdate
+// ingredient always sets it to config.SproutRootCA. Unset, downloads use
+// http.DefaultClient and the system pool, as before.
+const PropRootCAFile = "rootCAFile"
+
+var (
+	// ErrPinnedRootsRequireHTTPS: PropRootCAFile was set for a plain
+	// http:// source, where there is no TLS to pin.
+	ErrPinnedRootsRequireHTTPS = errors.New("http file provider: a pinned root CA requires an https:// source")
+	// ErrPinnedRootsUnusable: PropRootCAFile couldn't be read or holds no
+	// certificates. The download fails rather than falling back to the
+	// system pool.
+	ErrPinnedRootsUnusable = errors.New("http file provider: pinned root CA file is unusable")
+)
 
 // Compile-time interface check.
 var _ file.FileProvider = HTTPFile{}
@@ -39,7 +63,11 @@ func (hf HTTPFile) Download(ctx context.Context) error {
 	if err := applyRequestHeaders(req, hf.Props["headers"]); err != nil {
 		return err
 	}
-	res, err := httpc.DefaultClient.Do(req)
+	client, err := hf.client()
+	if err != nil {
+		return err
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -91,6 +119,45 @@ func (hf HTTPFile) Download(ctx context.Context) error {
 	}
 	cleanupStaged = false
 	return nil
+}
+
+// client returns http.DefaultClient, or, when PropRootCAFile is set, a
+// client that trusts only that file's certificates.
+func (hf HTTPFile) client() (*httpc.Client, error) {
+	raw, set := hf.Props[PropRootCAFile]
+	if !set || raw == nil {
+		return httpc.DefaultClient, nil
+	}
+	caFile, ok := raw.(string)
+	if !ok || caFile == "" {
+		return nil, fmt.Errorf("%w: %s must be a non-empty path", ErrPinnedRootsUnusable, PropRootCAFile)
+	}
+	u, err := url.Parse(hf.Source)
+	if err != nil || u.Scheme != "https" {
+		return nil, ErrPinnedRootsRequireHTTPS
+	}
+	pemBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrPinnedRootsUnusable, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("%w: no certificates in %s", ErrPinnedRootsUnusable, caFile)
+	}
+	transport := httpc.DefaultTransport.(*httpc.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	return &httpc.Client{
+		Transport: transport,
+		CheckRedirect: func(req *httpc.Request, via []*httpc.Request) error {
+			if req.URL.Scheme != "https" {
+				return ErrPinnedRootsRequireHTTPS
+			}
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return nil
+		},
+	}, nil
 }
 
 func applyRequestHeaders(req *httpc.Request, headers interface{}) error {

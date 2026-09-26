@@ -1,12 +1,13 @@
 // Fleet update dispatch, the dispatch half of design doc §1.8: POST
 // /tenants/{tenant_id}/sprouts/updates and GET .../sprouts/updates/{batch_id}.
 //
-// BLOCKED ON UPSTREAM, AND OFF BY DEFAULT. Sprout has no working self-update
-// path: internal/update's PerformUpdate fails closed with
-// errUnsignedUpdatesDisabled until release signature verification exists
-// (gogrlx/grlx#286), and farmer's internal.sprout.action handler answers
-// self_update with unsupported_action. §1.8 and §6 say not to expose this
-// endpoint until that's resolved. So both routes are registered only when
+// OFF BY DEFAULT. Release signing now exists (§2.5): cmd/fleetreleaser signs
+// each saas.fleet_versions row, and saasapi (selfUpdateParams), farmer and
+// the sprout's selfupdate ingredient each verify it. But the sprout still
+// can't install a verified release — that's §2.3's backup/restore work —
+// so its selfupdate step ends failed after verifying and staging the
+// artifact. §1.8 and §6 say not to expose this endpoint until that's
+// resolved. So both routes are registered only when
 // SetFleetUpdateDispatchEnabled(true) has been called before NewRouter
 // (Config.FleetUpdateDispatchEnabled, SAASAPI_FLEET_UPDATE_DISPATCH_ENABLED),
 // and the handlers check the flag again themselves. With the flag off,
@@ -52,6 +53,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -61,6 +63,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gogrlx/grlx/v2/internal/controlplane"
+	"github.com/gogrlx/grlx/v2/internal/fleetsign"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 )
 
@@ -148,13 +151,20 @@ type fleetUpdateRequest struct {
 }
 
 // farmerSelfUpdate is the params of a self_update internal.sprout.action,
-// in the shape design doc §2.2 gives. Farmer has no self_update handler yet,
-// so unlike farmerCmdRun and farmerCook there's no farmer type to pin it to.
-type farmerSelfUpdate struct {
-	Version        string `json:"version"`
-	ArtifactURL    string `json:"artifact_url"`
-	ChecksumSHA256 string `json:"checksum_sha256"`
-}
+// in the shape design doc §2.2 gives, signature included (§2.5).
+type farmerSelfUpdate = controlplane.SelfUpdateParams
+
+// fleetKeys is the READ-ONLY grlx-fleet-signing key source catalog rows
+// are verified against before a rollout is created (§2.5). Set once at
+// startup by SetFleetKeySource; while nil, every rollout is refused.
+var fleetKeys fleetsign.KeySetSource
+
+// SetFleetKeySource installs the key source. Like SetDB, call it once at
+// startup. The OpenBao token behind it (GRLX_FLEETSIGN_OPENBAO_*) must
+// carry only the read-only grlx-fleet-verify policy: saasapi can write
+// saas.fleet_versions, so it must never also be able to sign rows
+// (deploy/fleetreleaser/README.md).
+func SetFleetKeySource(src fleetsign.KeySetSource) { fleetKeys = src }
 
 // rolloutResponse describes a rollout batch in the GET response. It's
 // omitted for §1.5 batches.
@@ -226,7 +236,7 @@ func CreateFleetUpdateBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown_version", "target_version is not in the version catalog")
 		return
 	}
-	params, err := selfUpdateParams(versions[0])
+	params, err := selfUpdateParams(r.Context(), versions[0])
 	if err != nil {
 		log.Errorf("saasapi: fleet_versions entry %s is unusable for dispatch: %v", version, err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "the catalog entry for this version is invalid; contact support")
@@ -321,10 +331,13 @@ func parseUpdateGate(w http.ResponseWriter, gate string) (string, bool) {
 }
 
 // selfUpdateParams builds the farmer params for v. The catalog is written
-// by CloudXP's release pipeline, not by a tenant, but an entry that a
-// sprout couldn't use safely (no https artifact URL, a malformed checksum)
-// is refused here rather than sent to a whole fleet.
-func selfUpdateParams(v FleetVersion) (json.RawMessage, error) {
+// by cmd/fleetreleaser, not by a tenant, but an entry that a sprout
+// couldn't use safely (no https artifact URL, a malformed checksum) or
+// whose signature doesn't verify against the grlx-fleet-signing key — an
+// un-migrated row with no signature included — is refused here rather
+// than sent to a whole fleet. Farmer and the sprout each verify it again;
+// this is the early, whole-batch refusal, not the only one.
+func selfUpdateParams(ctx context.Context, v FleetVersion) (json.RawMessage, error) {
 	u, err := url.Parse(v.ArtifactURL)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
 		return nil, errors.New("artifact_url is not an https URL")
@@ -332,11 +345,23 @@ func selfUpdateParams(v FleetVersion) (json.RawMessage, error) {
 	if sum, err := hex.DecodeString(v.ChecksumSHA256); err != nil || len(sum) != 32 {
 		return nil, errors.New("checksum_sha256 is not 64 hex characters")
 	}
-	return json.Marshal(farmerSelfUpdate{
+	p := farmerSelfUpdate{
 		Version:        v.Version,
 		ArtifactURL:    v.ArtifactURL,
 		ChecksumSHA256: strings.ToLower(v.ChecksumSHA256),
-	})
+		Signature:      v.Signature,
+	}
+	if fleetKeys == nil {
+		return nil, errors.New("no fleet signing key source configured; refusing to dispatch unverified releases")
+	}
+	ks, err := fleetKeys.KeySet(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading fleet signing keys: %w", err)
+	}
+	if err := ks.Verify(fleetsign.Release{Version: p.Version, ArtifactURL: p.ArtifactURL, ChecksumSHA256: p.ChecksumSHA256}, p.Signature); err != nil {
+		return nil, fmt.Errorf("signature: %w", err)
+	}
+	return json.Marshal(p)
 }
 
 // rolloutPolicyCheck compares the tenant's update policy with a rollout of

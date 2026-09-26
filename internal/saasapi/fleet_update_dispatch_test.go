@@ -26,6 +26,7 @@ func newUpdateTestDB(t *testing.T) *gorm.DB {
 	empty()
 	t.Cleanup(empty)
 	enableFleetUpdateDispatch(t)
+	withTestFleetKeys(t)
 	return gdb
 }
 
@@ -323,7 +324,8 @@ func TestFleetUpdate_JobStatusGateRollsOutInWaves(t *testing.T) {
 		dec := json.NewDecoder(strings.NewReader(string(req.Action.Params)))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&p); err != nil || req.Action.Type != controlplane.ActionSelfUpdate || req.TenantID != tid ||
-			p.Version != "v2.4.1" || p.ArtifactURL != v.ArtifactURL || p.ChecksumSHA256 != v.ChecksumSHA256 {
+			p.Version != "v2.4.1" || p.ArtifactURL != v.ArtifactURL || p.ChecksumSHA256 != v.ChecksumSHA256 ||
+			p.Signature == "" || p.Signature != v.Signature {
 			t.Fatalf("request %d = %+v %s (%v)", i, req, req.Action.Params, err)
 		}
 	}

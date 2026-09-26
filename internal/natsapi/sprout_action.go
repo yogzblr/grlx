@@ -27,8 +27,18 @@ package natsapi
 // handleCook the tenant-facing grlx.api.cmd.run/cook subjects use, bound
 // to the verified tenant, so it travels over that tenant's own NATS
 // connection (its own Account) to the sprout — never any other tenant's.
+//
+// self_update (design doc §1.8, §2.5) adds a third check before dispatch:
+// the release's signature must verify against the grlx-fleet-signing
+// public key farmer reads from OpenBao Transit with its READ-ONLY token
+// (SetFleetKeySource). The SaaS API checked it too, but it can also write
+// saas.fleet_versions, so farmer doesn't take its word for it. A release
+// that passes goes to the sprout as a one-step cook job (the selfupdate
+// ingredient) over the same tenant connection, and the sprout verifies
+// the signature a third time, against the key it pinned at enrollment.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +52,8 @@ import (
 	apitypes "github.com/gogrlx/grlx/v2/internal/api/types"
 	"github.com/gogrlx/grlx/v2/internal/config"
 	"github.com/gogrlx/grlx/v2/internal/controlplane"
+	"github.com/gogrlx/grlx/v2/internal/cook"
+	"github.com/gogrlx/grlx/v2/internal/fleetsign"
 	log "github.com/gogrlx/grlx/v2/internal/log"
 	"github.com/gogrlx/grlx/v2/internal/pki"
 )
@@ -54,7 +66,21 @@ var (
 	dispatchCmdRun       = handleCmdRun
 	dispatchCook         = handleCook
 	triggerCook          = triggerCookOnTenantConn
+	dispatchSelfUpdate   = sendSelfUpdate
 )
+
+// fleetKeys is the grlx-fleet-signing public key source self_update
+// verifies releases against, set once at startup by SetFleetKeySource
+// (cmd/farmer). While it's nil every self_update is refused.
+var fleetKeys fleetsign.KeySetSource
+
+// SetFleetKeySource installs the read-only key source self_update
+// verifies release signatures against.
+func SetFleetKeySource(src fleetsign.KeySetSource) { fleetKeys = src }
+
+// selfUpdateVerifyTimeout bounds the Transit key read behind a signature
+// check (normally served from the source's cache).
+const selfUpdateVerifyTimeout = 15 * time.Second
 
 const auditActionSproutAction = controlplane.SubjectSproutAction
 
@@ -174,7 +200,7 @@ func runSproutAction(req controlplane.SproutActionRequest) (controlplane.SproutA
 	}
 
 	switch req.Action.Type {
-	case controlplane.ActionCmdRun, controlplane.ActionCook:
+	case controlplane.ActionCmdRun, controlplane.ActionCook, controlplane.ActionSelfUpdate:
 	default:
 		return fail(controlplane.ErrorUnsupportedAction, fmt.Errorf("unsupported action type %q", req.Action.Type))
 	}
@@ -198,8 +224,11 @@ func runSproutAction(req controlplane.SproutActionRequest) (controlplane.SproutA
 		return fail(controlplane.ErrorInvalidRequest, fmt.Errorf("sprout ID %q can't be targeted by %s", req.SproutID, req.Action.Type))
 	}
 
-	if req.Action.Type == controlplane.ActionCmdRun {
+	switch req.Action.Type {
+	case controlplane.ActionCmdRun:
 		return runSproutCmd(req, reply)
+	case controlplane.ActionSelfUpdate:
+		return runSproutSelfUpdate(req, reply)
 	}
 	return runSproutCook(req, reply)
 }
@@ -333,4 +362,72 @@ func triggerCookOnTenantConn(tenantID, jid string) error {
 	b, _ := json.Marshal(config.TriggerMsg{JID: jid})
 	_, err := nc.Request(SproutCookTriggerPrefix+jid, b, cookTriggerTimeout)
 	return err
+}
+
+// runSproutSelfUpdate verifies the release's signature and, only if it
+// verifies, dispatches the selfupdate step. Signature and field failures
+// are invalid_request; the specific reason stays in farmer's log. There is
+// no path that dispatches an unsigned or unverifiable release.
+func runSproutSelfUpdate(req controlplane.SproutActionRequest, reply controlplane.SproutActionReply) (controlplane.SproutActionReply, error) {
+	var in controlplane.SelfUpdateParams
+	if err := json.Unmarshal(req.Action.Params, &in); err != nil {
+		reply.ErrorCode = controlplane.ErrorInvalidRequest
+		return reply, fmt.Errorf("%w: self_update params: %v", errSproutActionInvalid, err)
+	}
+	rel := fleetsign.Release{Version: in.Version, ArtifactURL: in.ArtifactURL, ChecksumSHA256: in.ChecksumSHA256}
+	if _, err := rel.Message(); err != nil {
+		reply.ErrorCode = controlplane.ErrorInvalidRequest
+		return reply, fmt.Errorf("%w: self_update: %w", errSproutActionInvalid, err)
+	}
+	src := fleetKeys
+	if src == nil {
+		reply.ErrorCode = controlplane.ErrorInternal
+		return reply, errors.New("self_update refused: no fleet signing key source configured (GRLX_FLEETSIGN_OPENBAO_*)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), selfUpdateVerifyTimeout)
+	defer cancel()
+	ks, err := src.KeySet(ctx)
+	if err != nil {
+		reply.ErrorCode = controlplane.ErrorInternal
+		return reply, fmt.Errorf("self_update refused: reading fleet signing keys: %w", err)
+	}
+	if err := ks.Verify(rel, in.Signature); err != nil {
+		reply.ErrorCode = controlplane.ErrorInvalidRequest
+		return reply, fmt.Errorf("%w: self_update %s refused: %w", errSproutActionInvalid, in.Version, err)
+	}
+
+	jid, err := dispatchSelfUpdate(req.TenantID, req.SproutID, in)
+	if err != nil {
+		reply.ErrorCode = controlplane.ErrorInternal
+		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, nats.ErrNoResponders) {
+			reply.ErrorCode = controlplane.ErrorSproutUnreachable
+		}
+		return reply, err
+	}
+	reply.Status = controlplane.StatusDispatched
+	reply.JID = jid
+	return reply, nil
+}
+
+// sendSelfUpdate sends p to sproutID as a one-step cook job — the
+// sprout's selfupdate ingredient — over tenantID's own connection, and
+// returns its JID. The SaaS API follows the job through farmer.job_status
+// like a cook's.
+func sendSelfUpdate(tenantID, sproutID string, p controlplane.SelfUpdateParams) (string, error) {
+	jid := cook.GenerateJobID()
+	step := cook.Step{
+		Ingredient: cook.Ingredient(fleetsign.SelfUpdateIngredient),
+		Method:     fleetsign.SelfUpdateMethod,
+		ID:         cook.StepID(fleetsign.SelfUpdateStepIDPrefix + p.Version),
+		Properties: map[string]interface{}{
+			fleetsign.PropVersion:        p.Version,
+			fleetsign.PropArtifactURL:    p.ArtifactURL,
+			fleetsign.PropChecksumSHA256: p.ChecksumSHA256,
+			fleetsign.PropSignature:      p.Signature,
+		},
+	}
+	if err := cook.SendStepsEvent(tenantID, sproutID, jid, []cook.Step{step}); err != nil {
+		return "", fmt.Errorf("sending self_update %s to sprout %q: %w", p.Version, sproutID, err)
+	}
+	return jid, nil
 }

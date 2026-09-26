@@ -771,10 +771,9 @@ func dispatchItem(d *gorm.DB, nc *nats.Conn, batch AssetActionBatch, item AssetA
 }
 
 // jobTracked reports whether actionType is answered with a jid and then
-// followed through farmer.job_status: cook, and self_update. Farmer has no
-// self_update handler yet. The contract assumed here, the same as cook's,
-// is that it replies dispatched with the jid of a job whose outcome is
-// the update's.
+// followed through farmer.job_status: cook, and self_update. Farmer
+// replies to a self_update, like a cook, dispatched with the jid of the
+// sprout's one-step selfupdate job, whose outcome is the update's.
 func jobTracked(actionType string) bool {
 	return actionType == controlplane.ActionCook || actionType == controlplane.ActionSelfUpdate
 }

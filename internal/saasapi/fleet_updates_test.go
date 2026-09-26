@@ -42,6 +42,7 @@ func mustPublishVersion(t *testing.T, gdb *gorm.DB, version string, releasedAt t
 		ReleasedAt:     releasedAt.UTC(),
 		Notes:          "notes for " + version,
 	}
+	v.Signature = signTestRelease(t, v)
 	if err := gdb.Create(&v).Error; err != nil {
 		t.Fatalf("publishing %s: %v", version, err)
 	}

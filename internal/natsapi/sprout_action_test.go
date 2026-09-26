@@ -52,7 +52,11 @@ func (d *dispatchRecorder) all() []dispatchCall {
 func stubSproutActionDispatch(t *testing.T, verify func(string, string) error) *dispatchRecorder {
 	t.Helper()
 	origV, origR, origC, origT := verifySproutInTenant, dispatchCmdRun, dispatchCook, triggerCook
-	t.Cleanup(func() { verifySproutInTenant, dispatchCmdRun, dispatchCook, triggerCook = origV, origR, origC, origT })
+	origS, origK := dispatchSelfUpdate, fleetKeys
+	t.Cleanup(func() {
+		verifySproutInTenant, dispatchCmdRun, dispatchCook, triggerCook = origV, origR, origC, origT
+		dispatchSelfUpdate, fleetKeys = origS, origK
+	})
 
 	rec := &dispatchRecorder{}
 	if verify != nil {
@@ -73,6 +77,10 @@ func stubSproutActionDispatch(t *testing.T, verify func(string, string) error) *
 		return apitypes.CmdCook{JID: "jid-1"}, nil
 	}
 	triggerCook = func(string, string) error { return nil }
+	dispatchSelfUpdate = func(tenantID, _ string, p controlplane.SelfUpdateParams) (string, error) {
+		rec.record(tenantID, mustJSON(t, p))
+		return "jid-su", nil
+	}
 	return rec
 }
 
@@ -296,7 +304,8 @@ func TestSproutAction_RejectsBeforeDispatch(t *testing.T) {
 		want controlplane.ErrorCode
 	}{
 		{"malformed JSON", []byte(`{not json`), controlplane.ErrorInvalidRequest},
-		{"self_update not handled yet", mustJSON(t, controlplane.SproutActionRequest{TenantID: "t_1", SproutID: "web-01", Action: action("self_update", `{"version":"v2"}`)}), controlplane.ErrorUnsupportedAction},
+		{"self_update without artifact_url or checksum", mustJSON(t, controlplane.SproutActionRequest{TenantID: "t_1", SproutID: "web-01", Action: action("self_update", `{"version":"v2"}`)}), controlplane.ErrorInvalidRequest},
+		{"self_update params not an object", mustJSON(t, controlplane.SproutActionRequest{TenantID: "t_1", SproutID: "web-01", Action: action("self_update", `[]`)}), controlplane.ErrorInvalidRequest},
 		{"unknown type", mustJSON(t, controlplane.SproutActionRequest{TenantID: "t_1", SproutID: "web-01", Action: action("shell.start", `{}`)}), controlplane.ErrorUnsupportedAction},
 		{"missing type", mustJSON(t, controlplane.SproutActionRequest{TenantID: "t_1", SproutID: "web-01"}), controlplane.ErrorUnsupportedAction},
 		{"bad tenant ID", mustJSON(t, controlplane.SproutActionRequest{TenantID: "../t_1", SproutID: "web-01", Action: action("cmd.run", `{"command":"uptime"}`)}), controlplane.ErrorInvalidRequest},

@@ -15,6 +15,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	log "github.com/gogrlx/grlx/v2/internal/log"
@@ -47,13 +48,25 @@ type enrollRequest struct {
 // gateway_jwt is a standard alg:EdDSA JWS (internal/gatewayjwt) for
 // Envoy's jwt_authn-gated wss:// and recipe-download routes, since
 // Envoy — unlike nats-server — can't be taught NATS's own JWT dialect.
+//
+// fleet_signing_jwks is the grlx-fleet-signing public key set (design doc
+// §2.5) as a JWKS document, which the sprout pins next to its root CA
+// (pki.PinFleetSigningKeys). It is ADVISORY, a bootstrap fallback only:
+// the sprout verifies releases against the key set it fetches live from
+// farmer over its SproutRootCA-pinned NATS connection
+// (grlx.sprouts.<id>.fleetsigningkeys, internal/fleetkeys), so Transit key
+// rotations reach it. This enrollment-time copy is used only for a
+// sprout's very first update if it has never yet completed a live fetch,
+// and is superseded permanently by the first live fetch that succeeds
+// (internal/ingredients/selfupdate, keys.go).
 type enrollSuccessResponse struct {
-	SproutID        string   `json:"sprout_id"`
-	JWT             string   `json:"jwt"`
-	GatewayJWT      string   `json:"gateway_jwt"`
-	NKeyIdentity    string   `json:"nkey_identity"`
-	TenantX25519Pub string   `json:"tenant_x25519_pub"`
-	NatsURLs        []string `json:"nats_urls"`
+	SproutID         string          `json:"sprout_id"`
+	JWT              string          `json:"jwt"`
+	GatewayJWT       string          `json:"gateway_jwt"`
+	NKeyIdentity     string          `json:"nkey_identity"`
+	TenantX25519Pub  string          `json:"tenant_x25519_pub"`
+	FleetSigningJWKS json.RawMessage `json:"fleet_signing_jwks"`
+	NatsURLs         []string        `json:"nats_urls"`
 }
 
 // enrollErrorResponse is design doc §3.4's single generic failure shape.
@@ -80,6 +93,17 @@ func Enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read the fleet signing key before redeeming anything: if it can't be
+	// had, the sprout couldn't pin its bootstrap copy, and failing here
+	// leaves the join token unspent for the retry. Enrollment fails closed
+	// without it, the same way it does without a gateway JWT signer.
+	fleetJWKS, err := enrollFleetSigningJWKS(r)
+	if err != nil {
+		log.Errorf("enroll: fleet signing key unavailable: %v", err)
+		writeEnrollFailed(w)
+		return
+	}
+
 	result, err := pki.Enroll(r.Context(), req.JoinToken, req.NKeyPub, req.Hostname, req.SproutPub)
 	if err != nil {
 		// pki.Enroll has already logged the specific reason; nothing more
@@ -89,18 +113,33 @@ func Enroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := enrollSuccessResponse{
-		SproutID:        result.SproutID,
-		JWT:             result.JWT,
-		GatewayJWT:      result.GatewayJWT,
-		NKeyIdentity:    req.NKeyPub,
-		TenantX25519Pub: result.TenantX25519Pub,
-		NatsURLs:        enrollBusURLs(),
+		SproutID:         result.SproutID,
+		JWT:              result.JWT,
+		GatewayJWT:       result.GatewayJWT,
+		NKeyIdentity:     req.NKeyPub,
+		TenantX25519Pub:  result.TenantX25519Pub,
+		FleetSigningJWKS: fleetJWKS,
+		NatsURLs:         enrollBusURLs(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Errorf("enroll: writing success response: %v", err)
 	}
+}
+
+// enrollFleetSigningJWKS returns the fleet signing key set as a JWKS
+// document, or an error if no key source is configured
+// (GRLX_FLEETSIGN_OPENBAO_*) or Transit can't be read.
+func enrollFleetSigningJWKS(r *http.Request) (json.RawMessage, error) {
+	if fleetKeySource == nil {
+		return nil, errors.New("no fleet signing key source configured")
+	}
+	ks, err := fleetKeySource.KeySet(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	return ks.MarshalJWKS()
 }
 
 func writeEnrollFailed(w http.ResponseWriter) {
