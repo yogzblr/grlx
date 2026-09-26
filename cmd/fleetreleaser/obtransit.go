@@ -297,9 +297,13 @@ func (c *obTransitClient) keySet(ctx context.Context) (fleetsign.KeySet, error) 
 		if err != nil {
 			return nil, fmt.Errorf("%w: unexpected key version %q", errReadKeyFailed, k)
 		}
-		// Same floor as fleetsign's readKeySet (and gatewayjwt's
-		// PublicKeys), so a signature that verifies here verifies on
-		// every sprout.
+		// Signer-side floor: min_encryption_version, which is always >=
+		// the verifiers' min_decryption_version floor (fleetsign's
+		// readKeySet). Stricter than they are, so a signature that
+		// verifies here verifies on every sprout, farmer and saasapi.
+		// The flip side: during a rotation grace period, an existing
+		// row signed by a version below min_encryption_version fails
+		// this check even though every verifier still accepts it.
 		if version < rr.Data.MinEncryptionVersion {
 			continue
 		}

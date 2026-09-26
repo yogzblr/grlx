@@ -245,28 +245,44 @@ type transitReadKeyResponse struct {
 		Keys map[string]struct {
 			PublicKey string `json:"public_key"`
 		} `json:"keys"`
+		// MinEncryptionVersion is the floor for producing NEW signatures —
+		// a signer-side concern. Decoded but deliberately not used here.
 		MinEncryptionVersion int `json:"min_encryption_version"`
+		// MinDecryptionVersion is the floor Transit's own /verify honors,
+		// and the one readKeySet filters on.
+		MinDecryptionVersion int `json:"min_decryption_version"`
 		LatestVersion        int `json:"latest_version"`
 	} `json:"data"`
 	Errors []string `json:"errors"`
 }
 
 // readKeySet calls Transit's GET /v1/<mount>/keys/<keyName> and returns
-// every key version at or above min_encryption_version, sorted ascending —
-// the same selection internal/gatewayjwt's (*GatewaySigner).PublicKeys
-// makes for the gateway JWKS, deliberately copied rather than reinvented.
+// every key version Transit itself would still verify with: those at or
+// above min_decryption_version, sorted ascending. That is the floor
+// Transit's own /verify honors for signing keys. min_encryption_version
+// is only the floor for producing NEW signatures (cmd/fleetreleaser's
+// concern) and is always >= min_decryption_version, so flooring on it
+// here would drop versions Transit still accepts and turn every rotation
+// grace period into false verification failures. This intentionally
+// differs from internal/gatewayjwt's (*GatewaySigner).PublicKeys, which
+// floors its JWKS on min_encryption_version; the version-sorted
+// {version, public key} shape is the same.
+//
 // Every verifier of a fleet release (farmer's self_update re-check,
 // saasapi's dispatch check, the enrollment pin, and the live key set
 // sprouts fetch on grlx.sprouts.<id>.fleetsigningkeys) uses this one
 // selection, so they all agree on which versions are valid.
 //
 // Consequence, and an OPERATIONAL CONSTRAINT: raising
-// grlx-fleet-signing's min_encryption_version retires every version below
-// it for verification on every sprout, not just for new signatures. Never
+// grlx-fleet-signing's min_decryption_version retires every version below
+// it for verification — on every sprout, in farmer and in saasapi. Never
 // raise it past a version that signed a release still named as
-// approved_version in any tenant's saas.tenant_update_policy. Nothing in
-// this repo bumps it or retires versions automatically; that stays an
-// operator decision (deploy/fleetreleaser/README.md, "Rotating the key").
+// approved_version in any tenant's saas.tenant_update_policy. (Raising
+// min_encryption_version alone only stops NEW signatures with the older
+// versions; it doesn't retire anything for verification.) Nothing in
+// this repo bumps either floor or retires versions automatically; that
+// stays an operator decision (deploy/fleetreleaser/README.md, "Rotating
+// the key").
 func (c *obTransitClient) readKeySet(ctx context.Context, keyName string) (KeySet, error) {
 	token, err := c.currentToken(ctx)
 	if err != nil {
@@ -298,9 +314,9 @@ func (c *obTransitClient) readKeySet(ctx context.Context, keyName string) (KeySe
 	if rr.Data.Type != "ed25519" {
 		return nil, fmt.Errorf("%w: Transit key %q is type %q, want ed25519", ErrReadKeyFailed, keyName, rr.Data.Type)
 	}
-	// min_encryption_version of 0 is Transit's "no restriction" sentinel:
-	// treat it as 1, exactly as PublicKeys does.
-	minVersion := rr.Data.MinEncryptionVersion
+	// A floor of 0 is Transit's "no restriction" sentinel: treat it as 1,
+	// the same handling PublicKeys gives min_encryption_version.
+	minVersion := rr.Data.MinDecryptionVersion
 	if minVersion < 1 {
 		minVersion = 1
 	}

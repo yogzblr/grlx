@@ -65,7 +65,7 @@ var (
 	// ErrMalformedSignature: the signature isn't "v<version>:<base64>".
 	ErrMalformedSignature = errors.New("fleetsign: malformed signature")
 	// ErrUnknownKeyVersion: the signature names a key version the key set
-	// doesn't hold (not fetched or pinned, or retired by min_encryption_version).
+	// doesn't hold (not fetched or pinned, or retired by min_decryption_version).
 	ErrUnknownKeyVersion = errors.New("fleetsign: signature key version not in key set")
 	// ErrInvalidSignature: the signature doesn't verify.
 	ErrInvalidSignature = errors.New("fleetsign: signature verification failed")

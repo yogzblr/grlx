@@ -24,7 +24,8 @@ import (
 type mockTransit struct {
 	token         string
 	keys          []PublicKey
-	minEncryption int
+	minEncryption int // floor for new signatures; must NOT limit verification
+	minDecryption int // floor Transit's /verify honors
 	keyType       string
 	reads         atomic.Int32
 	otherRequests atomic.Int32
@@ -56,7 +57,8 @@ func (m *mockTransit) start(t *testing.T) *httptest.Server {
 			keyType = "ed25519"
 		}
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-			"type": keyType, "keys": keys, "min_encryption_version": m.minEncryption, "latest_version": len(m.keys),
+			"type": keyType, "keys": keys, "min_encryption_version": m.minEncryption,
+			"min_decryption_version": m.minDecryption, "latest_version": len(m.keys),
 		}})
 	}))
 	t.Cleanup(ts.Close)
@@ -96,15 +98,49 @@ func TestTransitKeySource_ReadsAndCaches(t *testing.T) {
 	}
 }
 
-// min_encryption_version is the floor, copied from gatewayjwt's
-// PublicKeys: raising it retires the versions below it for verification.
-func TestTransitKeySource_HonorsMinEncryptionVersion(t *testing.T) {
+// The case the min_encryption_version floor silently broke: a rotation in
+// its grace period. v3 is the only version new signatures may use
+// (min_encryption_version=3), but Transit still verifies v1 and v2
+// (min_decryption_version=1). Every version down to min_decryption_version
+// must be served, including the ones below min_encryption_version, and a
+// release signed by v1 during the grace period must still verify.
+func TestTransitKeySource_RotationGracePeriodServesBelowMinEncryption(t *testing.T) {
+	k1, priv1 := newTestKey(t, 1)
+	k2, priv2 := newTestKey(t, 2)
+	k3, priv3 := newTestKey(t, 3)
+	m := &mockTransit{token: "ro-token", keys: []PublicKey{k1, k2, k3}, minEncryption: 3, minDecryption: 1}
+	m.start(t)
+	src, err := NewTransitKeySourceFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks, err := src.KeySet(t.Context())
+	if err != nil {
+		t.Fatalf("KeySet: %v", err)
+	}
+	if len(ks) != 3 || ks[0].Version != 1 || ks[1].Version != 2 || ks[2].Version != 3 {
+		t.Fatalf("KeySet versions = %+v, want 1, 2, 3 (down to min_decryption_version, not min_encryption_version)", ks)
+	}
+	for v, priv := range map[int]ed25519.PrivateKey{1: priv1, 2: priv2, 3: priv3} {
+		if err := src.Verify(t.Context(), testRelease(), signForTest(t, priv, v, testRelease())); err != nil {
+			t.Errorf("v%d signature during the grace period: %v", v, err)
+		}
+	}
+}
+
+// min_decryption_version is what retires a version for verification.
+func TestTransitKeySource_HonorsMinDecryptionVersion(t *testing.T) {
 	k1, priv1 := newTestKey(t, 1)
 	k2, _ := newTestKey(t, 2)
-	m := &mockTransit{token: "ro-token", keys: []PublicKey{k1, k2}, minEncryption: 2}
+	k3, _ := newTestKey(t, 3)
+	m := &mockTransit{token: "ro-token", keys: []PublicKey{k1, k2, k3}, minEncryption: 3, minDecryption: 2}
 	m.start(t)
 	src, _ := NewTransitKeySourceFromEnv()
-	err := src.Verify(t.Context(), testRelease(), signForTest(t, priv1, 1, testRelease()))
+	ks, err := src.KeySet(t.Context())
+	if err != nil || len(ks) != 2 || ks[0].Version != 2 || ks[1].Version != 3 {
+		t.Fatalf("KeySet = %+v, %v; want versions 2, 3", ks, err)
+	}
+	err = src.Verify(t.Context(), testRelease(), signForTest(t, priv1, 1, testRelease()))
 	if !errors.Is(err, ErrUnknownKeyVersion) {
 		t.Fatalf("Verify with retired v1 = %v, want ErrUnknownKeyVersion", err)
 	}

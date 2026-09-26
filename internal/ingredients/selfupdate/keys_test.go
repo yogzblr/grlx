@@ -110,12 +110,12 @@ func TestLiveKeys_NonNewestValidVersionVerifies(t *testing.T) {
 	if err != nil || !res.Succeeded || len(f.installs) != 1 {
 		t.Fatalf("Apply = %+v, %v (installs %d)", res, err, len(f.installs))
 	}
-	// v1 too, while it's still at or above min_encryption_version.
+	// v1 too, while it's still at or above min_decryption_version.
 	res, err = step(t, rel, tk.sign(t, 1, rel)).Apply(context.Background())
 	if err != nil || !res.Succeeded {
 		t.Fatalf("Apply with v1 = %+v, %v", res, err)
 	}
-	// Once farmer stops serving v1 (min_encryption_version raised to 2),
+	// Once farmer stops serving v1 (min_decryption_version raised to 2),
 	// a v1 signature is refused even after the forced refetch.
 	fk.serve(tk.set(t, 2, 3), nil)
 	resetLiveKeys()

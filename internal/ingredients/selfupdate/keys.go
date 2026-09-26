@@ -10,8 +10,10 @@ package selfupdate
 //
 //  1. Live set (authoritative). The key set is fetched from farmer over
 //     that connection (internal/fleetkeys, grlx.sprouts.<id>.fleetsigningkeys):
-//     every Transit version at or above min_encryption_version, the same
-//     selection as internal/gatewayjwt's PublicKeys. It's cached for
+//     every Transit version at or above min_decryption_version, i.e.
+//     every version Transit's own /verify still accepts, including those
+//     below min_encryption_version during a rotation grace period
+//     (fleetsign's readKeySet). It's cached for
 //     liveKeyTTL. A signature naming a version the cached set doesn't
 //     hold triggers one immediate refetch before the release is refused,
 //     so a release signed right after a rotation verifies without waiting

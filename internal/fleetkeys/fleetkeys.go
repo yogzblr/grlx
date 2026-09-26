@@ -109,9 +109,9 @@ type KeyVersion struct {
 }
 
 // Response is farmer's reply. Keys is every version at or above the key's
-// min_encryption_version, sorted ascending (fleetsign's readKeySet, a copy
-// of PublicKeys' selection). On failure Keys is empty and Error is a fixed
-// code, never error text.
+// min_decryption_version — every version Transit's own /verify still
+// accepts — sorted ascending (fleetsign's readKeySet). On failure Keys is
+// empty and Error is a fixed code, never error text.
 type Response struct {
 	Keys  []KeyVersion `json:"keys,omitempty"`
 	Error string       `json:"error,omitempty"`

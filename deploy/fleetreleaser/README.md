@@ -49,34 +49,46 @@ bao write -f transit/keys/grlx-fleet-signing type=ed25519 exportable=false allow
 - fleetreleaser signs new releases with the new version.
 - Sprouts pick it up without re-enrolling. They verify against the key
   set farmer serves live on `grlx.sprouts.<id>.fleetsigningkeys`. That
-  set holds every version at or above `min_encryption_version`, the same
-  selection as `internal/gatewayjwt`'s `PublicKeys`.
+  set holds every version at or above `min_decryption_version`: every
+  version Transit's own `/verify` still accepts.
 - Sprouts cache that set for 5 minutes. A signature by a version missing
   from the cache triggers an immediate refetch.
 
+**The two floors do different things.**
+
+- `min_encryption_version` only limits which versions may make **new**
+  signatures. Raising it (for example to the newest version right after
+  a rotation) starts a grace period. Older versions stop signing but
+  still verify everywhere, so already-approved releases keep working.
+- `min_decryption_version` is what verifiers honor.
+
 **Retiring a version is not automated, on purpose, and has a hard
-constraint.** You retire version N by raising `min_encryption_version`
-past it (`bao write transit/keys/grlx-fleet-signing/config
-min_encryption_version=N+1`).
+constraint.** You retire version N for verification by raising
+`min_decryption_version` past it (`bao write
+transit/keys/grlx-fleet-signing/config min_decryption_version=N+1`).
+Transit requires `min_encryption_version` >= `min_decryption_version`,
+so raise that first if needed.
 
 - That removes N from the live set, so every sprout stops accepting
   signatures made with N within about 5 minutes. Farmer's pre-dispatch
   check and saasapi's rollout check stop accepting them too.
-- **Never raise `min_encryption_version` past a version that signed a
+- **Never raise `min_decryption_version` past a version that signed a
   release still named as `approved_version` in any tenant's
   `saas.tenant_update_policy`.** That tenant's approved release would
   stop verifying fleet-wide, and its rollouts would fail.
 - Before raising it, check that every approved version was signed at or
   above the new floor. The key version is the `v<N>:` prefix of
-  `saas.fleet_versions.signature`. If one wasn't, re-sign it with
-  fleetreleaser under the new version first. Only then retire the old
-  version.
-- This is an operator decision. Nothing in grlx raises
-  `min_encryption_version`, trims key versions or retires them
-  automatically.
+  `saas.fleet_versions.signature`.
+- **fleetreleaser has no re-sign path today.** A row whose signature
+  still verifies is left `unchanged`, and one that doesn't verify is
+  refused. So the only way to move an approved release onto a newer key
+  version is to publish it as a new version, have tenants approve that,
+  and only then retire the old key version.
+- This is an operator decision. Nothing in grlx raises either floor,
+  trims key versions or retires them automatically.
 
-Don't use `min_decryption_version` for this. The verifiers deliberately
-follow `min_encryption_version`, as `PublicKeys` does.
+Note that `internal/gatewayjwt`'s JWKS floors on `min_encryption_version`.
+That's a different key with different semantics; don't copy it here.
 
 ## Roles
 
